@@ -1,0 +1,137 @@
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rmpv::Value;
+
+use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback};
+use reticulum_rust::{log, LOG_NOTICE};
+
+use crate::lx_message::LXMessage;
+use crate::lxmf::{APP_NAME, pn_announce_data_is_valid, stamp_cost_from_app_data};
+use crate::lxm_router::LXMRouter;
+
+fn now() -> f64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_secs_f64())
+		.unwrap_or(0.0)
+}
+
+pub fn delivery_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHandler {
+	let callback: AnnounceCallback = Arc::new(move |destination_hash, _identity, app_data, _announce_hash, _is_path_response| {
+		let stamp_cost = stamp_cost_from_app_data(Some(app_data))
+			.and_then(|value| if value >= 0 { Some(value as u32) } else { None });
+
+		if let Ok(mut router) = router.lock() {
+			router.update_stamp_cost(destination_hash, stamp_cost);
+			let mut should_trigger = false;
+			for message in router.pending_outbound.iter() {
+				if let Ok(mut lxm) = message.lock() {
+					if lxm.destination_hash == destination_hash
+						&& (lxm.method == LXMessage::DIRECT || lxm.method == LXMessage::OPPORTUNISTIC)
+					{
+						lxm.next_delivery_attempt = Some(now());
+						should_trigger = true;
+					}
+				}
+			}
+
+			if should_trigger {
+				router.process_outbound();
+			}
+		}
+	});
+
+	AnnounceHandler {
+		aspect_filter: Some(format!("{}.delivery", APP_NAME)),
+		receive_path_responses: true,
+		callback,
+	}
+}
+
+pub fn propagation_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHandler {
+	let callback: AnnounceCallback = Arc::new(move |destination_hash, _identity, app_data, _announce_hash, is_path_response| {
+		if let Ok(mut router) = router.lock() {
+			if !router.propagation_node {
+				return;
+			}
+
+			if !pn_announce_data_is_valid(app_data) {
+				return;
+			}
+
+			let config = match rmpv::decode::read_value(&mut std::io::Cursor::new(app_data)) {
+				Ok(Value::Array(items)) => items,
+				_ => return,
+			};
+
+			if config.len() < 7 {
+				return;
+			}
+
+			let node_timebase = config[1].as_i64().unwrap_or(0) as i64;
+			let propagation_enabled = config[2].as_bool().unwrap_or(false);
+			let transfer_limit = config[3].as_i64().unwrap_or(0) as i64;
+			let sync_limit = config[4].as_i64().unwrap_or(0) as i64;
+			let (stamp_cost, stamp_flex, peering_cost) = match &config[5] {
+				Value::Array(costs) if costs.len() >= 3 => {
+					(
+						costs[0].as_i64().unwrap_or(0) as i64,
+						costs[1].as_i64().unwrap_or(0) as i64,
+						costs[2].as_i64().unwrap_or(0) as i64,
+					)
+				}
+				_ => (0, 0, 0),
+			};
+			let metadata_value = config[6].clone();
+			let mut metadata = Vec::new();
+			let _ = rmpv::encode::write_value(&mut metadata, &metadata_value);
+
+			if router.static_peers.contains(&destination_hash.to_vec()) {
+				if !is_path_response || router.peers.get(destination_hash).map(|peer| peer.lock().ok().map(|p| p.last_heard == 0.0)).flatten().unwrap_or(true) {
+					router.peer(
+						destination_hash.to_vec(),
+						node_timebase as f64,
+						transfer_limit as f64,
+						if sync_limit > 0 { Some(sync_limit as f64) } else { None },
+						stamp_cost as u32,
+						stamp_flex as u32,
+						peering_cost as u32,
+						metadata,
+					);
+				}
+			} else if router.autopeer && !is_path_response {
+				if propagation_enabled {
+					if reticulum_rust::transport::Transport::hops_to(destination_hash) <= router.autopeer_maxdepth {
+						router.peer(
+							destination_hash.to_vec(),
+							node_timebase as f64,
+							transfer_limit as f64,
+							if sync_limit > 0 { Some(sync_limit as f64) } else { None },
+							stamp_cost as u32,
+							stamp_flex as u32,
+							peering_cost as u32,
+							metadata,
+						);
+					} else if router.peers.contains_key(destination_hash) {
+						log(
+							&format!("Peer {:x?} moved outside auto-peering range, breaking peering...", destination_hash),
+							LOG_NOTICE,
+							false,
+							false,
+						);
+						router.unpeer(destination_hash.to_vec(), Some(node_timebase as f64));
+					}
+				} else {
+					router.unpeer(destination_hash.to_vec(), Some(node_timebase as f64));
+				}
+			}
+		}
+	});
+
+	AnnounceHandler {
+		aspect_filter: Some(format!("{}.propagation", APP_NAME)),
+		receive_path_responses: true,
+		callback,
+	}
+}
