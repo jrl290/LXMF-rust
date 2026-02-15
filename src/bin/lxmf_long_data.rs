@@ -136,6 +136,11 @@ fn main() -> Result<(), String> {
         .unwrap_or(1)
         .max(1);
 
+    let target_override = args
+        .iter()
+        .position(|arg| arg == "--to")
+        .and_then(|pos| args.get(pos + 1).cloned());
+
     let base_dir = PathBuf::from(env::var("RETICULUM_WORKDIR").unwrap_or_else(|_| "".to_string()));
     let env_path = if let Some(pos) = args.iter().position(|arg| arg == "--env") {
         PathBuf::from(args.get(pos + 1).ok_or("--env requires a path")?)
@@ -155,16 +160,28 @@ fn main() -> Result<(), String> {
 
     // Read message content from stdin or generate test data
     let mut content = if atty::isnt(atty::Stream::Stdin) {
-        // Content is being piped in - read binary-safe bytes
         use std::io::Read;
         let mut buffer = Vec::new();
         std::io::stdin().read_to_end(&mut buffer)
             .map_err(|e| format!("Failed to read from stdin: {e}"))?;
-        buffer
+
+        if !buffer.is_empty() {
+            buffer
+        } else {
+            let content_size = (size_mb * 1024.0 * 1024.0).ceil() as usize;
+            if content_size == 0 {
+                b"Rust LXMF test message".to_vec()
+            } else {
+                vec![b'X'; content_size]
+            }
+        }
     } else {
-        // No piped content - generate test data based on --size-mb
         let content_size = (size_mb * 1024.0 * 1024.0).ceil() as usize;
-        vec![b'X'; content_size]
+        if content_size == 0 {
+            b"Rust LXMF test message".to_vec()
+        } else {
+            vec![b'X'; content_size]
+        }
     };
 
     let mut fields: Option<Value> = None;
@@ -215,13 +232,21 @@ fn main() -> Result<(), String> {
         .get("KEY_1")
         .ok_or("KEY_1 not found in env file")?
         .to_string();
-    let dest_hash_hex = env_map
-        .get("ADDR_2")
-        .ok_or("ADDR_2 not found in env file")?
-        .to_string();
+    let dest_hash_hex = if let Some(value) = target_override {
+        value
+    } else {
+        env_map
+            .get("ADDR_2")
+            .ok_or("ADDR_2 not found in env file")?
+            .to_string()
+    };
 
     let key_bytes = decode_key(&key_value)?;
     let dest_hash = decode_hex(&dest_hash_hex)?;
+    if args.iter().any(|arg| arg == "--to") {
+        eprintln!("[config] Using destination override from --to: {}", dest_hash_hex);
+    }
+    eprintln!("[config] Destination hash: {}", to_hex(&dest_hash));
 
     eprintln!("[step] init reticulum");
     let init_result = std::panic::catch_unwind(|| {

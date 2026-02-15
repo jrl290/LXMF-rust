@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use data_encoding::BASE32;
 
@@ -96,13 +98,40 @@ fn resolve_recipient_identity(dest_hash: &[u8]) -> Result<Identity, String> {
     )
 }
 
+fn unix_timestamp_string() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+}
+
+fn state_name(state: u8) -> &'static str {
+    match state {
+        LXMessage::GENERATING => "GENERATING",
+        LXMessage::OUTBOUND => "OUTBOUND",
+        LXMessage::SENDING => "SENDING",
+        LXMessage::SENT => "SENT",
+        LXMessage::DELIVERED => "DELIVERED",
+        LXMessage::PAPER => "PAPER",
+        LXMessage::PROPAGATED => "PROPAGATED",
+        LXMessage::FAILED => "FAILED",
+        LXMessage::CANCELLED => "CANCELLED",
+        LXMessage::REJECTED => "REJECTED",
+        _ => "UNKNOWN",
+    }
+}
+
 fn main() -> Result<(), String> {
-    let watchdog_timeout = Duration::from_secs(45);
-    std::thread::spawn(move || {
-        std::thread::sleep(watchdog_timeout);
-        eprintln!("Timeout");
-        panic!("Timeout");
-    });
+    eprintln!("[time] started: {}", unix_timestamp_string());
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted_flag = interrupted.clone();
+        if let Err(err) = ctrlc::set_handler(move || {
+            interrupted_flag.store(true, Ordering::SeqCst);
+        }) {
+            eprintln!("[warn] Failed to install SIGINT handler: {}", err);
+        }
+    }
 
     let args: Vec<String> = env::args().collect();
 
@@ -129,18 +158,31 @@ fn main() -> Result<(), String> {
         "Hello from Rust".to_string()
     };
 
+    let target_override = args
+        .iter()
+        .position(|arg| arg == "--to")
+        .and_then(|pos| args.get(pos + 1).cloned());
+
     let env_map = load_env(&env_path)?;
     let key_value = env_map
         .get("KEY_1")
         .ok_or("KEY_1 not found in env file")?
         .to_string();
-    let dest_hash_hex = env_map
-        .get("ADDR_2")
-        .ok_or("ADDR_2 not found in env file")?
-        .to_string();
+    let dest_hash_hex = if let Some(value) = target_override {
+        value
+    } else {
+        env_map
+            .get("ADDR_2")
+            .ok_or("ADDR_2 not found in env file")?
+            .to_string()
+    };
 
     let key_bytes = decode_key(&key_value)?;
     let dest_hash = decode_hex(&dest_hash_hex)?;
+    if args.iter().any(|arg| arg == "--to") {
+        eprintln!("[config] Using destination override from --to: {}", dest_hash_hex);
+    }
+    eprintln!("[config] Destination hash: {}", to_hex(&dest_hash));
 
     eprintln!("[step] init reticulum");
     let init_result = std::panic::catch_unwind(|| {
@@ -207,6 +249,11 @@ fn main() -> Result<(), String> {
     if !Transport::has_path(&dest_hash) {
         let mut last_request = Instant::now() - Duration::from_secs(10);
         while Instant::now() < overall_deadline && !Transport::has_path(&dest_hash) {
+            if interrupted.load(Ordering::SeqCst) {
+                eprintln!("[signal] SIGINT received, stopping during path resolution");
+                eprintln!("[time] finished: {}", unix_timestamp_string());
+                return Ok(());
+            }
             if last_request.elapsed() >= Duration::from_secs(5) {
                 eprintln!("[step] request path");
                 Transport::request_path(&dest_hash, None, None, None, None);
@@ -276,19 +323,26 @@ fn main() -> Result<(), String> {
     let timeout = Instant::now() + Duration::from_secs(20);
     let mut next_state_log = Instant::now() + Duration::from_secs(2);
     while Instant::now() < timeout {
-        if let Ok(locked) = handle.lock() {
+        if let Ok(locked) = handle.try_lock() {
             if Instant::now() >= next_state_log {
-                eprintln!("[step] message state: {}", locked.state);
+                eprintln!("[step] message state: {} ({})", locked.state, state_name(locked.state));
                 next_state_log = Instant::now() + Duration::from_secs(2);
             }
             if locked.state == LXMessage::DELIVERED || locked.state == LXMessage::FAILED {
-                println!("Message state: {}", locked.state);
+                println!("Final message state: {} ({})", locked.state, state_name(locked.state));
+                eprintln!("[time] finished: {}", unix_timestamp_string());
                 return Ok(());
             }
+        }
+        if interrupted.load(Ordering::SeqCst) {
+            eprintln!("[signal] SIGINT received, stopping during send wait");
+            eprintln!("[time] finished: {}", unix_timestamp_string());
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(200));
     }
 
     println!("Message send timed out");
+    eprintln!("[time] finished: {}", unix_timestamp_string());
     Ok(())
 }

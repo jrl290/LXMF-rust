@@ -911,46 +911,48 @@ impl LXMRouter {
 						LXMessage::OPPORTUNISTIC => {
 							if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 								let dest_hash = lxm.destination_hash.clone();
-								if lxm.delivery_attempts >= Self::MAX_PATHLESS_TRIES && !Transport::has_path(&dest_hash) {
-									log(
-										&format!("Requesting path to {} after {} pathless tries", prettyhexrep(&dest_hash), lxm.delivery_attempts),
-										LOG_DEBUG,
-										false,
-										false,
-									);
-									lxm.delivery_attempts += 1;
-									Transport::request_path(&dest_hash, None, None, None, None);
-									lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
-									lxm.progress = 0.01;
-								} else if lxm.delivery_attempts == Self::MAX_PATHLESS_TRIES + 1
-									&& Transport::has_path(&dest_hash)
-								{
-									log(
-										&format!("Rediscovering path to {} after failed opportunistic attempt", prettyhexrep(&dest_hash)),
-										LOG_DEBUG,
-										false,
-										false,
-									);
-									lxm.delivery_attempts += 1;
-									if let Some(reticulum) = Reticulum::get_instance() {
-										if let Ok(reticulum) = reticulum.lock() {
-											let _ = reticulum.drop_path(&dest_hash);
+								if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
+									if lxm.delivery_attempts >= Self::MAX_PATHLESS_TRIES && !Transport::has_path(&dest_hash) {
+										log(
+											&format!("Requesting path to {} after {} pathless tries", prettyhexrep(&dest_hash), lxm.delivery_attempts),
+											LOG_DEBUG,
+											false,
+											false,
+										);
+										lxm.delivery_attempts += 1;
+										Transport::request_path(&dest_hash, None, None, None, None);
+										lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+										lxm.progress = 0.01;
+									} else if lxm.delivery_attempts == Self::MAX_PATHLESS_TRIES + 1
+										&& Transport::has_path(&dest_hash)
+									{
+										log(
+											&format!("Rediscovering path to {} after failed opportunistic attempt", prettyhexrep(&dest_hash)),
+											LOG_DEBUG,
+											false,
+											false,
+										);
+										lxm.delivery_attempts += 1;
+										if let Some(reticulum) = Reticulum::get_instance() {
+											if let Ok(reticulum) = reticulum.lock() {
+												let _ = reticulum.drop_path(&dest_hash);
+											}
 										}
-									}
-									let dest_clone = dest_hash.clone();
-									thread::spawn(move || {
-										thread::sleep(Duration::from_millis(500));
-										Transport::request_path(&dest_clone, None, None, None, None);
-									});
-									lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
-									lxm.progress = 0.01;
-								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
-									eprintln!("[DEBUG] Sending OPPORTUNISTIC message, attempt {}", lxm.delivery_attempts + 1);
-									lxm.delivery_attempts += 1;
-									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-									match lxm.send_with_handle(Some(message.clone())) {
-										Ok(_) => eprintln!("[DEBUG] send() succeeded"),
-										Err(e) => eprintln!("[DEBUG] send() FAILED: {}", e),
+										let dest_clone = dest_hash.clone();
+										thread::spawn(move || {
+											thread::sleep(Duration::from_millis(500));
+											Transport::request_path(&dest_clone, None, None, None, None);
+										});
+										lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+										lxm.progress = 0.01;
+									} else {
+										eprintln!("[DEBUG] Sending OPPORTUNISTIC message, attempt {}", lxm.delivery_attempts + 1);
+										lxm.delivery_attempts += 1;
+										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+										match lxm.send_with_handle(Some(message.clone())) {
+											Ok(_) => eprintln!("[DEBUG] send() succeeded"),
+											Err(e) => eprintln!("[DEBUG] send() FAILED: {}", e),
+										}
 									}
 								}
 							} else {
