@@ -12,6 +12,7 @@ use reticulum_rust::identity::{self, Identity, SIGLENGTH, TRUNCATED_HASHLENGTH};
 use reticulum_rust::link::Link;
 use reticulum_rust::packet::{self, Packet};
 use reticulum_rust::resource::{Resource, ResourceData, ResourceStatus};
+use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_ERROR};
 
 use crate::lx_stamper as lx_stamper;
@@ -633,20 +634,25 @@ impl LXMessage {
 		locked.send_with_handle(Some(handle))
 	}
 
-	fn send_with_handle(&mut self, handle: Option<Arc<Mutex<LXMessage>>>) -> Result<(), String> {
+	pub(crate) fn send_with_handle(&mut self, handle: Option<Arc<Mutex<LXMessage>>>) -> Result<(), String> {
 		self.determine_transport_encryption();
 		match self.method {
 			Self::OPPORTUNISTIC => {
+				eprintln!("[DEBUG] OPPORTUNISTIC: entering send_with_handle");
 				let mut packet = self.as_packet()?;
+				eprintln!("[DEBUG] OPPORTUNISTIC: packet synthesized, sending...");
 				let receipt = packet.send()?;
+				eprintln!("[DEBUG] OPPORTUNISTIC: packet.send() returned");
 				self.progress = 0.50;
 				self.ratchet_id = packet.ratchet_id.clone();
 				self.state = Self::SENT;
 				if let Some(mut receipt) = receipt {
 					if let Some(handle) = handle.clone() {
-						receipt.set_delivery_callback(Arc::new(move |_| {
+						let delivery_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 							mark_delivered_shared(&handle);
-						}));
+						});
+						receipt.set_delivery_callback(delivery_cb.clone());
+						Transport::set_receipt_delivery_callback(&receipt.hash, delivery_cb);
 					}
 				}
 			}
@@ -654,6 +660,11 @@ impl LXMessage {
 				self.state = Self::SENDING;
 				match self.representation {
 					Self::PACKET => {
+						if self.delivery_destination.is_none() {
+							if let Some(destination) = self.destination.as_ref() {
+								self.delivery_destination = Some(destination.clone());
+							}
+						}
 						let mut packet = self.as_packet()?;
 						let receipt = packet.send()?;
 						if let Some(link) = self.delivery_link.as_ref() {
@@ -665,12 +676,16 @@ impl LXMessage {
 							if let Some(handle) = handle.clone() {
 								let delivery_handle = Arc::clone(&handle);
 								let timeout_handle = Arc::clone(&handle);
-								receipt.set_delivery_callback(Arc::new(move |_| {
+								let delivery_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 									mark_delivered_shared(&delivery_handle);
-								}));
-								receipt.set_timeout_callback(Arc::new(move |_| {
+								});
+								let timeout_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 									link_packet_timed_out_shared(&timeout_handle);
-								}));
+								});
+								receipt.set_delivery_callback(delivery_cb.clone());
+								receipt.set_timeout_callback(timeout_cb.clone());
+								Transport::set_receipt_delivery_callback(&receipt.hash, delivery_cb);
+								Transport::set_receipt_timeout_callback(&receipt.hash, timeout_cb);
 							}
 							self.progress = 0.50;
 						} else {
@@ -703,12 +718,16 @@ impl LXMessage {
 							if let Some(handle) = handle.clone() {
 								let delivery_handle = Arc::clone(&handle);
 								let timeout_handle = Arc::clone(&handle);
-								receipt.set_delivery_callback(Arc::new(move |_| {
+								let delivery_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 									mark_propagated_shared(&delivery_handle);
-								}));
-								receipt.set_timeout_callback(Arc::new(move |_| {
+								});
+								let timeout_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 									link_packet_timed_out_shared(&timeout_handle);
-								}));
+								});
+								receipt.set_delivery_callback(delivery_cb.clone());
+								receipt.set_timeout_callback(timeout_cb.clone());
+								Transport::set_receipt_delivery_callback(&receipt.hash, delivery_cb);
+								Transport::set_receipt_timeout_callback(&receipt.hash, timeout_cb);
 							}
 							self.progress = 0.50;
 						} else {
@@ -1082,7 +1101,7 @@ impl LXMessage {
 			callback,
 			progress_callback,
 			None,
-			0,
+			1,
 			None,
 			None,
 			false,

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use data_encoding::BASE32;
+use rmpv::Value;
 
+use lxmf_rust::lxmf::FIELD_FILE_ATTACHMENTS;
 use lxmf_rust::{LXMRouter, LXMessage};
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
@@ -96,15 +99,42 @@ fn resolve_recipient_identity(dest_hash: &[u8]) -> Result<Identity, String> {
     )
 }
 
+fn filename_bytes(path: &Path) -> Vec<u8> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment.bin")
+        .as_bytes()
+        .to_vec()
+}
+
 fn main() -> Result<(), String> {
-    let watchdog_timeout = Duration::from_secs(45);
-    std::thread::spawn(move || {
-        std::thread::sleep(watchdog_timeout);
-        eprintln!("Timeout");
-        panic!("Timeout");
-    });
 
     let args: Vec<String> = env::args().collect();
+
+    // Parse arguments
+    let size_mb = args
+        .iter()
+        .position(|arg| arg == "--size-mb")
+        .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<f64>().ok()))
+        .unwrap_or(0.1);
+
+    let method_arg = args
+        .iter()
+        .position(|arg| arg == "--method")
+        .and_then(|pos| args.get(pos + 1).map(|s| s.as_str()))
+        .unwrap_or("auto");
+
+    let attachment_path = args
+        .iter()
+        .position(|arg| arg == "--attach")
+        .and_then(|pos| args.get(pos + 1).map(PathBuf::from));
+
+    let repeat_count = args
+        .iter()
+        .position(|arg| arg == "--repeat")
+        .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<usize>().ok()))
+        .unwrap_or(1)
+        .max(1);
 
     let base_dir = PathBuf::from(env::var("RETICULUM_WORKDIR").unwrap_or_else(|_| "".to_string()));
     let env_path = if let Some(pos) = args.iter().position(|arg| arg == "--env") {
@@ -123,11 +153,62 @@ fn main() -> Result<(), String> {
         base_dir.join("cli-tests/rnsd_client_sender")
     };
 
-    let content = if let Some(pos) = args.iter().position(|arg| arg == "--message") {
-        args.get(pos + 1).cloned().unwrap_or_else(|| "Hello from Rust".to_string())
+    // Read message content from stdin or generate test data
+    let mut content = if atty::isnt(atty::Stream::Stdin) {
+        // Content is being piped in - read binary-safe bytes
+        use std::io::Read;
+        let mut buffer = Vec::new();
+        std::io::stdin().read_to_end(&mut buffer)
+            .map_err(|e| format!("Failed to read from stdin: {e}"))?;
+        buffer
     } else {
-        "Hello from Rust".to_string()
+        // No piped content - generate test data based on --size-mb
+        let content_size = (size_mb * 1024.0 * 1024.0).ceil() as usize;
+        vec![b'X'; content_size]
     };
+
+    let mut fields: Option<Value> = None;
+    if let Some(path) = attachment_path.as_ref() {
+        let mut attachment_data = fs::read(path)
+            .map_err(|e| format!("Failed to read attachment {}: {e}", path.display()))?;
+        if repeat_count > 1 {
+            let original = attachment_data.clone();
+            attachment_data.reserve(original.len().saturating_mul(repeat_count.saturating_sub(1)));
+            for _ in 1..repeat_count {
+                attachment_data.extend_from_slice(&original);
+            }
+        }
+
+        let attachment_entry = Value::Array(vec![
+            Value::Binary(filename_bytes(path.as_path())),
+            Value::Binary(attachment_data.clone()),
+        ]);
+        fields = Some(Value::Map(vec![
+            (
+                Value::from(FIELD_FILE_ATTACHMENTS as i64),
+                Value::Array(vec![attachment_entry]),
+            ),
+        ]));
+
+        if content.is_empty() {
+            content = b"Binary attachment test".to_vec();
+        }
+        eprintln!(
+            "[config] Attachment: {} ({} bytes, repeat {})",
+            path.display(),
+            attachment_data.len(),
+            repeat_count
+        );
+    }
+    
+    let content_size = content.len();
+
+    eprintln!("[config] Message size: {:.2} MB ({} bytes)", size_mb, content_size);
+    eprintln!("[config] Method preference: {}", method_arg);
+    eprintln!("[config] Size limits:");
+    eprintln!("  - OPPORTUNISTIC max: {} bytes", LXMessage::ENCRYPTED_PACKET_MAX_CONTENT);
+    eprintln!("  - DIRECT (packet) max: {} bytes", LXMessage::LINK_PACKET_MAX_CONTENT);
+    eprintln!("  - DIRECT (resource) max: unlimited");
 
     let env_map = load_env(&env_path)?;
     let key_value = env_map
@@ -148,7 +229,7 @@ fn main() -> Result<(), String> {
     });
     match init_result {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(format!("Reticulum init failed: {err}")),
+        Ok(Err(err)) =>return Err(format!("Reticulum init failed: {err}")),
         Err(panic) => {
             let detail = if let Some(msg) = panic.downcast_ref::<&str>() {
                 (*msg).to_string()
@@ -165,7 +246,7 @@ fn main() -> Result<(), String> {
     let cwd = env::current_dir().map_err(|e| format!("Failed to read current dir: {e}"))?;
     let storage_path = cwd.join("cli-tests/lxmf_storage/sender");
 
-    eprintln!("[step] create router");
+    eprintln!("[step] create router - calling LXMRouter::new()...");
     let router = LXMRouter::new(
         None,
         storage_path.to_string_lossy().to_string(),
@@ -186,13 +267,14 @@ fn main() -> Result<(), String> {
         LXMRouter::MAX_PEERING_COST,
         Some("rust-sender".to_string()),
     )?;
+    eprintln!("[step] create router - RETURNED from LXMRouter::new()");
 
     eprintln!("[step] load sender identity");
     let source_identity = Identity::from_bytes(&key_bytes)?;
     eprintln!("[step] register sender destination");
     let source = {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
-        router_guard.register_delivery_identity(source_identity, Some("Python Sender".to_string()), None)?
+        router_guard.register_delivery_identity(source_identity, Some("Rust Long Data Sender".to_string()), None)?
     };
 
     {
@@ -250,15 +332,37 @@ fn main() -> Result<(), String> {
     if !has_path {
         return Err("No path available for send".to_string());
     }
-    let method = LXMessage::OPPORTUNISTIC;
+
+    // Auto-select delivery method based on message size
+    let method = match method_arg {
+        "direct" => LXMessage::DIRECT,
+        "opportunistic" if content_size <= LXMessage::ENCRYPTED_PACKET_MAX_CONTENT => {
+            eprintln!("[method] Selecting OPPORTUNISTIC (content fits in packet)");
+            LXMessage::OPPORTUNISTIC
+        }
+        "opportunistic" => {
+            eprintln!("[method] OPPORTUNISTIC requested but content too large; auto-converting to DIRECT");
+            LXMessage::DIRECT
+        }
+        _ => {
+            // Auto selection
+            if content_size <= LXMessage::ENCRYPTED_PACKET_MAX_CONTENT {
+                eprintln!("[method] Auto-selected: OPPORTUNISTIC (content fits in packet)");
+                LXMessage::OPPORTUNISTIC
+            } else {
+                eprintln!("[method] Auto-selected: DIRECT (content requires link/resource transfer)");
+                LXMessage::DIRECT
+            }
+        }
+    };
 
     eprintln!("[step] build message");
     let message = LXMessage::new(
         Some(destination),
         Some(source),
-        Some(content.as_bytes().to_vec()),
-        Some(b"Python Test".to_vec()),
-        None,
+        Some(content),
+        Some(b"Long Data Test".to_vec()),
+        fields,
         Some(method),
         None,
         None,
@@ -267,26 +371,63 @@ fn main() -> Result<(), String> {
     )?;
 
     let handle = std::sync::Arc::new(std::sync::Mutex::new(message));
+
     {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
         eprintln!("[step] handle outbound");
         router_guard.handle_outbound(handle.clone());
     }
 
-    let timeout = Instant::now() + Duration::from_secs(20);
-    let mut next_state_log = Instant::now() + Duration::from_secs(2);
+    // Log representation determination AFTER packing
+    {
+        let locked = handle.lock().map_err(|_| "Message lock poisoned")?;
+        eprintln!("[message] Method: {}", match locked.method {
+            LXMessage::OPPORTUNISTIC => "OPPORTUNISTIC",
+            LXMessage::DIRECT => "DIRECT",
+            LXMessage::PROPAGATED => "PROPAGATED",
+            _ => "UNKNOWN",
+        });
+        eprintln!("[message] Representation: {}", match locked.representation {
+            LXMessage::PACKET => "PACKET (single packet delivery)",
+            LXMessage::RESOURCE => "RESOURCE (multi-packet chunked transfer)",
+            _ => "UNKNOWN",
+        });
+        eprintln!("[message] Content size: {} bytes", locked.packed_size);
+    }
+
+    // The background job thread in LXMRouter handles periodic processing.
+    // We just wait and observe the message state transitions.
+    let timeout = Instant::now() + Duration::from_secs(30);
+    let mut next_state_log = Instant::now();
     while Instant::now() < timeout {
         if let Ok(locked) = handle.lock() {
             if Instant::now() >= next_state_log {
-                eprintln!("[step] message state: {}", locked.state);
+                eprintln!("[step] message state: {} (progress: {:.1}%)", 
+                    match locked.state {
+                        LXMessage::GENERATING => "GENERATING",
+                        LXMessage::OUTBOUND => "OUTBOUND",
+                        LXMessage::SENDING => "SENDING",
+                        LXMessage::SENT => "SENT",
+                        LXMessage::DELIVERED => "DELIVERED",
+                        _ => "UNKNOWN",
+                    },
+                    locked.progress * 100.0
+                );
                 next_state_log = Instant::now() + Duration::from_secs(2);
             }
             if locked.state == LXMessage::DELIVERED || locked.state == LXMessage::FAILED {
-                println!("Message state: {}", locked.state);
+                println!("Final message state: {}", 
+                    match locked.state {
+                        LXMessage::DELIVERED => "DELIVERED",
+                        LXMessage::FAILED => "FAILED",
+                        _ => "UNKNOWN",
+                    }
+                );
+                eprintln!("[result] Message successfully delivered!");
                 return Ok(());
             }
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(500));
     }
 
     println!("Message send timed out");

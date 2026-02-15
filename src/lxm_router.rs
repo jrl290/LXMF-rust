@@ -245,8 +245,10 @@ impl LXMRouter {
 		max_peering_cost: u32,
 		name: Option<String>,
 	) -> Result<Arc<Mutex<Self>>, String> {
+		eprintln!("[DEBUG] LXMRouter::new() - START");
 		let identity = identity.unwrap_or_else(|| Identity::new(true));
 		let storagepath = format!("{}/lxmf", storagepath);
+		eprintln!("[DEBUG] LXMRouter::new() - identity/path setup done");
 		let ratchetpath = format!("{}/ratchets", storagepath);
 		let propagation_limit = propagation_limit.unwrap_or(Self::PROPAGATION_LIMIT);
 		let delivery_limit = delivery_limit.unwrap_or(Self::DELIVERY_LIMIT);
@@ -341,24 +343,35 @@ impl LXMRouter {
 			self_handle: None,
 		}));
 
+		// Register announce handlers BEFORE any locking to avoid deadlock
+		// (Python does this early in __init__ before loading cached state)
+		eprintln!("[DEBUG] LXMRouter::new() - registering announce handlers");
+		let router_clone_for_handlers = router.clone();
+		Transport::register_announce_handler(delivery_announce_handler(router_clone_for_handlers.clone()));
+		eprintln!("[DEBUG] LXMRouter::new() - registered delivery handler");
+		Transport::register_announce_handler(propagation_announce_handler(router_clone_for_handlers.clone()));
+		eprintln!("[DEBUG] LXMRouter::new() - registered propagation handler");
+
 		if let Ok(mut router_guard) = router.lock() {
+			eprintln!("[DEBUG] LXMRouter::new() - locked router, calling load_cached_state()");
 			router_guard.self_handle = Some(Arc::downgrade(&router));
 			router_guard.load_cached_state();
+			eprintln!("[DEBUG] LXMRouter::new() - load_cached_state() returned");
 		}
 
-		let router_clone = router.clone();
-		Transport::register_announce_handler(delivery_announce_handler(router_clone.clone()));
-		Transport::register_announce_handler(propagation_announce_handler(router_clone.clone()));
-
+		eprintln!("[DEBUG] LXMRouter::new() - spawning background thread");
 		let job_router = Arc::downgrade(&router);
 		thread::spawn(move || {
+			eprintln!("[DEBUG] Background jobloop thread - STARTED");
 			while let Some(router) = job_router.upgrade() {
 				if let Ok(mut router) = router.lock() {
 					router.jobs();
 				}
 				thread::sleep(Duration::from_secs(Self::PROCESSING_INTERVAL));
 			}
+			eprintln!("[DEBUG] Background jobloop thread - EXITING");
 		});
+		eprintln!("[DEBUG] LXMRouter::new() - background thread spawned, returning router");
 
 		Ok(router)
 	}
@@ -858,6 +871,7 @@ impl LXMRouter {
 	}
 
 	pub fn process_outbound(&mut self) {
+		eprintln!("[DEBUG] process_outbound() - CALLED, {} pending messages", self.pending_outbound.len());
 		let _guard = match self.outbound_processing_lock.lock() {
 			Ok(guard) => guard,
 			Err(_) => return,
@@ -931,9 +945,13 @@ impl LXMRouter {
 									lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 									lxm.progress = 0.01;
 								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
+									eprintln!("[DEBUG] Sending OPPORTUNISTIC message, attempt {}", lxm.delivery_attempts + 1);
 									lxm.delivery_attempts += 1;
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-									let _ = lxm.send();
+									match lxm.send_with_handle(Some(message.clone())) {
+										Ok(_) => eprintln!("[DEBUG] send() succeeded"),
+										Err(e) => eprintln!("[DEBUG] send() FAILED: {}", e),
+									}
 								}
 							} else {
 								self.fail_message(&mut lxm);
@@ -953,8 +971,23 @@ impl LXMRouter {
 											lxm.progress = 0.05;
 										}
 										if lxm.state != LXMessage::SENDING {
+											if let Ok(link_guard) = link_arc.lock() {
+												if let Ok(destination_guard) = link_guard.destination.lock() {
+													let mut link_destination = destination_guard.clone();
+													link_destination.dest_type = DestinationType::Link;
+													link_destination.hash = link_guard.link_id.clone();
+													link_destination.hexhash = hexrep(&link_destination.hash, false);
+													link_destination.link = Some(reticulum_rust::destination::LinkInfo {
+														rtt: link_guard.rtt,
+														traffic_timeout_factor: link_guard.traffic_timeout_factor,
+														status_closed: false,
+														mtu: Some(link_guard.mtu),
+													});
+													lxm.set_delivery_destination(link_destination);
+												}
+											}
 											lxm.set_delivery_link(link_arc.clone());
-											let _ = lxm.send();
+											let _ = lxm.send_with_handle(Some(message.clone()));
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
 										let activated = link_arc.lock().ok().and_then(|link| link.activated_at);
@@ -996,9 +1029,7 @@ impl LXMRouter {
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									if lxm.delivery_attempts < Self::MAX_DELIVERY_ATTEMPTS {
 										if Transport::has_path(&dest_hash) {
-											if lxm.representation == LXMessage::PACKET {
-												let _ = lxm.send();
-											} else if let Some(destination) = lxm.destination().cloned() {
+											if let Some(destination) = lxm.destination().cloned() {
 												if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
 													let link_arc = Arc::new(Mutex::new(link));
 													let router_weak = self.self_handle.clone();
@@ -1010,7 +1041,9 @@ impl LXMRouter {
 																}
 															}
 														}));
+														let _ = link_guard.initiate();
 													}
+													reticulum_rust::link::register_runtime_link(Arc::clone(&link_arc));
 													self.direct_links.insert(dest_hash.clone(), link_arc);
 													lxm.progress = 0.03;
 												}
@@ -1037,8 +1070,23 @@ impl LXMRouter {
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.state != LXMessage::SENDING {
+											if let Ok(link_guard) = link_arc.lock() {
+												if let Ok(destination_guard) = link_guard.destination.lock() {
+													let mut link_destination = destination_guard.clone();
+													link_destination.dest_type = DestinationType::Link;
+													link_destination.hash = link_guard.link_id.clone();
+													link_destination.hexhash = hexrep(&link_destination.hash, false);
+													link_destination.link = Some(reticulum_rust::destination::LinkInfo {
+														rtt: link_guard.rtt,
+														traffic_timeout_factor: link_guard.traffic_timeout_factor,
+														status_closed: false,
+														mtu: Some(link_guard.mtu),
+													});
+													lxm.set_delivery_destination(link_destination);
+												}
+											}
 											lxm.set_delivery_link(link_arc.clone());
-											let _ = lxm.send();
+											let _ = lxm.send_with_handle(Some(message.clone()));
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
 										self.outbound_propagation_link = None;
@@ -1117,8 +1165,10 @@ impl LXMRouter {
 	}
 
 	pub fn handle_outbound(&mut self, message: Arc<Mutex<LXMessage>>) {
+		eprintln!("[DEBUG] handle_outbound: start");
 		let mut unknown_path_requested = false;
 		if let Ok(mut lxm) = message.lock() {
+			eprintln!("[DEBUG] handle_outbound: message lock acquired");
 			let destination_hash = lxm.destination_hash.clone();
 			if lxm.stamp_cost.is_none() {
 				if let Some((_, stamp_cost)) = self.outbound_stamp_costs.get(&destination_hash) {
@@ -1154,10 +1204,17 @@ impl LXMRouter {
 			}
 
 			if lxm.packed.is_none() {
-				let _ = lxm.pack(false);
+				eprintln!("[DEBUG] handle_outbound: packing message");
+				if let Err(e) = lxm.pack(false) {
+					log(&format!("Failed to pack message: {}", e), LOG_ERROR, false, false);
+					eprintln!("[ERROR] Failed to pack message: {}", e);
+					return;
+				}
+				eprintln!("[DEBUG] handle_outbound: message packed");
 			}
 
 			if lxm.method == LXMessage::OPPORTUNISTIC && !Transport::has_path(&destination_hash) {
+				eprintln!("[DEBUG] handle_outbound: path unknown, requesting");
 				Transport::request_path(&destination_hash, None, None, None, None);
 				lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 				unknown_path_requested = true;
@@ -1169,6 +1226,7 @@ impl LXMRouter {
 				lxm.defer_stamp = false;
 			}
 		}
+		eprintln!("[DEBUG] handle_outbound: message prep done");
 
 		let defer_propagation_stamp = message
 			.lock()
@@ -1189,16 +1247,21 @@ impl LXMRouter {
 			.unwrap_or(false);
 
 		if !defer_stamp && !defer_propagation_stamp {
+			eprintln!("[DEBUG] handle_outbound: enqueueing pending outbound");
 			self.pending_outbound.push(message);
 			if !unknown_path_requested {
+				eprintln!("[DEBUG] handle_outbound: calling process_outbound");
 				self.process_outbound();
+				eprintln!("[DEBUG] handle_outbound: process_outbound returned");
 			}
 		} else {
+			eprintln!("[DEBUG] handle_outbound: deferring stamp generation");
 			let message_id = message.lock().ok().and_then(|lxm| lxm.message_id.clone());
 			if let Some(message_id) = message_id {
 				self.pending_deferred_stamps.insert(message_id, message);
 			}
 		}
+		eprintln!("[DEBUG] handle_outbound: end");
 	}
 
 	pub fn fail_message(&self, message: &mut LXMessage) {
@@ -1449,6 +1512,7 @@ impl LXMRouter {
 	}
 
 	fn load_cached_state(&mut self) {
+		eprintln!("[DEBUG] load_cached_state() - reading deliveries");
 		let deliveries_path = format!("{}/local_deliveries", self.storagepath);
 		if let Ok(data) = fs::read(&deliveries_path) {
 			if let Ok(map) = rmp_serde::from_slice::<HashMap<Vec<u8>, f64>>(&data) {
@@ -1464,6 +1528,7 @@ impl LXMRouter {
 			}
 		}
 
+		eprintln!("[DEBUG] load_cached_state() - reading processed");
 		let processed_path = format!("{}/locally_processed", self.storagepath);
 		if let Ok(data) = fs::read(&processed_path) {
 			if let Ok(map) = rmp_serde::from_slice::<HashMap<Vec<u8>, f64>>(&data) {
@@ -1479,25 +1544,40 @@ impl LXMRouter {
 			}
 		}
 
+		eprintln!("[DEBUG] load_cached_state() - clean_transient_id_caches");
 		self.clean_transient_id_caches();
 
+		eprintln!("[DEBUG] load_cached_state() - reading stamp_costs");
 		let stamp_costs_path = format!("{}/outbound_stamp_costs", self.storagepath);
+		eprintln!("[DEBUG] load_cached_state() - stamp_costs_path: {}", stamp_costs_path);
+		eprintln!("[DEBUG] load_cached_state() - about to call fs::read()");
 		if let Ok(data) = fs::read(&stamp_costs_path) {
-			if let Ok(map) = rmp_serde::from_slice::<HashMap<Vec<u8>, (f64, u32)>>(&data) {
-				self.outbound_stamp_costs = map;
-			} else {
-				log(
-					"Invalid data format for loaded outbound stamp costs, recreating",
-					LOG_ERROR,
-					false,
-					false,
-				);
-				self.outbound_stamp_costs = HashMap::new();
+			eprintln!("[DEBUG] load_cached_state() - fs::read() returned {} bytes", data.len());
+			match rmp_serde::from_slice::<HashMap<Vec<u8>, (f64, u32)>>(&data) {
+				Ok(map) => {
+					eprintln!("[DEBUG] load_cached_state() - deserialized {} entries", map.len());
+					self.outbound_stamp_costs = map;
+				}
+				Err(e) => {
+					eprintln!("[DEBUG] load_cached_state() - deserialization FAILED: {}", e);
+					log(
+						"Invalid data format for loaded outbound stamp costs, recreating",
+						LOG_ERROR,
+						false,
+						false,
+					);
+					self.outbound_stamp_costs = HashMap::new();
+				}
 			}
+			eprintln!("[DEBUG] load_cached_state() - clean_outbound_stamp_costs");
 			self.clean_outbound_stamp_costs();
+			eprintln!("[DEBUG] load_cached_state() - save_outbound_stamp_costs");
 			self.save_outbound_stamp_costs();
+			eprintln!("[DEBUG] load_cached_state() - save_outbound_stamp_costs DONE");
 		}
+		eprintln!("[DEBUG] load_cached_state() - stamp_costs section complete");
 
+		eprintln!("[DEBUG] load_cached_state() - reading tickets");
 		let tickets_path = format!("{}/available_tickets", self.storagepath);
 		if let Ok(data) = fs::read(&tickets_path) {
 			if let Ok(tickets) = rmp_serde::from_slice::<AvailableTickets>(&data) {
@@ -1511,9 +1591,13 @@ impl LXMRouter {
 				);
 				self.available_tickets = AvailableTickets::default();
 			}
+			eprintln!("[DEBUG] load_cached_state() - clean_available_tickets");
 			self.clean_available_tickets();
+			eprintln!("[DEBUG] load_cached_state() - save_available_tickets");
 			self.save_available_tickets();
+			eprintln!("[DEBUG] load_cached_state() - save_available_tickets DONE");
 		}
+		eprintln!("[DEBUG] load_cached_state() - COMPLETE");
 	}
 
 	fn clean_links(&mut self) {

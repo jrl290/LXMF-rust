@@ -842,7 +842,7 @@ impl LXMPeer {
 					callback,
 					None,
 					None,
-					0,
+					1,
 					None,
 					None,
 					false,

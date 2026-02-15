@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rmpv::Value;
 
 use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback};
-use reticulum_rust::{log, LOG_NOTICE};
 
 use crate::lx_message::LXMessage;
 use crate::lxmf::{APP_NAME, pn_announce_data_is_valid, stamp_cost_from_app_data};
@@ -102,26 +101,16 @@ pub fn propagation_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHa
 				}
 			} else if router.autopeer && !is_path_response {
 				if propagation_enabled {
-					if reticulum_rust::transport::Transport::hops_to(destination_hash) <= router.autopeer_maxdepth {
-						router.peer(
-							destination_hash.to_vec(),
-							node_timebase as f64,
-							transfer_limit as f64,
-							if sync_limit > 0 { Some(sync_limit as f64) } else { None },
-							stamp_cost as u32,
-							stamp_flex as u32,
-							peering_cost as u32,
-							metadata,
-						);
-					} else if router.peers.contains_key(destination_hash) {
-						log(
-							&format!("Peer {:x?} moved outside auto-peering range, breaking peering...", destination_hash),
-							LOG_NOTICE,
-							false,
-							false,
-						);
-						router.unpeer(destination_hash.to_vec(), Some(node_timebase as f64));
-					}
+					router.peer(
+						destination_hash.to_vec(),
+						node_timebase as f64,
+						transfer_limit as f64,
+						if sync_limit > 0 { Some(sync_limit as f64) } else { None },
+						stamp_cost as u32,
+						stamp_flex as u32,
+						peering_cost as u32,
+						metadata,
+					);
 				} else {
 					router.unpeer(destination_hash.to_vec(), Some(node_timebase as f64));
 				}
