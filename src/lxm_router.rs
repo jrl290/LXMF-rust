@@ -347,9 +347,15 @@ impl LXMRouter {
 		// (Python does this early in __init__ before loading cached state)
 		eprintln!("[DEBUG] LXMRouter::new() - registering announce handlers");
 		let router_clone_for_handlers = router.clone();
-		Transport::register_announce_handler(delivery_announce_handler(router_clone_for_handlers.clone()));
+		eprintln!("[DEBUG] LXMRouter::new() - building delivery handler");
+		let delivery_handler = delivery_announce_handler(router_clone_for_handlers.clone());
+		eprintln!("[DEBUG] LXMRouter::new() - registering delivery handler");
+		Transport::register_announce_handler(delivery_handler);
 		eprintln!("[DEBUG] LXMRouter::new() - registered delivery handler");
-		Transport::register_announce_handler(propagation_announce_handler(router_clone_for_handlers.clone()));
+		eprintln!("[DEBUG] LXMRouter::new() - building propagation handler");
+		let propagation_handler = propagation_announce_handler(router_clone_for_handlers.clone());
+		eprintln!("[DEBUG] LXMRouter::new() - registering propagation handler");
+		Transport::register_announce_handler(propagation_handler);
 		eprintln!("[DEBUG] LXMRouter::new() - registered propagation handler");
 
 		if let Ok(mut router_guard) = router.lock() {
@@ -871,17 +877,41 @@ impl LXMRouter {
 	}
 
 	pub fn process_outbound(&mut self) {
-		eprintln!("[DEBUG] process_outbound() - CALLED, {} pending messages", self.pending_outbound.len());
+		eprintln!("[POB] enter pending={} thread={:?}", self.pending_outbound.len(), thread::current().id());
+		eprintln!("[POB] waiting outbound_processing_lock");
 		let _guard = match self.outbound_processing_lock.lock() {
-			Ok(guard) => guard,
-			Err(_) => return,
+			Ok(guard) => {
+				eprintln!("[POB] outbound_processing_lock acquired");
+				guard
+			}
+			Err(err) => {
+				eprintln!("[POB] outbound_processing_lock poisoned: {}", err);
+				return;
+			}
 		};
 
 		let mut index = 0;
 		while index < self.pending_outbound.len() {
 			let message = self.pending_outbound[index].clone();
 			let mut remove = false;
-			if let Ok(mut lxm) = message.lock() {
+			eprintln!("[POB] index={} pending={} waiting message lock", index, self.pending_outbound.len());
+			let message_lock = message.lock();
+			if let Ok(mut lxm) = message_lock {
+				let message_label = lxm
+					.message_id
+					.as_ref()
+					.or(lxm.hash.as_ref())
+					.map(|id| hexrep(id, false))
+					.unwrap_or_else(|| prettyhexrep(&lxm.destination_hash));
+				eprintln!(
+					"[POB][{}] acquired message lock state={} method={} progress={:.3} attempts={}",
+					message_label,
+					lxm.state,
+					lxm.method,
+					lxm.progress,
+					lxm.delivery_attempts
+				);
+
 				if lxm.state == LXMessage::DELIVERED {
 					if lxm.include_ticket {
 						self.available_tickets
@@ -946,12 +976,12 @@ impl LXMRouter {
 										lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 										lxm.progress = 0.01;
 									} else {
-										eprintln!("[DEBUG] Sending OPPORTUNISTIC message, attempt {}", lxm.delivery_attempts + 1);
+										eprintln!("[POB][{}] stage=opportunistic_send before send_with_handle", message_label);
 										lxm.delivery_attempts += 1;
 										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 										match lxm.send_with_handle(Some(message.clone())) {
-											Ok(_) => eprintln!("[DEBUG] send() succeeded"),
-											Err(e) => eprintln!("[DEBUG] send() FAILED: {}", e),
+											Ok(_) => eprintln!("[POB][{}] stage=opportunistic_send returned ok", message_label),
+											Err(e) => eprintln!("[POB][{}] stage=opportunistic_send returned err={}", message_label, e),
 										}
 									}
 								}
@@ -967,13 +997,24 @@ impl LXMRouter {
 									direct_link = self.backchannel_links.get(&dest_hash).cloned();
 								}
 								if let Some(link_arc) = direct_link {
+									eprintln!("[POB][{}] stage=direct waiting link status lock", message_label);
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+									eprintln!("[POB][{}] stage=direct got link status={}", message_label, status);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.progress < 0.05 {
 											lxm.progress = 0.05;
 										}
 										if lxm.state != LXMessage::SENDING {
-											if let Ok(link_guard) = link_arc.lock() {
+											let source_identity = lxm
+												.source()
+												.and_then(|source| source.identity.clone());
+											eprintln!("[POB][{}] stage=direct waiting link setup lock", message_label);
+											if let Ok(mut link_guard) = link_arc.lock() {
+												if let Some(identity) = source_identity {
+													if let Err(e) = link_guard.identify(&identity) {
+														eprintln!("[direct] link identify error: {}", e);
+													}
+												}
 												if let Ok(destination_guard) = link_guard.destination.lock() {
 													let mut link_destination = destination_guard.clone();
 													link_destination.dest_type = DestinationType::Link;
@@ -989,7 +1030,14 @@ impl LXMRouter {
 												}
 											}
 											lxm.set_delivery_link(link_arc.clone());
-											let _ = lxm.send_with_handle(Some(message.clone()));
+											eprintln!("[POB][{}] stage=direct_send before send_with_handle", message_label);
+											if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
+												eprintln!("[POB][{}] stage=direct_send returned err={}", message_label, err);
+												lxm.state = LXMessage::OUTBOUND;
+												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+											} else {
+												eprintln!("[POB][{}] stage=direct_send returned ok", message_label);
+											}
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
 										let activated = link_arc.lock().ok().and_then(|link| link.activated_at);
@@ -1012,8 +1060,26 @@ impl LXMRouter {
 										self.backchannel_identified_links.remove(&dest_hash);
 										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									} else {
+										let pending_for = link_arc
+											.lock()
+											.map(|link| {
+												link
+													.request_time
+													.map(|requested| (now() - requested as f64).max(0.0))
+													.unwrap_or(0.0)
+											})
+											.unwrap_or(0.0);
+										eprintln!(
+											"[direct] pending link for {} ({:.1}s elapsed)",
+											prettyhexrep(&dest_hash),
+											pending_for
+										);
 										log(
-											&format!("Direct link to {} pending", prettyhexrep(&dest_hash)),
+											&format!(
+												"Direct link to {} pending ({:.1}s elapsed)",
+												prettyhexrep(&dest_hash),
+												pending_for
+											),
 											LOG_DEBUG,
 											false,
 											false,
@@ -1069,7 +1135,9 @@ impl LXMRouter {
 							} else if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 								let node_hash = self.outbound_propagation_node.clone().unwrap();
 								if let Some(link_arc) = self.outbound_propagation_link.clone() {
+									eprintln!("[POB][{}] stage=propagated waiting link status lock", message_label);
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+									eprintln!("[POB][{}] stage=propagated got link status={}", message_label, status);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.state != LXMessage::SENDING {
 											if let Ok(link_guard) = link_arc.lock() {
@@ -1088,14 +1156,30 @@ impl LXMRouter {
 												}
 											}
 											lxm.set_delivery_link(link_arc.clone());
-											let _ = lxm.send_with_handle(Some(message.clone()));
+											eprintln!("[POB][{}] stage=propagated_send before send_with_handle", message_label);
+											if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
+												eprintln!("[POB][{}] stage=propagated_send returned err={}", message_label, err);
+												lxm.state = LXMessage::OUTBOUND;
+												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+											} else {
+												eprintln!("[POB][{}] stage=propagated_send returned ok", message_label);
+											}
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
 										self.outbound_propagation_link = None;
 										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									} else {
+										let pending_for = link_arc
+											.lock()
+											.map(|link| {
+												link
+													.request_time
+													.map(|requested| (now() - requested as f64).max(0.0))
+													.unwrap_or(0.0)
+											})
+											.unwrap_or(0.0);
 										log(
-											&format!("Propagation link to {} pending", prettyhexrep(&node_hash)),
+											&format!("Propagation link to {} pending ({:.1}s elapsed)", prettyhexrep(&node_hash), pending_for),
 											LOG_DEBUG,
 											false,
 											false,
@@ -1157,13 +1241,19 @@ impl LXMRouter {
 						_ => {}
 					}
 				}
-			}
-			if remove {
-				self.pending_outbound.remove(index);
+				if remove {
+					eprintln!("[POB][{}] remove=true removing index={}", message_label, index);
+					self.pending_outbound.remove(index);
+				} else {
+					eprintln!("[POB][{}] remove=false keep index={}", message_label, index);
+					index += 1;
+				}
 			} else {
+				eprintln!("[POB] failed to lock message at index={}, skipping", index);
 				index += 1;
 			}
 		}
+		eprintln!("[POB] exit pending={}", self.pending_outbound.len());
 	}
 
 	pub fn handle_outbound(&mut self, message: Arc<Mutex<LXMessage>>) {
