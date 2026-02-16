@@ -290,6 +290,67 @@ impl LXMessage {
 		}
 	}
 
+	/// Human-readable name for a message state constant.
+	pub fn state_name(state: u8) -> &'static str {
+		match state {
+			Self::GENERATING => "GENERATING",
+			Self::OUTBOUND => "OUTBOUND",
+			Self::SENDING => "SENDING",
+			Self::SENT => "SENT",
+			Self::DELIVERED => "DELIVERED",
+			Self::PAPER => "PAPER",
+			Self::PROPAGATED => "PROPAGATED",
+			Self::FAILED => "FAILED",
+			Self::CANCELLED => "CANCELLED",
+			Self::REJECTED => "REJECTED",
+			_ => "UNKNOWN",
+		}
+	}
+
+	/// Human-readable name for a representation constant.
+	pub fn representation_name(repr: u8) -> &'static str {
+		match repr {
+			Self::PACKET => "PACKET",
+			Self::RESOURCE => "RESOURCE",
+			_ => "UNKNOWN",
+		}
+	}
+
+	/// Human-readable name for a delivery method constant.
+	pub fn method_name(method: u8) -> &'static str {
+		match method {
+			Self::OPPORTUNISTIC => "OPPORTUNISTIC",
+			Self::DIRECT => "DIRECT",
+			Self::PROPAGATED => "PROPAGATED",
+			Self::PAPER => "PAPER",
+			_ => "UNKNOWN",
+		}
+	}
+
+	/// Add a file attachment to this message.
+	///
+	/// Filenames are encoded as msgpack strings (not binary) for
+	/// compatibility with Python receivers (Sideband, MeshChat).
+	pub fn add_file_attachment(&mut self, filename: &str, data: Vec<u8>) {
+		use crate::lxmf::FIELD_FILE_ATTACHMENTS;
+
+		let entry = Value::Array(vec![
+			Value::String(filename.into()),
+			Value::Binary(data),
+		]);
+
+		if let Value::Map(entries) = &mut self.fields {
+			let key = Value::from(FIELD_FILE_ATTACHMENTS as i64);
+			if let Some((_, existing)) = entries.iter_mut().find(|(k, _)| *k == key) {
+				if let Value::Array(list) = existing {
+					list.push(entry);
+					return;
+				}
+			}
+			entries.push((key, Value::Array(vec![entry])));
+		}
+	}
+
 	pub fn destination(&self) -> Option<&Destination> {
 		self.destination.as_ref()
 	}

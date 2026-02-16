@@ -1,6 +1,5 @@
 use std::env;
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,11 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use data_encoding::BASE32;
-use rmpv::Value;
 
-use lxmf_rust::lxmf::FIELD_FILE_ATTACHMENTS;
 use lxmf_rust::{LXMRouter, LXMessage};
-use reticulum_rust::destination::{Destination, DestinationType};
+use reticulum_rust::destination::Destination;
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
@@ -57,67 +54,11 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
 
-fn resolve_recipient_identity(dest_hash: &[u8]) -> Result<Identity, String> {
-    let public_key = Identity::recall_public_key(dest_hash)
-        .ok_or("Destination public key not found after path request")?;
-
-    let mut swapped = public_key.clone();
-    if swapped.len() == 64 {
-        swapped[..32].copy_from_slice(&public_key[32..64]);
-        swapped[32..64].copy_from_slice(&public_key[..32]);
-    }
-
-    let candidates = vec![public_key, swapped];
-    for candidate in candidates {
-        if let Ok(identity) = Identity::from_public_key(&candidate) {
-            if let Ok(destination) = Destination::new_outbound(
-                Some(identity.clone()),
-                DestinationType::Single,
-                "lxmf".to_string(),
-                vec!["delivery".to_string()],
-            ) {
-                if destination.hash == dest_hash {
-                    return Ok(identity);
-                }
-            }
-        }
-    }
-
-    Identity::from_public_key(
-        &Identity::recall_public_key(dest_hash)
-            .ok_or("Destination public key not found after path request")?,
-    )
-}
-
 fn unix_timestamp_string() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:03}", now.as_secs(), now.subsec_millis())
-}
-
-fn state_name(state: u8) -> &'static str {
-    match state {
-        LXMessage::GENERATING => "GENERATING",
-        LXMessage::OUTBOUND => "OUTBOUND",
-        LXMessage::SENDING => "SENDING",
-        LXMessage::SENT => "SENT",
-        LXMessage::DELIVERED => "DELIVERED",
-        LXMessage::PAPER => "PAPER",
-        LXMessage::PROPAGATED => "PROPAGATED",
-        LXMessage::FAILED => "FAILED",
-        LXMessage::CANCELLED => "CANCELLED",
-        LXMessage::REJECTED => "REJECTED",
-        _ => "UNKNOWN",
-    }
-}
-
-fn filename_bytes(path: &Path) -> Vec<u8> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("attachment.bin")
-        .as_bytes()
-        .to_vec()
 }
 
 fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -243,7 +184,7 @@ fn main() -> Result<(), String> {
         message_text.as_bytes().to_vec()
     };
 
-    let mut fields: Option<Value> = None;
+    let mut attachment_info: Option<(String, Vec<u8>)> = None;
     if let Some(path) = attachment_path.as_ref() {
         let mut attachment_data = fs::read(path)
             .map_err(|e| format!("Failed to read attachment {}: {e}", path.display()))?;
@@ -260,15 +201,6 @@ fn main() -> Result<(), String> {
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let attachment_entry = Value::Array(vec![
-            Value::String(filename_str.into()),
-            Value::Binary(attachment_data.clone()),
-        ]);
-
-        fields = Some(Value::Map(vec![(
-            Value::from(FIELD_FILE_ATTACHMENTS as i64),
-            Value::Array(vec![attachment_entry]),
-        )]));
 
         if content.is_empty() {
             content = b"Binary attachment from Rust send CLI".to_vec();
@@ -280,6 +212,8 @@ fn main() -> Result<(), String> {
             attachment_data.len(),
             repeat_count
         );
+
+        attachment_info = Some((filename_str, attachment_data));
     }
 
     let target_override = arg_value_flexible(&args, "--to");
@@ -463,24 +397,10 @@ fn main() -> Result<(), String> {
 
     let has_path = Transport::has_path(&dest_hash);
     eprintln!("[step] has_path: {}", has_path);
-    eprintln!("[step] recall destination identity");
+    eprintln!("[step] resolve destination from hash");
     let destination_setup_start = Instant::now();
-    let dest_identity = resolve_recipient_identity(&dest_hash)?;
-    eprintln!("[step] create outbound destination");
-    let mut destination = Destination::new_outbound(
-        Some(dest_identity),
-        DestinationType::Single,
-        "lxmf".to_string(),
-        vec!["delivery".to_string()],
-    )?;
-
-    eprintln!("[step] target hash: {}", to_hex(&dest_hash));
-    eprintln!("[step] computed destination hash: {}", to_hex(&destination.hash));
-    if destination.hash != dest_hash {
-        eprintln!("[warn] destination hash mismatch, forcing target hash");
-        destination.hash = dest_hash.clone();
-        destination.hexhash = to_hex(&destination.hash);
-    }
+    let destination = Destination::from_destination_hash(&dest_hash, "lxmf", &["delivery"])?;
+    eprintln!("[step] destination hash: {}", to_hex(&destination.hash));
     eprintln!(
         "[timing] destination_setup: {:.3}s",
         destination_setup_start.elapsed().as_secs_f64()
@@ -517,32 +437,28 @@ fn main() -> Result<(), String> {
         other => return Err(format!("Invalid --mode/--method value: {other}. Use direct|opportunistic|auto")),
     };
 
-    eprintln!(
-        "[method] selected: {}",
-        match method {
-            LXMessage::DIRECT => "DIRECT",
-            LXMessage::OPPORTUNISTIC => "OPPORTUNISTIC",
-            _ => "UNKNOWN",
-        }
-    );
+    eprintln!("[method] selected: {}", LXMessage::method_name(method));
 
     let wait_seconds = PY_SENDER_POST_SEND_SECONDS;
     eprintln!("[config] Post-send wait: {}s", wait_seconds);
 
     eprintln!("[step] build message");
     let message_build_start = Instant::now();
-    let message = LXMessage::new(
+    let mut message = LXMessage::new(
         Some(destination),
         Some(source),
         Some(content),
         Some(b"Python Test".to_vec()),
-        fields,
+        None,
         Some(method),
         None,
         None,
         None,
         true,
     )?;
+    if let Some((filename, data)) = attachment_info {
+        message.add_file_attachment(&filename, data);
+    }
     eprintln!(
         "[timing] message_build: {:.3}s",
         message_build_start.elapsed().as_secs_f64()
@@ -559,14 +475,7 @@ fn main() -> Result<(), String> {
 
     {
         let locked = handle.lock().map_err(|_| "Message lock poisoned")?;
-        eprintln!(
-            "[message] representation: {}",
-            match locked.representation {
-                LXMessage::PACKET => "PACKET",
-                LXMessage::RESOURCE => "RESOURCE",
-                _ => "UNKNOWN",
-            }
-        );
+        eprintln!("[message] representation: {}", LXMessage::representation_name(locked.representation));
     }
 
     let wait_loop_start = Instant::now();
@@ -577,13 +486,13 @@ fn main() -> Result<(), String> {
                 eprintln!(
                     "[step] message state: {} ({}) progress {:.1}%",
                     locked.state,
-                    state_name(locked.state),
+                    LXMessage::state_name(locked.state),
                     locked.progress * 100.0
                 );
                 next_state_log = Instant::now() + Duration::from_secs(2);
             }
             if locked.state == LXMessage::DELIVERED || locked.state == LXMessage::FAILED {
-                println!("Final message state: {} ({})", locked.state, state_name(locked.state));
+                println!("Final message state: {} ({})", locked.state, LXMessage::state_name(locked.state));
                 eprintln!(
                     "[timing] send_wait: {:.3}s",
                     wait_loop_start.elapsed().as_secs_f64()
