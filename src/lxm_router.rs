@@ -1269,6 +1269,8 @@ impl LXMRouter {
 	pub fn handle_outbound(&mut self, message: Arc<Mutex<LXMessage>>) {
 		eprintln!("[DEBUG] handle_outbound: start");
 		let mut unknown_path_requested = false;
+		let mut defer_stamp = false;
+		let mut defer_propagation_stamp = false;
 		if let Ok(mut lxm) = message.lock() {
 			eprintln!("[DEBUG] handle_outbound: message lock acquired");
 			let destination_hash = lxm.destination_hash.clone();
@@ -1327,26 +1329,16 @@ impl LXMRouter {
 			if lxm.defer_stamp && lxm.stamp_cost.is_none() {
 				lxm.defer_stamp = false;
 			}
+
+			// Capture defer flags while we hold the lock
+			defer_stamp = lxm.defer_stamp;
+			defer_propagation_stamp = if lxm.desired_method == Some(LXMessage::PROPAGATED) {
+				lxm.defer_propagation_stamp
+			} else {
+				false
+			};
 		}
 		eprintln!("[DEBUG] handle_outbound: message prep done");
-
-		let defer_propagation_stamp = message
-			.lock()
-			.ok()
-			.and_then(|lxm| {
-				if lxm.desired_method == Some(LXMessage::PROPAGATED) {
-					Some(lxm.defer_propagation_stamp)
-				} else {
-					Some(false)
-				}
-			})
-			.unwrap_or(false);
-
-		let defer_stamp = message
-			.lock()
-			.ok()
-			.map(|lxm| lxm.defer_stamp)
-			.unwrap_or(false);
 
 		if !defer_stamp && !defer_propagation_stamp {
 			eprintln!("[DEBUG] handle_outbound: enqueueing pending outbound");
