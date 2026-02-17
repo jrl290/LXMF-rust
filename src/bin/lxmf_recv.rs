@@ -5,8 +5,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use data_encoding::BASE32;
-
 use lxmf_rust::{LXMRouter, LXMessage};
 use reticulum_rust::destination::PROVE_ALL;
 use reticulum_rust::identity::Identity;
@@ -15,39 +13,8 @@ use reticulum_rust::reticulum::Reticulum;
 // Default receiver identity: KEY_2 / ADDR_2 from cli_constants.env
 const DEFAULT_KEY: &str = "GVQDBB7XDWV3OFVM76ZY7QGBJVFMTJP5UKCDPD6M5UCCQBCEG7MVCLNQDPKG4HJ77GOAVZMKLSLWQDYYF33KEZFBXPQA6V4UUMUBYZY";
 
-fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
-    if input.len() % 2 != 0 {
-        return Err("Hex string length must be even".to_string());
-    }
-    let mut bytes = Vec::with_capacity(input.len() / 2);
-    let mut chars = input.chars();
-    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
-        let hi_val = hi.to_digit(16).ok_or("Invalid hex digit")?;
-        let lo_val = lo.to_digit(16).ok_or("Invalid hex digit")?;
-        bytes.push(((hi_val << 4) | lo_val) as u8);
-    }
-    Ok(bytes)
-}
-
-fn decode_key(value: &str) -> Result<Vec<u8>, String> {
-    let trimmed = value.trim();
-    if !trimmed.is_empty()
-        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
-        && trimmed.len() % 2 == 0
-    {
-        return decode_hex(trimmed);
-    }
-    let mut padded = trimmed.to_string();
-    while padded.len() % 8 != 0 {
-        padded.push('=');
-    }
-    BASE32
-        .decode(padded.as_bytes())
-        .map_err(|e| format!("Base32 decode failed: {e}"))
-}
-
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    reticulum_rust::hexrep(bytes, false)
 }
 
 fn unix_timestamp_string() -> String {
@@ -178,7 +145,7 @@ fn main() -> Result<(), String> {
 
     // ── Identity & destination ──────────────────────────────────────
     eprintln!("[step] load receiver identity");
-    let key_bytes = decode_key(&key_value)?;
+    let key_bytes = lxmf_rust::decode_key(&key_value)?;
     let identity = Identity::from_bytes(&key_bytes)?;
 
     eprintln!("[step] register delivery identity");

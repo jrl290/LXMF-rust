@@ -6,8 +6,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use data_encoding::BASE32;
-
 use lxmf_rust::{LXMRouter, LXMessage};
 use reticulum_rust::destination::Destination;
 use reticulum_rust::identity::Identity;
@@ -21,37 +19,8 @@ const DEBUG_ADDR_3: &str = "29b00f4f93eb95c08f1c67eb31c5f9f6";
 const DEBUG_MC_RECV_ADDR: &str = "13f4b14dd364a672e853a37fb534678c";
 const PY_SENDER_POST_SEND_SECONDS: u64 = 30;
 
-fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
-    if input.len() % 2 != 0 {
-        return Err("Hex string length must be even".to_string());
-    }
-    let mut bytes = Vec::with_capacity(input.len() / 2);
-    let mut chars = input.chars();
-    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
-        let hi_val = hi.to_digit(16).ok_or("Invalid hex digit")?;
-        let lo_val = lo.to_digit(16).ok_or("Invalid hex digit")?;
-        bytes.push(((hi_val << 4) | lo_val) as u8);
-    }
-    Ok(bytes)
-}
-
-fn decode_key(value: &str) -> Result<Vec<u8>, String> {
-    let trimmed = value.trim();
-    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) && trimmed.len() % 2 == 0 {
-        return decode_hex(trimmed);
-    }
-
-    let mut padded = trimmed.to_string();
-    while padded.len() % 8 != 0 {
-        padded.push('=');
-    }
-    BASE32
-        .decode(padded.as_bytes())
-        .map_err(|e| format!("Base32 decode failed: {e}"))
-}
-
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    reticulum_rust::hexrep(bytes, false)
 }
 
 fn unix_timestamp_string() -> String {
@@ -251,8 +220,9 @@ fn main() -> Result<(), String> {
         }
     };
 
-    let key_bytes = decode_key(&key_value)?;
-    let dest_hash = decode_hex(&dest_hash_hex)?;
+    let key_bytes = lxmf_rust::decode_key(&key_value)?;
+    let dest_hash = reticulum_rust::decode_hex(&dest_hash_hex)
+        .ok_or_else(|| format!("Invalid hex destination hash: {dest_hash_hex}"))?;
     eprintln!("[config] Destination source: {}", dest_source);
     eprintln!("[config] Destination hash: {}", to_hex(&dest_hash));
     eprintln!("[config] Config dir: {}", config_dir.display());

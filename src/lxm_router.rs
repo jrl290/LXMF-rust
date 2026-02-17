@@ -34,18 +34,9 @@ fn now() -> f64 {
 		.unwrap_or(0.0)
 }
 
+// decode_hex moved to reticulum_rust::decode_hex
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-	if hex.len() % 2 != 0 {
-		return None;
-	}
-	let mut bytes = Vec::with_capacity(hex.len() / 2);
-	let mut chars = hex.chars();
-	while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
-		let hi_val = hi.to_digit(16)?;
-		let lo_val = lo.to_digit(16)?;
-		bytes.push(((hi_val << 4) | lo_val) as u8);
-	}
-	Some(bytes)
+	reticulum_rust::decode_hex(hex)
 }
 
 #[derive(Clone)]
