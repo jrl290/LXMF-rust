@@ -22,7 +22,7 @@ fn main() -> Result<(), String> {
     {
         let flag = interrupted.clone();
         if let Err(err) = ctrlc::set_handler(move || {
-            flag.store(true, Ordering::SeqCst);
+            flag.store(true, Ordering::Relaxed);
         }) {
             eprintln!("[warn] Failed to install SIGINT handler: {}", err);
         }
@@ -121,14 +121,16 @@ fn main() -> Result<(), String> {
     eprintln!("[step] register delivery identity");
     let mut delivery_dest = {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
-        router_guard.register_delivery_identity(
+        let dest = router_guard.register_delivery_identity(
             identity,
             Some(display_name.clone()),
             None,
-        )?
+        )?;
+        // Prove all packets (so senders get delivery confirmations)
+        // set_proof_strategy is on the dest, not the router, so do it after unlock
+        dest
     };
 
-    // Prove all packets (so senders get delivery confirmations)
     let _ = delivery_dest.set_proof_strategy(PROVE_ALL);
     let dest_hash = delivery_dest.hash.clone();
     eprintln!("[step] delivery destination: {}", to_hex(&dest_hash));
@@ -141,7 +143,7 @@ fn main() -> Result<(), String> {
     {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
         router_guard.register_delivery_callback(Arc::new(move |message: &LXMessage| {
-            let n = msg_count_cb.fetch_add(1, Ordering::SeqCst) + 1;
+            let n = msg_count_cb.fetch_add(1, Ordering::Relaxed) + 1;
             let ts = unix_timestamp_string();
 
             eprintln!("+--- LXMF Delivery #{} [{}] ---", n, ts);
@@ -212,9 +214,9 @@ fn main() -> Result<(), String> {
     // ── Main loop: announce periodically, wait for messages ─────
     let mut last_announce = Instant::now();
     loop {
-        if interrupted.load(Ordering::SeqCst) {
+        if interrupted.load(Ordering::Relaxed) {
             eprintln!("\n[signal] SIGINT received, shutting down");
-            let count = msg_count.load(Ordering::SeqCst);
+            let count = msg_count.load(Ordering::Relaxed);
             eprintln!(
                 "[summary] received {} message(s) in {:.1}s",
                 count,

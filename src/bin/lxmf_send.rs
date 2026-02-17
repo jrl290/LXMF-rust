@@ -18,7 +18,7 @@ const DEBUG_ADDR_1: &str = "99e5aebb4ac27f05695c98e8e22540ca";
 const DEBUG_ADDR_2: &str = "4c0c6c7f420da5df5203554462cbb3bc";
 const DEBUG_ADDR_3: &str = "29b00f4f93eb95c08f1c67eb31c5f9f6";
 const DEBUG_MC_RECV_ADDR: &str = "13f4b14dd364a672e853a37fb534678c";
-const PY_SENDER_POST_SEND_SECONDS: u64 = 30;
+const DEFAULT_SEND_WAIT_SECONDS: u64 = 60;
 
 fn main() -> Result<(), String> {
     let run_start = Instant::now();
@@ -27,7 +27,7 @@ fn main() -> Result<(), String> {
     {
         let interrupted_flag = interrupted.clone();
         if let Err(err) = ctrlc::set_handler(move || {
-            interrupted_flag.store(true, Ordering::SeqCst);
+            interrupted_flag.store(true, Ordering::Relaxed);
         }) {
             eprintln!("[warn] Failed to install SIGINT handler: {}", err);
         }
@@ -47,14 +47,6 @@ fn main() -> Result<(), String> {
     }
 
     let base_dir = PathBuf::from(env::var("RETICULUM_WORKDIR").unwrap_or_else(|_| "".to_string()));
-    let env_path = if let Some(path) = arg_value_flexible(&args, "--env") {
-        PathBuf::from(path)
-    } else if base_dir.as_os_str().is_empty() {
-        PathBuf::from("cli-tests/cli_constants.env")
-    } else {
-        base_dir.join("cli-tests/cli_constants.env")
-    };
-
     let net_selector = arg_value_flexible(&args, "--net").unwrap_or_else(|| "rpi".to_string());
 
     let config_dir = if let Some(path) = arg_value_flexible(&args, "--config") {
@@ -196,7 +188,6 @@ fn main() -> Result<(), String> {
     eprintln!("[config] Destination source: {}", dest_source);
     eprintln!("[config] Destination hash: {}", to_hex(&dest_hash));
     eprintln!("[config] Config dir: {}", config_dir.display());
-    eprintln!("[config] Env file (optional): {}", env_path.display());
     eprintln!("[config] Net profile: {}", net_selector);
     eprintln!("[config] Content size: {} bytes", content.len());
     eprintln!("[config] Delivery mode: {}", mode_arg);
@@ -262,14 +253,11 @@ fn main() -> Result<(), String> {
     eprintln!("[step] register sender destination");
     let source = {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
-        router_guard.register_delivery_identity(source_identity, Some("Python Sender".to_string()), None)?
-    };
-
-    {
-        let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
+        let dest = router_guard.register_delivery_identity(source_identity, Some("Python Sender".to_string()), None)?;
         eprintln!("[step] announce sender destination");
-        router_guard.announce(&source.hash, None);
-    }
+        router_guard.announce(&dest.hash, None);
+        dest
+    };
     eprintln!(
         "[timing] identity_register_announce: {:.3}s",
         identity_register_start.elapsed().as_secs_f64()
@@ -318,7 +306,7 @@ fn main() -> Result<(), String> {
                 );
                 break;
             }
-            if interrupted.load(Ordering::SeqCst) {
+            if interrupted.load(Ordering::Relaxed) {
                 eprintln!("[signal] SIGINT received, stopping during path resolution");
                 eprintln!("[timing] total_elapsed: {:.3}s", run_start.elapsed().as_secs_f64());
                 eprintln!("[time] finished: {}", unix_timestamp_string());
@@ -379,7 +367,9 @@ fn main() -> Result<(), String> {
 
     eprintln!("[method] selected: {}", LXMessage::method_name(method));
 
-    let wait_seconds = PY_SENDER_POST_SEND_SECONDS;
+    let wait_seconds = arg_value(&args, "--wait")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SEND_WAIT_SECONDS);
     eprintln!("[config] Post-send wait: {}s", wait_seconds);
 
     eprintln!("[step] build message");
@@ -431,7 +421,7 @@ fn main() -> Result<(), String> {
                 );
                 next_state_log = Instant::now() + Duration::from_secs(2);
             }
-            if locked.state == LXMessage::DELIVERED || locked.state == LXMessage::FAILED {
+            if locked.state == LXMessage::DELIVERED {
                 println!("Final message state: {} ({})", locked.state, LXMessage::state_name(locked.state));
                 eprintln!(
                     "[timing] send_wait: {:.3}s",
@@ -441,8 +431,18 @@ fn main() -> Result<(), String> {
                 eprintln!("[time] finished: {}", unix_timestamp_string());
                 return Ok(());
             }
+            if locked.state == LXMessage::FAILED {
+                println!("Final message state: {} ({})", locked.state, LXMessage::state_name(locked.state));
+                eprintln!(
+                    "[timing] send_wait: {:.3}s",
+                    wait_loop_start.elapsed().as_secs_f64()
+                );
+                eprintln!("[timing] total_elapsed: {:.3}s", run_start.elapsed().as_secs_f64());
+                eprintln!("[time] finished: {}", unix_timestamp_string());
+                std::process::exit(1);
+            }
         }
-        if interrupted.load(Ordering::SeqCst) {
+        if interrupted.load(Ordering::Relaxed) {
             eprintln!("[signal] SIGINT received, stopping during send wait");
             eprintln!(
                 "[timing] send_wait: {:.3}s",
@@ -455,9 +455,17 @@ fn main() -> Result<(), String> {
         thread::sleep(Duration::from_millis(200));
     }
 
-    println!("Message send wait complete");
+    eprintln!("[error] send wait timed out after {}s", wait_seconds);
+    if let Ok(locked) = handle.try_lock() {
+        eprintln!(
+            "[error] final state: {} ({}) progress {:.1}%",
+            locked.state,
+            LXMessage::state_name(locked.state),
+            locked.progress * 100.0
+        );
+    }
     eprintln!("[timing] send_wait: {:.3}s", wait_loop_start.elapsed().as_secs_f64());
     eprintln!("[timing] total_elapsed: {:.3}s", run_start.elapsed().as_secs_f64());
     eprintln!("[time] finished: {}", unix_timestamp_string());
-    Ok(())
+    std::process::exit(2)
 }
