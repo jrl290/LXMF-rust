@@ -2,6 +2,15 @@
 name = "lxmf_rust"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "lxmf_send"
+path = "src/bin/lxmf_send.rs"
+
+[[bin]]
+name = "lxmf_recv"
+path = "src/bin/lxmf_recv.rs"
 
 [dependencies]
 reticulum_rust = { path = "../Reticulum-rust" }

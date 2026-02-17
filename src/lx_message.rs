@@ -351,6 +351,48 @@ impl LXMessage {
 		}
 	}
 
+	/// Return the list of file attachments as `(filename, data)` pairs.
+	///
+	/// Handles filenames stored as either msgpack String or Binary
+	/// (for compatibility with senders using either encoding).
+	pub fn get_file_attachments(&self) -> Vec<(String, Vec<u8>)> {
+		use crate::lxmf::FIELD_FILE_ATTACHMENTS;
+
+		let key = Value::from(FIELD_FILE_ATTACHMENTS as i64);
+		if let Value::Map(entries) = &self.fields {
+			for (k, v) in entries {
+				if *k == key {
+					if let Value::Array(list) = v {
+						let mut result = Vec::new();
+						for entry in list {
+							if let Value::Array(pair) = entry {
+								if pair.len() >= 2 {
+									let filename = match &pair[0] {
+										Value::String(s) => {
+											s.as_str().unwrap_or("attachment.bin").to_string()
+										}
+										Value::Binary(b) => {
+											String::from_utf8(b.clone())
+												.unwrap_or_else(|_| "attachment.bin".to_string())
+										}
+										_ => "attachment.bin".to_string(),
+									};
+									let data = match &pair[1] {
+										Value::Binary(b) => b.clone(),
+										_ => Vec::new(),
+									};
+									result.push((filename, data));
+								}
+							}
+						}
+						return result;
+					}
+				}
+			}
+		}
+		Vec::new()
+	}
+
 	pub fn destination(&self) -> Option<&Destination> {
 		self.destination.as_ref()
 	}
@@ -1344,16 +1386,26 @@ fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
 }
 
 fn resource_concluded_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mutex<Resource>>) {
+	eprintln!("[LXM-RC] resource_concluded_shared called");
 	let resource_guard = match resource.lock() {
 		Ok(guard) => guard,
-		Err(_) => return,
+		Err(_) => {
+			eprintln!("[LXM-RC] failed to lock resource");
+			return;
+		}
 	};
+	eprintln!("[LXM-RC] resource status={:?}", resource_guard.status);
 	if let Ok(mut message) = handle.lock() {
 		if message.method == LXMessage::PROPAGATED {
+			eprintln!("[LXM-RC] calling propagation_resource_concluded");
 			message.propagation_resource_concluded(&resource_guard);
 		} else {
+			eprintln!("[LXM-RC] calling resource_concluded, current state={}", message.state);
 			message.resource_concluded(&resource_guard);
+			eprintln!("[LXM-RC] after resource_concluded, state={}", message.state);
 		}
+	} else {
+		eprintln!("[LXM-RC] failed to lock message handle");
 	}
 }
 

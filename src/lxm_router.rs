@@ -12,7 +12,7 @@ use rmpv::decode::read_value;
 use rmp_serde;
 use serde::{Deserialize, Serialize};
 
-use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL, ALLOW_LIST};
+use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL, ALLOW_LIST, PROVE_ALL};
 use reticulum_rust::identity::{Identity, HASHLENGTH, TRUNCATED_HASHLENGTH};
 use reticulum_rust::link::Link;
 use reticulum_rust::packet::Packet;
@@ -405,8 +405,27 @@ impl LXMRouter {
 
 	pub fn announce(&mut self, destination_hash: &[u8], attached_interface: Option<String>) {
 		let app_data = self.get_announce_app_data(destination_hash);
+		eprintln!("[LXMRouter::announce] dest_hash={} app_data={} delivery_destinations_count={}",
+			hexrep(destination_hash, false),
+			app_data.as_ref().map(|d| d.len()).unwrap_or(0),
+			self.delivery_destinations.len(),
+		);
 		if let Some(destination) = self.delivery_destinations.get_mut(destination_hash) {
-			let _ = destination.announce(app_data.as_deref(), false, attached_interface, None, true);
+			eprintln!("[LXMRouter::announce] found destination, calling destination.announce()");
+			match destination.announce(app_data.as_deref(), false, attached_interface, None, true) {
+				Ok(_) => {
+					eprintln!("[LXMRouter::announce] destination.announce() succeeded");
+					// Sync the destination to Transport so its ratchet keys are current
+					// (rotate_ratchets() runs during announce, generating new keys)
+					Transport::update_destination(destination.clone());
+				}
+				Err(e) => eprintln!("[LXMRouter::announce] destination.announce() FAILED: {}", e),
+			}
+		} else {
+			eprintln!("[LXMRouter::announce] destination NOT FOUND in delivery_destinations");
+			for key in self.delivery_destinations.keys() {
+				eprintln!("[LXMRouter::announce]   registered key: {}", hexrep(key, false));
+			}
 		}
 	}
 
@@ -2453,6 +2472,11 @@ impl LXMRouter {
 		if self.enforce_ratchets {
 			let _ = delivery_destination.enforce_ratchets();
 		}
+
+		// LXMF delivery destinations should always prove packets so senders
+		// receive delivery confirmations. In Python this is set by the caller
+		// on a shared reference, but in Rust we clone, so set it before cloning.
+		let _ = delivery_destination.set_proof_strategy(PROVE_ALL);
 
 		// Note: display_name is not a field on Destination in Rust implementation
 		//delivery_destination.display_name = display_name;
