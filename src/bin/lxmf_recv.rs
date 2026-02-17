@@ -3,46 +3,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use lxmf_rust::{LXMRouter, LXMessage};
+use lxmf_rust::cli_util::{to_hex, unix_timestamp_string, arg_value, arg_value_flexible, has_flag};
 use reticulum_rust::destination::PROVE_ALL;
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
 
 // Default receiver identity: KEY_2 / ADDR_2 from cli_constants.env
 const DEFAULT_KEY: &str = "GVQDBB7XDWV3OFVM76ZY7QGBJVFMTJP5UKCDPD6M5UCCQBCEG7MVCLNQDPKG4HJ77GOAVZMKLSLWQDYYF33KEZFBXPQA6V4UUMUBYZY";
-
-fn to_hex(bytes: &[u8]) -> String {
-    reticulum_rust::hexrep(bytes, false)
-}
-
-fn unix_timestamp_string() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
-}
-
-fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|arg| arg == name)
-        .and_then(|pos| args.get(pos + 1))
-        .map(|s| s.as_str())
-}
-
-fn arg_value_flexible(args: &[String], name: &str) -> Option<String> {
-    if let Some(value) = arg_value(args, name) {
-        return Some(value.to_string());
-    }
-    let prefix = format!("{name}=");
-    args.iter()
-        .find_map(|arg| arg.strip_prefix(&prefix).map(|v| v.to_string()))
-}
-
-fn has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| arg == name)
-}
 
 fn main() -> Result<(), String> {
     let run_start = Instant::now();
@@ -172,12 +142,7 @@ fn main() -> Result<(), String> {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
         router_guard.register_delivery_callback(Arc::new(move |message: &LXMessage| {
             let n = msg_count_cb.fetch_add(1, Ordering::SeqCst) + 1;
-            let ts = {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                format!("{}.{:03}", now.as_secs(), now.subsec_millis())
-            };
+            let ts = unix_timestamp_string();
 
             eprintln!("+--- LXMF Delivery #{} [{}] ---", n, ts);
             eprintln!("| Source hash            : {}", to_hex(&message.source_hash));

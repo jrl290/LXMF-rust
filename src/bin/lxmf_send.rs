@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use lxmf_rust::{LXMRouter, LXMessage};
+use lxmf_rust::cli_util::{to_hex, unix_timestamp_string, arg_value, arg_value_flexible, has_flag};
 use reticulum_rust::destination::Destination;
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
@@ -18,37 +19,6 @@ const DEBUG_ADDR_2: &str = "4c0c6c7f420da5df5203554462cbb3bc";
 const DEBUG_ADDR_3: &str = "29b00f4f93eb95c08f1c67eb31c5f9f6";
 const DEBUG_MC_RECV_ADDR: &str = "13f4b14dd364a672e853a37fb534678c";
 const PY_SENDER_POST_SEND_SECONDS: u64 = 30;
-
-fn to_hex(bytes: &[u8]) -> String {
-    reticulum_rust::hexrep(bytes, false)
-}
-
-fn unix_timestamp_string() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
-}
-
-fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|arg| arg == name)
-        .and_then(|pos| args.get(pos + 1))
-        .map(|s| s.as_str())
-}
-
-fn arg_value_flexible(args: &[String], name: &str) -> Option<String> {
-    if let Some(value) = arg_value(args, name) {
-        return Some(value.to_string());
-    }
-    let prefix = format!("{name}=");
-    args.iter()
-        .find_map(|arg| arg.strip_prefix(&prefix).map(|v| v.to_string()))
-}
-
-fn has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| arg == name)
-}
 
 fn main() -> Result<(), String> {
     let run_start = Instant::now();
