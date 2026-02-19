@@ -7,6 +7,7 @@ pub mod lxm_router;
 pub mod utilities;
 pub mod version;
 pub mod cli_util;
+pub mod ffi;
 
 pub use lx_message::LXMessage;
 pub use lxm_router::LXMRouter;
