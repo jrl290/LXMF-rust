@@ -13,7 +13,7 @@ use reticulum_rust::link::Link;
 use reticulum_rust::packet::{self, Packet};
 use reticulum_rust::resource::{Resource, ResourceData, ResourceStatus};
 use reticulum_rust::transport::Transport;
-use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_ERROR};
+use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_ERROR, LOG_NOTICE};
 
 use crate::lx_stamper as lx_stamper;
 use crate::lxmf::APP_NAME;
@@ -1195,11 +1195,13 @@ impl LXMessage {
 			}) as Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>
 		});
 
+		// Create with advertise=false; we'll use advertise_shared() on the
+		// Arc so the watchdog & link-registered resource share the same state.
 		let resource = Resource::new_internal(
 			resource_data,
 			link,
 			None,
-			true,
+			false,
 			reticulum_rust::resource::AutoCompressOption::Enabled,
 			callback,
 			progress_callback,
@@ -1210,7 +1212,9 @@ impl LXMessage {
 			false,
 			0,
 		)?;
-		Ok(Arc::new(Mutex::new(resource)))
+		let resource_arc = Arc::new(Mutex::new(resource));
+		Resource::advertise_shared(resource_arc.clone());
+		Ok(resource_arc)
 	}
 
 	fn mark_delivered(&mut self) {
@@ -1284,10 +1288,15 @@ impl LXMessage {
 	}
 
 	fn link_packet_timed_out(&mut self) {
+		let msg_hash = self.hash.as_ref().map(|h| hexrep(h, false)).unwrap_or_default();
+		log(&format!("link_packet_timed_out msg={} state={}", msg_hash, self.state), LOG_NOTICE, false, false);
 		if self.state != Self::CANCELLED {
 			if let Some(link) = self.delivery_link.as_ref() {
 				if let Ok(mut link) = link.lock() {
+					log(&format!("link_packet_timed_out tearing down link={}", hexrep(&link.link_id, false)), LOG_NOTICE, false, false);
 					link.teardown();
+				} else {
+					log("link_packet_timed_out: link lock poisoned", LOG_ERROR, false, false);
 				}
 			}
 			self.state = Self::OUTBOUND;

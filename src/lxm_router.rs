@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -149,6 +149,10 @@ pub struct LXMRouter {
 	pub peer_distribution_queue: VecDeque<(Vec<u8>, Option<Vec<u8>>)>,
 
 	pub delivery_callback: Option<Arc<dyn Fn(&LXMessage) + Send + Sync>>,
+	pub announce_callback: Option<Arc<dyn Fn(&[u8], Option<String>) + Send + Sync>>,
+	/// Destination hashes we care about (contacts, pending targets).
+	/// Announces from destinations NOT in this set are ignored.
+	pub watched_destinations: HashSet<Vec<u8>>,
 	pub self_handle: Option<Weak<Mutex<LXMRouter>>>,
 }
 
@@ -331,6 +335,8 @@ impl LXMRouter {
 			propagation_entries: HashMap::new(),
 			peer_distribution_queue: VecDeque::new(),
 			delivery_callback: None,
+			announce_callback: None,
+			watched_destinations: HashSet::new(),
 			self_handle: None,
 		}));
 
@@ -494,6 +500,11 @@ impl LXMRouter {
 			if let Some(router_arc) = router_weak.and_then(|w| w.upgrade()) {
 				if let Ok(mut router) = router_arc.lock() {
 					let app_data = router.get_propagation_node_app_data();
+					// Set default_app_data so path responses also include
+					// the propagation node config (stamp cost, limits, etc.)
+					router
+						.propagation_destination
+						.set_default_app_data(Some(app_data.clone()));
 					let _ = router
 						.propagation_destination
 						.announce(Some(&app_data), false, None, None, true);
@@ -510,8 +521,18 @@ impl LXMRouter {
 	pub fn enable_propagation(&mut self) -> Result<(), String> {
 		let messagepath = format!("{}/messagestore", self.storagepath);
 		self.messagepath = Some(messagepath.clone());
-		fs::create_dir_all(&self.storagepath).map_err(|e| e.to_string())?;
-		fs::create_dir_all(&messagepath).map_err(|e| e.to_string())?;
+		// On Synology/userns-remap hosts, create_dir_all may fail even
+		// though the directory already exists.  Tolerate that.
+		if let Err(e) = fs::create_dir_all(&self.storagepath) {
+			if !std::path::Path::new(&self.storagepath).is_dir() {
+				return Err(format!("Cannot create storage dir {}: {e}", self.storagepath));
+			}
+		}
+		if let Err(e) = fs::create_dir_all(&messagepath) {
+			if !std::path::Path::new(&messagepath).is_dir() {
+				return Err(format!("Cannot create messagestore dir {}: {e}", messagepath));
+			}
+		}
 
 		self.propagation_entries.clear();
 
@@ -768,6 +789,16 @@ impl LXMRouter {
 		Transport::register_destination(control_destination.clone());
 		self.control_destination = Some(control_destination);
 
+		// Set default_app_data immediately so path responses include
+		// propagation node config (stamp cost, limits, etc.) even
+		// before the deferred initial announce fires.
+		let app_data = self.get_propagation_node_app_data();
+		self.propagation_destination.set_default_app_data(Some(app_data));
+
+		// Update the already-registered destination so Transport has
+		// the copy with default_app_data set.
+		Transport::update_destination(self.propagation_destination.clone());
+
 		self.announce_propagation_node();
 		Ok(())
 	}
@@ -887,6 +918,7 @@ impl LXMRouter {
 	}
 
 	pub fn process_outbound(&mut self) {
+		log(&format!("[POB] enter pending={}", self.pending_outbound.len()), LOG_NOTICE, false, false);
 		eprintln!("[POB] enter pending={} thread={:?}", self.pending_outbound.len(), thread::current().id());
 		eprintln!("[POB] waiting outbound_processing_lock");
 		let _guard = match self.outbound_processing_lock.lock() {
@@ -901,6 +933,7 @@ impl LXMRouter {
 		};
 
 		let mut index = 0;
+		let mut backchannel_setup_links: Vec<(Arc<Mutex<Link>>, Vec<u8>)> = Vec::new();
 		while index < self.pending_outbound.len() {
 			let message = self.pending_outbound[index].clone();
 			let mut remove = false;
@@ -913,6 +946,7 @@ impl LXMRouter {
 					.or(lxm.hash.as_ref())
 					.map(|id| hexrep(id, false))
 					.unwrap_or_else(|| prettyhexrep(&lxm.destination_hash));
+				log(&format!("[POB][{}] state={} method={} attempts={}", message_label, lxm.state, lxm.method, lxm.delivery_attempts), LOG_NOTICE, false, false);
 				eprintln!(
 					"[POB][{}] acquired message lock state={} method={} progress={:.3} attempts={}",
 					message_label,
@@ -929,6 +963,49 @@ impl LXMRouter {
 							.insert(lxm.destination_hash.clone(), now());
 						self.save_available_tickets();
 					}
+
+					// Prepare link for backchannel communications (matches Python LXMRouter.py L2527-2540)
+					// After delivery, we identify on our outbound link and set up delivery callbacks
+					// so the remote peer can send messages BACK to us on the same link.
+					if lxm.method == LXMessage::DIRECT {
+						let dest_hash = lxm.destination_hash.clone();
+						if let Some(direct_link) = self.direct_links.get(&dest_hash).cloned() {
+							let is_initiator = direct_link.lock().map(|l| l.initiator).unwrap_or(false);
+							if is_initiator {
+								// Step 1: Identify if not already done
+								if !self.backchannel_identified_links.contains_key(&dest_hash) {
+									let source_hash = lxm.source_hash.clone();
+									let backchannel_identity = self.delivery_destinations.get(&source_hash)
+										.and_then(|d| d.identity.clone());
+									if let Some(identity) = backchannel_identity {
+										if let Ok(mut link_guard) = direct_link.lock() {
+											match link_guard.identify(&identity) {
+												Ok(()) => {
+													self.backchannel_identified_links.insert(dest_hash.clone(), true);
+													log(&format!(
+														"Performed backchannel identification on outbound link to {}",
+														hexrep(&dest_hash, false)
+													), LOG_NOTICE, false, false);
+												},
+												Err(e) => {
+													log(&format!(
+														"Backchannel identify error: {}",
+														e
+													), LOG_NOTICE, false, false);
+												},
+											}
+										}
+									}
+								}
+								// Step 2: ALWAYS set up delivery callbacks on the outbound link
+								// so we can RECEIVE messages from the peer on this same link.
+								// This must happen even if identify was done earlier (pre-send).
+								// Deferred until after the loop to avoid borrow conflict with _guard.
+								backchannel_setup_links.push((direct_link.clone(), dest_hash.clone()));
+							}
+						}
+					}
+
 					remove = true;
 				} else if lxm.method == LXMessage::PROPAGATED && lxm.state == LXMessage::SENT {
 					remove = true;
@@ -997,32 +1074,55 @@ impl LXMRouter {
 								}
 							} else {
 								self.fail_message(&mut lxm);
+								remove = true;
 							}
 						}
 						LXMessage::DIRECT => {
+							log(&format!("[POB][{}] DIRECT entry attempts={} max={}", message_label, lxm.delivery_attempts, Self::MAX_DELIVERY_ATTEMPTS), LOG_NOTICE, false, false);
 							if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 								let dest_hash = lxm.destination_hash.clone();
 								let mut direct_link = self.direct_links.get(&dest_hash).cloned();
 								if direct_link.is_none() {
 									direct_link = self.backchannel_links.get(&dest_hash).cloned();
+								} else if let Some(bl) = self.backchannel_links.get(&dest_hash).cloned() {
+									// Both direct and backchannel exist — prefer whichever was activated more recently.
+									// When a peer establishes its own link to us, packets on our old outbound
+									// link may no longer receive proofs.
+									let dl_activated = direct_link.as_ref().and_then(|d| d.lock().ok().and_then(|l| l.activated_at.map(|t| t as f64))).unwrap_or(0.0);
+									// Use established_at as fallback for incoming links whose LRRTT hasn't arrived yet
+									let bl_activated = bl.lock().ok().and_then(|l| l.activated_at.or(l.established_at).map(|t| t as f64)).unwrap_or(0.0);
+									if bl_activated > dl_activated {
+										log(&format!("[POB][{}] Preferring newer backchannel link over older direct link", message_label), LOG_NOTICE, false, false);
+										direct_link = Some(bl);
+									}
 								}
 								if let Some(link_arc) = direct_link {
-									eprintln!("[POB][{}] stage=direct waiting link status lock", message_label);
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
-									eprintln!("[POB][{}] stage=direct got link status={}", message_label, status);
+									log(&format!("[POB][{}] DIRECT has-link status={}", message_label, status), LOG_NOTICE, false, false);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.progress < 0.05 {
 											lxm.progress = 0.05;
 										}
 										if lxm.state != LXMessage::SENDING {
-											let source_identity = lxm
-												.source()
-												.and_then(|source| source.identity.clone());
-											eprintln!("[POB][{}] stage=direct waiting link setup lock", message_label);
+											log(&format!("[POB][{}] DIRECT ACTIVE sending", message_label), LOG_NOTICE, false, false);
 											if let Ok(mut link_guard) = link_arc.lock() {
-												if let Some(identity) = source_identity {
-													if let Err(e) = link_guard.identify(&identity) {
-														eprintln!("[direct] link identify error: {}", e);
+												// Only identify on outbound links we initiated
+												// (Python doesn't identify in the ACTIVE send branch at all;
+												// backchannel identification is handled separately)
+												if link_guard.initiator && !self.backchannel_identified_links.contains_key(&dest_hash) {
+													let source_identity = lxm
+														.source()
+														.and_then(|source| source.identity.clone());
+													if let Some(identity) = source_identity {
+														log(&format!("[POB][{}] Pre-send identify on link {} to {}", message_label, hexrep(&link_guard.link_id, false), hexrep(&dest_hash, false)), LOG_NOTICE, false, false);
+														if let Err(e) = link_guard.identify(&identity) {
+															log(&format!("[POB][{}] link identify error: {}", message_label, e), LOG_NOTICE, false, false);
+														} else {
+															log(&format!("[POB][{}] Pre-send identify OK on link {}", message_label, hexrep(&link_guard.link_id, false)), LOG_NOTICE, false, false);
+															self.backchannel_identified_links.insert(dest_hash.clone(), true);
+														}
+													} else {
+														log(&format!("[POB][{}] Pre-send identify SKIPPED: source_identity is None", message_label), LOG_NOTICE, false, false);
 													}
 												}
 												if let Ok(destination_guard) = link_guard.destination.lock() {
@@ -1035,21 +1135,23 @@ impl LXMRouter {
 														traffic_timeout_factor: link_guard.traffic_timeout_factor,
 														status_closed: false,
 														mtu: Some(link_guard.mtu),
+														attached_interface: link_guard.attached_interface.clone(),
 													});
 													lxm.set_delivery_destination(link_destination);
 												}
 											}
 											lxm.set_delivery_link(link_arc.clone());
-											eprintln!("[POB][{}] stage=direct_send before send_with_handle", message_label);
 											if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
-												eprintln!("[POB][{}] stage=direct_send returned err={}", message_label, err);
+												log(&format!("[POB][{}] DIRECT send FAILED: {}", message_label, err), LOG_NOTICE, false, false);
 												lxm.state = LXMessage::OUTBOUND;
+												lxm.delivery_attempts += 1;
 												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 											} else {
-												eprintln!("[POB][{}] stage=direct_send returned ok", message_label);
+												log(&format!("[POB][{}] DIRECT send OK", message_label), LOG_NOTICE, false, false);
 											}
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
+										log(&format!("[POB][{}] DIRECT link CLOSED, removing", message_label), LOG_NOTICE, false, false);
 										let activated = link_arc.lock().ok().and_then(|link| link.activated_at);
 										if activated.is_some() {
 											Transport::request_path(&dest_hash, None, None, None, None);
@@ -1064,49 +1166,66 @@ impl LXMRouter {
 												false,
 											);
 										}
+										// Reset SENDING state: the resource transfer died with the link
+										if lxm.state == LXMessage::SENDING {
+											log(&format!("[POB][{}] DIRECT link CLOSED while SENDING, resetting to OUTBOUND", message_label), LOG_NOTICE, false, false);
+											lxm.state = LXMessage::OUTBOUND;
+											lxm.resource_representation = None;
+										}
 										lxm.clear_delivery_link();
 										self.direct_links.remove(&dest_hash);
 										self.backchannel_links.remove(&dest_hash);
 										self.backchannel_identified_links.remove(&dest_hash);
-										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+										// Retry immediately on next cycle instead of waiting DELIVERY_RETRY_WAIT
+										lxm.next_delivery_attempt = Some(now());
 									} else {
 										let pending_for = link_arc
 											.lock()
 											.map(|link| {
 												link
 													.request_time
-													.map(|requested| (now() - requested as f64).max(0.0))
+													.map(|requested| (now() - requested).max(0.0))
 													.unwrap_or(0.0)
 											})
 											.unwrap_or(0.0);
-										eprintln!(
-											"[direct] pending link for {} ({:.1}s elapsed)",
-											prettyhexrep(&dest_hash),
-											pending_for
-										);
 										log(
 											&format!(
-												"Direct link to {} pending ({:.1}s elapsed)",
-												prettyhexrep(&dest_hash),
+												"[POB][{}] DIRECT link PENDING ({:.1}s elapsed)",
+												message_label,
 												pending_for
 											),
-											LOG_DEBUG,
+											LOG_NOTICE,
 											false,
 											false,
 										);
 									}
-								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
-									eprintln!(
-										"[direct] attempts={}, has_path={}, repr={}, next_at={:?}",
-										lxm.delivery_attempts,
-										Transport::has_path(&dest_hash),
-										lxm.representation,
-										lxm.next_delivery_attempt
-									);
+								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true)
+									|| Transport::has_path(&dest_hash) {
+									// Reset SENDING state: no link exists, any prior resource transfer is gone
+									if lxm.state == LXMessage::SENDING {
+										log(&format!("[POB][{}] DIRECT no-link while SENDING, resetting to OUTBOUND", message_label), LOG_NOTICE, false, false);
+										lxm.state = LXMessage::OUTBOUND;
+										lxm.resource_representation = None;
+									}
+									let has_path = Transport::has_path(&dest_hash);
+									log(&format!("[POB][{}] DIRECT no-link try: attempts={} has_path={}", message_label, lxm.delivery_attempts, has_path), LOG_NOTICE, false, false);
 									lxm.delivery_attempts += 1;
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									if lxm.delivery_attempts < Self::MAX_DELIVERY_ATTEMPTS {
 										if Transport::has_path(&dest_hash) {
+											// If the message has no Destination object, try to resolve it from the hash
+											if lxm.destination().is_none() {
+												log(&format!("Resolving destination for {}", prettyhexrep(&dest_hash)), LOG_NOTICE, false, false);
+												match Destination::from_destination_hash(&dest_hash, "lxmf", &["delivery"]) {
+													Ok(dest) => {
+														log("Destination resolved OK", LOG_NOTICE, false, false);
+														let _ = lxm.set_destination(dest);
+													}
+													Err(e) => {
+														log(&format!("Destination resolution failed: {}", e), LOG_NOTICE, false, false);
+													}
+												}
+											}
 											if let Some(destination) = lxm.destination().cloned() {
 												if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
 													let link_arc = Arc::new(Mutex::new(link));
@@ -1129,19 +1248,24 @@ impl LXMRouter {
 												log("Missing destination identity for direct delivery", LOG_ERROR, false, false);
 											}
 										} else {
+											log(&format!("No path to {}, requesting", prettyhexrep(&dest_hash)), LOG_NOTICE, false, false);
 											Transport::request_path(&dest_hash, None, None, None, None);
 											lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 											lxm.progress = 0.01;
 										}
 									}
+								} else {
+									log(&format!("[POB][{}] DIRECT no-link WAITING for path next_at={:?}", message_label, lxm.next_delivery_attempt), LOG_NOTICE, false, false);
 								}
 							} else {
 								self.fail_message(&mut lxm);
+								remove = true;
 							}
 						}
 						LXMessage::PROPAGATED => {
 							if self.outbound_propagation_node.is_none() {
 								self.fail_message(&mut lxm);
+								remove = true;
 							} else if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 								let node_hash = self.outbound_propagation_node.clone().unwrap();
 								if let Some(link_arc) = self.outbound_propagation_link.clone() {
@@ -1161,6 +1285,7 @@ impl LXMRouter {
 														traffic_timeout_factor: link_guard.traffic_timeout_factor,
 														status_closed: false,
 														mtu: Some(link_guard.mtu),
+														attached_interface: link_guard.attached_interface.clone(),
 													});
 													lxm.set_delivery_destination(link_destination);
 												}
@@ -1184,7 +1309,7 @@ impl LXMRouter {
 											.map(|link| {
 												link
 													.request_time
-													.map(|requested| (now() - requested as f64).max(0.0))
+													.map(|requested| (now() - requested).max(0.0))
 													.unwrap_or(0.0)
 											})
 											.unwrap_or(0.0);
@@ -1245,6 +1370,7 @@ impl LXMRouter {
 									}
 								} else {
 									self.fail_message(&mut lxm);
+									remove = true;
 								}
 							}
 						}
@@ -1264,6 +1390,20 @@ impl LXMRouter {
 			}
 		}
 		eprintln!("[POB] exit pending={}", self.pending_outbound.len());
+
+		// Drop the processing lock before calling delivery_link_established
+		// (which needs &mut self)
+		drop(_guard);
+
+		// Set up backchannel delivery callbacks on any outbound links
+		// that just had messages DELIVERED
+		for (link, dest_hash) in backchannel_setup_links {
+			self.delivery_link_established(link);
+			log(&format!(
+				"Set up backchannel delivery callbacks on outbound link to {}",
+				hexrep(&dest_hash, false)
+			), LOG_NOTICE, false, false);
+		}
 	}
 
 	pub fn handle_outbound(&mut self, message: Arc<Mutex<LXMessage>>) {
@@ -2501,6 +2641,24 @@ impl LXMRouter {
 		self.delivery_callback = Some(callback);
 	}
 
+	/// Register a callback that fires when a delivery announce is received.
+	/// The callback receives (destination_hash, Option<display_name>).
+	pub fn register_announce_callback(&mut self, callback: Arc<dyn Fn(&[u8], Option<String>) + Send + Sync>) {
+		self.announce_callback = Some(callback);
+	}
+
+	/// Add a destination hash to the watch list.
+	/// Only announces from watched destinations (or pending outbound targets)
+	/// will be fully processed.
+	pub fn watch_destination(&mut self, dest_hash: &[u8]) {
+		self.watched_destinations.insert(dest_hash.to_vec());
+	}
+
+	/// Remove a destination hash from the watch list.
+	pub fn unwatch_destination(&mut self, dest_hash: &[u8]) {
+		self.watched_destinations.remove(dest_hash);
+	}
+
 	/// Set the required stamp cost for inbound messages to a delivery destination
 	pub fn set_inbound_stamp_cost(&mut self, destination_hash: &[u8], stamp_cost: Option<u32>) -> bool {
 		if self.delivery_destinations.contains_key(destination_hash) {
@@ -2538,12 +2696,16 @@ impl LXMRouter {
 		no_stamp_enforcement: bool,
 		allow_duplicate: bool,
 	) -> bool {
+		log(&format!("[LXMF-DELIVERY] enter data_len={} method={:?} dest_type={:?}", lxmf_data.len(), method, destination_type), LOG_NOTICE, false, false);
 		let mut message = match LXMessage::unpack_from_bytes(lxmf_data, method) {
-			Ok(msg) => msg,
+			Ok(msg) => {
+				log(&format!("[LXMF-DELIVERY] unpacked OK source={} dest={}", hexrep(&msg.source_hash, false), hexrep(&msg.destination_hash, false)), LOG_NOTICE, false, false);
+				msg
+			}
 			Err(e) => {
 				log(
-					&format!("Could not assemble LXMF message from received data: {}", e),
-					LOG_DEBUG,
+					&format!("[LXMF-DELIVERY] unpack FAILED: {}", e),
+					LOG_NOTICE,
 					false,
 					false,
 				);
@@ -2687,6 +2849,11 @@ impl LXMRouter {
 
 	/// Handle delivery packet
 	pub fn delivery_packet(&mut self, data: &[u8], packet: &Packet) {
+		log(&format!("delivery_packet received: data_len={} dest_type={:?} dest_hash={}",
+			data.len(),
+			packet.destination_type,
+			packet.destination_hash.as_ref().map(|h| hexrep(h, false)).unwrap_or_default()
+		), LOG_NOTICE, false, false);
 		let _ = packet.prove(None);
 
 		let mut rssi = packet.rssi;
@@ -2731,6 +2898,9 @@ impl LXMRouter {
 	/// Callback when delivery link is established
 	pub fn delivery_link_established(&mut self, link: Arc<Mutex<Link>>) {
 		if let Ok(mut link_guard) = link.lock() {
+			let link_id_hex = hexrep(&link_guard.link_id, false);
+			let is_initiator = link_guard.initiator;
+			log(&format!("delivery_link_established: link={} initiator={}", link_id_hex, is_initiator), LOG_NOTICE, false, false);
 			link_guard.track_phy_stats = true;
 
 			// Set packet callback
@@ -2776,10 +2946,15 @@ impl LXMRouter {
 
 			let router_weak3 = self.self_handle.clone();
 			link_guard.callbacks.resource_concluded = Some(Arc::new(move |resource| {
+				log("LXMF delivery resource concluded", LOG_DEBUG, false, false);
 				if let Some(router_arc) = router_weak3.as_ref().and_then(|w| w.upgrade()) {
 					if let Ok(mut router) = router_arc.lock() {
 						router.delivery_resource_concluded(resource);
+					} else {
+						log("[LXMF] resource_concluded: FAILED to lock router", LOG_ERROR, false, false);
 					}
+				} else {
+					log("[LXMF] resource_concluded: router Weak ref expired", LOG_ERROR, false, false);
 				}
 			}));
 
@@ -2817,18 +2992,19 @@ impl LXMRouter {
 
 	/// Handle delivery resource conclusion
 	pub fn delivery_resource_concluded(&mut self, resource: Arc<Mutex<Resource>>) {
-		log(
-			&format!("Transfer concluded for LXMF delivery resource"),
-			LOG_DEBUG,
-			false,
-			false,
-		);
-
 		if let Ok(res) = resource.lock() {
+			log(&format!("LXMF delivery resource concluded status={:?} data_len={} split={} seg={}/{}",
+				res.status, res.data.as_ref().map(|d| d.len()).unwrap_or(0),
+				res.split, res.segment_index, res.total_segments), LOG_DEBUG, false, false);
 			if res.status == ResourceStatus::Complete {
 				let data = match &res.data {
-					Some(bytes) => bytes.clone(),
-					None => return,
+					Some(bytes) if !bytes.is_empty() => bytes.clone(),
+					_ => {
+						// Non-final segment of a split resource — data is on disk,
+						// not available yet. Skip until the final segment delivers
+						// the combined data.
+						return;
+					}
 				};
 
 				let link_arc = res.link.clone();
@@ -2864,6 +3040,26 @@ impl LXMRouter {
 			Some(&identity),
 		);
 
+		// If we have an existing outbound direct link to this peer, tear it down.
+		// The peer has established its own link, indicating it prefers this channel.
+		// Keeping the old link causes delivery failures: we'd send on a link the
+		// peer no longer services, the proof never arrives, and we time out.
+		if let Some(old_link) = self.direct_links.remove(&destination_hash) {
+			log(
+				&format!(
+					"Peer {} established backchannel; tearing down old direct link",
+					hexrep(&destination_hash, false)
+				),
+				LOG_NOTICE,
+				false,
+				false,
+			);
+			if let Ok(mut old_guard) = old_link.lock() {
+				old_guard.teardown();
+			}
+			self.backchannel_identified_links.remove(&destination_hash);
+		}
+
 		self.backchannel_links.insert(destination_hash.clone(), link.clone());
 
 		log(
@@ -2871,7 +3067,7 @@ impl LXMRouter {
 				"Backchannel became available for {} on delivery link",
 				hexrep(&destination_hash, false)
 			),
-			LOG_DEBUG,
+			LOG_NOTICE,
 			false,
 			false,
 		);
@@ -3193,6 +3389,14 @@ impl LXMRouter {
 			if let Ok(link) = link_arc.lock() {
 				if link.status == reticulum_rust::link::STATE_ACTIVE {
 					self.propagation_transfer_state = Self::PR_LINK_ESTABLISHED;
+
+					// Identify ourselves on the link before requesting messages
+					if let Ok(mut link_guard) = link_arc.lock() {
+						if let Err(e) = link_guard.identify(&identity) {
+							log(&format!("Failed to identify on propagation link: {}", e), LOG_ERROR, false, false);
+						}
+					}
+
 					if let Ok(mut link_guard) = link_arc.lock() {
 						link_guard.callbacks.packet = Some(Arc::new({
 							let router_weak = self.self_handle.clone();

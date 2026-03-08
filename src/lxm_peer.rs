@@ -833,11 +833,13 @@ impl LXMPeer {
 					}) as Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>
 				});
 
+				// Create with advertise=false; use advertise_shared() so the
+				// watchdog & link-registered resource share the same state.
 				let resource = Resource::new_internal(
 					resource_data,
 					link,
 					None,
-					true,
+					false,
 					reticulum_rust::resource::AutoCompressOption::Enabled,
 					callback,
 					None,
@@ -854,10 +856,12 @@ impl LXMPeer {
 				});
 
 				if let Ok(resource) = resource {
+					let resource_arc = Arc::new(Mutex::new(resource));
+					Resource::advertise_shared(resource_arc.clone());
 					self.currently_transferring_messages = Some(wanted_message_ids);
 					self.current_sync_transfer_started = Some(now());
 					self.state = Self::RESOURCE_TRANSFERRING;
-					let _ = resource;
+					let _ = resource_arc;
 				}
 			}
 		} else {

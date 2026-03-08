@@ -12,6 +12,10 @@ path = "src/bin/lxmf_send.rs"
 name = "lxmf_recv"
 path = "src/bin/lxmf_recv.rs"
 
+[[bin]]
+name = "lxmd"
+path = "src/bin/lxmd.rs"
+
 [dependencies]
 reticulum_rust = { path = "../Reticulum-rust" }
 rmp = "0.8.14"

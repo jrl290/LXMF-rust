@@ -1,0 +1,32 @@
+services:
+  lxmd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lxmd-propagation-node
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "${LXMD_PORT:-37428}:37428"
+    volumes:
+      - /docker/lxmf-propagation/lxmd:/data/lxmd
+      - /docker/lxmf-propagation/reticulum:/data/reticulum
+    environment:
+      - LXMD_NODE_NAME=${LXMD_NODE_NAME:-}
+      - LXMD_ANNOUNCE_INTERVAL=${LXMD_ANNOUNCE_INTERVAL:-360}
+      - LXMD_STORAGE_LIMIT_MB=${LXMD_STORAGE_LIMIT_MB:-500}
+      - LXMD_STATIC_PEERS=${LXMD_STATIC_PEERS:-}
+      - LXMD_BANDWIDTH_LIMIT=${LXMD_BANDWIDTH_LIMIT:-10mbit}
+    command:
+      - "--config"
+      - "/data/lxmd"
+      - "--rnsconfig"
+      - "/data/reticulum"
+      - "--name"
+      - "${LXMD_NODE_NAME:-Rust Propagation Node}"
+      - "--announce-interval"
+      - "${LXMD_ANNOUNCE_INTERVAL:-360}"
+      - "--storage-limit"
+      - "${LXMD_STORAGE_LIMIT_MB:-500}"
+      - "--announce-at-start"

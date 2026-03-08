@@ -5,28 +5,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::ffi::{
-    destroy_handle, get_handle, set_error, store_handle,
+    destroy_handle, get_handle, store_handle,
 };
 use reticulum_rust::identity::Identity;
 
 use crate::lx_message::LXMessage;
 use crate::lxm_router::LXMRouter;
-use crate::lxmf::APP_NAME;
-
-// ---------------------------------------------------------------------------
-// Group-chat field IDs (application-level, carried in LXMF message fields)
-// ---------------------------------------------------------------------------
-
-pub const FIELD_GROUP_ID: u64       = 0xA0;
-pub const FIELD_GROUP_MEMBERS: u64  = 0xA1;
-pub const FIELD_GROUP_NAME: u64     = 0xA2;
-pub const FIELD_GROUP_SECRET: u64   = 0xA3;
-pub const FIELD_GROUP_SENDER: u64   = 0xA4;
-pub const FIELD_GROUP_LOW_BW: u64   = 0xA5;
-pub const FIELD_GROUP_RELAY_FOR: u64 = 0xA6;
-pub const FIELD_GROUP_DELIVERED_TO: u64 = 0xA7;
 
 // ---------------------------------------------------------------------------
 // Snapshot of a received message (safe to send across FFI)
@@ -47,12 +32,24 @@ pub struct ReceivedMessage {
     pub rssi: Option<f64>,
     pub snr: Option<f64>,
     pub q: Option<f64>,
+
+    /// The raw msgpack-encoded LXMF fields map.
+    /// Consumers deserialize and interpret application-level fields themselves.
+    pub fields_raw: Vec<u8>,
 }
 
 impl ReceivedMessage {
     /// Build a snapshot from a borrowed `LXMessage`.
     pub fn from_lxmessage(msg: &LXMessage) -> Self {
         let attachments = msg.get_file_attachments();
+
+        // Serialize the fields map to msgpack bytes for passthrough.
+        let fields_raw = {
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, msg.get_fields())
+                .unwrap_or_default();
+            buf
+        };
 
         ReceivedMessage {
             hash: msg.hash.clone().unwrap_or_default(),
@@ -66,6 +63,7 @@ impl ReceivedMessage {
             rssi: msg.rssi,
             snr: msg.snr,
             q: msg.q,
+            fields_raw,
         }
     }
 }
@@ -93,7 +91,7 @@ pub fn router_create(
         None,            // autopeer
         None,            // autopeer_maxdepth
         None,            // propagation_limit
-        None,            // delivery_limit
+        Some(1_000_000.0), // delivery_limit — no practical cap on mobile
         None,            // sync_limit
         false,           // enforce_ratchets
         false,           // enforce_stamps
@@ -157,6 +155,25 @@ pub fn router_set_delivery_callback(
     Ok(())
 }
 
+/// Register a callback that fires when a delivery announce is received.
+///
+/// The callback receives the 16-byte destination hash and an optional
+/// display name string extracted from the announce `app_data`.
+pub fn router_set_announce_callback(
+    router_handle: u64,
+    callback: Arc<dyn Fn(&[u8], Option<String>) + Send + Sync>,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .register_announce_callback(callback);
+
+    Ok(())
+}
+
 /// Announce a delivery destination on the network.
 pub fn router_announce(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
@@ -166,6 +183,31 @@ pub fn router_announce(router_handle: u64, dest_hash: &[u8]) -> Result<(), Strin
         .lock()
         .map_err(|e| e.to_string())?
         .announce(dest_hash, None);
+    Ok(())
+}
+
+/// Add a destination hash to the announce watch list.
+/// Only announces from watched destinations are processed.
+pub fn router_watch_destination(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .watch_destination(dest_hash);
+    Ok(())
+}
+
+/// Remove a destination hash from the announce watch list.
+pub fn router_unwatch_destination(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .unwatch_destination(dest_hash);
     Ok(())
 }
 
@@ -196,23 +238,46 @@ pub fn router_destroy(router_handle: u64) -> Result<(), String> {
 /// Returns a handle to `Arc<Mutex<LXMessage>>`.
 ///
 /// `method` values: 0 = opportunistic, 1 = direct, 2 = propagated.
+///
+/// `source_identity_handle` – handle to the sender's Identity (required for signing).
 pub fn message_create(
     dest_hash: &[u8],
     source_hash: &[u8],
     content: &str,
     title: &str,
     method: u8,
+    source_identity_handle: u64,
 ) -> Result<u64, String> {
-    let desired = match method {
-        0 => LXMessage::OPPORTUNISTIC,
-        1 => LXMessage::DIRECT,
-        2 => LXMessage::PROPAGATED,
-        _ => LXMessage::DIRECT,
-    };
+    use reticulum_rust::destination::{Destination, DestinationType};
+
+    // Kotlin now sends the raw LXMessage constant values directly
+    // (OPPORTUNISTIC=0x01, DIRECT=0x02, PROPAGATED=0x03)
+    let desired = method;
+
+    // Build source Destination with the identity (needed for signing during pack)
+    reticulum_rust::log(&format!(
+        "message_create: looking up identity handle={}, handle_count={}",
+        source_identity_handle,
+        reticulum_rust::ffi::handle_count(),
+    ), reticulum_rust::LOG_NOTICE, false, false);
+    let source_identity: Identity = get_handle(source_identity_handle)
+        .ok_or_else(|| {
+            let keys = reticulum_rust::ffi::handle_keys();
+            format!(
+                "invalid source identity handle {} (existing handles: {:?})",
+                source_identity_handle, keys,
+            )
+        })?;
+    let source_dest = Destination::new_inbound(
+        Some(source_identity),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )?;
 
     let msg = LXMessage::new(
-        None,                                       // destination (set via hash)
-        None,                                       // source      (set via hash)
+        None,                                       // destination (resolved by router)
+        Some(source_dest),                          // source (with identity for signing)
         Some(content.as_bytes().to_vec()),           // content
         Some(title.as_bytes().to_vec()),             // title
         None,                                       // fields
@@ -237,6 +302,37 @@ pub fn message_add_attachment(
     msg.lock()
         .map_err(|e| e.to_string())?
         .add_file_attachment(filename, data.to_vec());
+    Ok(())
+}
+
+/// Add a string-valued field to an outbound message.
+///
+/// `key` is an LXMF field ID (e.g. 0x08 for FIELD_THREAD).
+/// `value` is the UTF-8 string to store.
+pub fn message_add_field_string(
+    handle: u64,
+    key: u8,
+    value: &str,
+) -> Result<(), String> {
+    let msg: Arc<Mutex<LXMessage>> =
+        get_handle(handle).ok_or_else(|| "invalid message handle".to_string())?;
+    msg.lock()
+        .map_err(|e| e.to_string())?
+        .set_field(key, rmpv::Value::String(value.into()));
+    Ok(())
+}
+
+/// Add a boolean-valued field to an outbound message.
+pub fn message_add_field_bool(
+    handle: u64,
+    key: u8,
+    value: bool,
+) -> Result<(), String> {
+    let msg: Arc<Mutex<LXMessage>> =
+        get_handle(handle).ok_or_else(|| "invalid message handle".to_string())?;
+    msg.lock()
+        .map_err(|e| e.to_string())?
+        .set_field(key, rmpv::Value::Boolean(value));
     Ok(())
 }
 
@@ -286,4 +382,67 @@ pub fn message_destroy(handle: u64) -> Result<(), String> {
     } else {
         Err("invalid message handle".to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Propagation node management
+// ---------------------------------------------------------------------------
+
+/// Set the outbound propagation node by destination hash (16 bytes).
+pub fn router_set_propagation_node(
+    router_handle: u64,
+    dest_hash: &[u8],
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let mut guard = router.lock().map_err(|e| e.to_string())?;
+    guard.set_outbound_propagation_node(dest_hash.to_vec())
+}
+
+/// Request messages from the configured propagation node.
+///
+/// `identity_handle` – identity to use for authentication with the prop node.
+pub fn router_request_messages(
+    router_handle: u64,
+    identity_handle: u64,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let id: Identity = get_handle(identity_handle)
+        .ok_or_else(|| "invalid identity handle".to_string())?;
+
+    let mut guard = router.lock().map_err(|e| e.to_string())?;
+    guard.request_messages_from_propagation_node(id, None);
+    Ok(())
+}
+
+/// Get the current propagation transfer state.
+///
+/// Returns one of the `PR_*` constants (e.g. PR_IDLE=0x00, PR_COMPLETE=0x07).
+pub fn router_get_propagation_state(router_handle: u64) -> Result<u8, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let guard = router.lock().map_err(|e| e.to_string())?;
+    Ok(guard.propagation_transfer_state)
+}
+
+/// Get the current propagation transfer progress (0.0 – 1.0).
+pub fn router_get_propagation_progress(router_handle: u64) -> Result<f64, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let guard = router.lock().map_err(|e| e.to_string())?;
+    Ok(guard.propagation_transfer_progress)
+}
+
+/// Cancel any in-progress propagation node requests.
+pub fn router_cancel_propagation(router_handle: u64) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let mut guard = router.lock().map_err(|e| e.to_string())?;
+    guard.cancel_propagation_node_requests();
+    Ok(())
 }
