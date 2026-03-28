@@ -673,7 +673,7 @@ impl LXMessage {
 			Some(Self::PROPAGATED) => {
 				let destination = self
 					.destination
-					.as_ref()
+					.as_mut()
 					.ok_or("Missing destination for propagated delivery")?;
 				if self.pn_encrypted_data.is_none() || payload_updated {
 					self.pn_encrypted_data =
@@ -707,7 +707,7 @@ impl LXMessage {
 			Some(Self::PAPER) => {
 				let destination = self
 					.destination
-					.as_ref()
+					.as_mut()
 					.ok_or("Missing destination for paper delivery")?;
 				let encrypted = destination.encrypt(&packed[Self::DESTINATION_LENGTH..])?;
 				self.ratchet_id = destination.latest_ratchet_id.clone();
@@ -1044,7 +1044,7 @@ impl LXMessage {
 			Some(fields_value),
 			original_method,
 			Some(destination_hash),
-			Some(source_hash),
+			Some(source_hash.clone()),
 			None,
 			false,
 		)?;
@@ -1061,15 +1061,25 @@ impl LXMessage {
 		if let Some(source) = message.source.as_ref() {
 			if source.validate(&signature, &signed_part) {
 				message.signature_validated = true;
+				log("[SIG] Signature validated OK", LOG_DEBUG, false, false);
 			} else {
 				message.signature_validated = false;
 				message.unverified_reason = Some(Self::SIGNATURE_INVALID);
+				log(
+					&format!("[SIG] Signature INVALID for source={}", hexrep(&source_hash, false)),
+					LOG_NOTICE,
+					false,
+					false,
+				);
 			}
 		} else {
 			message.signature_validated = false;
 			message.unverified_reason = Some(Self::SOURCE_UNKNOWN);
 			log(
-				"Unpacked LXMF message signature could not be validated, source identity unknown",
+				&format!(
+					"[SIG] Source identity unknown for source_hash={}, signature cannot be verified",
+					hexrep(&source_hash, false)
+				),
 				LOG_DEBUG,
 				false,
 				false,
@@ -1372,8 +1382,8 @@ fn now_seconds() -> f64 {
 	since.as_secs() as f64 + (since.subsec_nanos() as f64 / 1_000_000_000.0)
 }
 
-fn recall_identity(_hash: &[u8]) -> Option<Identity> {
-	None
+fn recall_identity(hash: &[u8]) -> Option<Identity> {
+	Identity::recall(hash)
 }
 
 fn mark_delivered_shared(handle: &Arc<Mutex<LXMessage>>) {

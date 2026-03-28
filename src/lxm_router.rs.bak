@@ -240,8 +240,10 @@ impl LXMRouter {
 		max_peering_cost: u32,
 		name: Option<String>,
 	) -> Result<Arc<Mutex<Self>>, String> {
+		eprintln!("[DEBUG] LXMRouter::new() - START");
 		let identity = identity.unwrap_or_else(|| Identity::new(true));
 		let storagepath = format!("{}/lxmf", storagepath);
+		eprintln!("[DEBUG] LXMRouter::new() - identity/path setup done");
 		let ratchetpath = format!("{}/ratchets", storagepath);
 		let propagation_limit = propagation_limit.unwrap_or(Self::PROPAGATION_LIMIT);
 		let delivery_limit = delivery_limit.unwrap_or(Self::DELIVERY_LIMIT);
@@ -340,26 +342,39 @@ impl LXMRouter {
 
 		// Register announce handlers BEFORE any locking to avoid deadlock
 		// (Python does this early in __init__ before loading cached state)
+		eprintln!("[DEBUG] LXMRouter::new() - registering announce handlers");
 		let router_clone_for_handlers = router.clone();
+		eprintln!("[DEBUG] LXMRouter::new() - building delivery handler");
 		let delivery_handler = delivery_announce_handler(router_clone_for_handlers.clone());
+		eprintln!("[DEBUG] LXMRouter::new() - registering delivery handler");
 		Transport::register_announce_handler(delivery_handler);
+		eprintln!("[DEBUG] LXMRouter::new() - registered delivery handler");
+		eprintln!("[DEBUG] LXMRouter::new() - building propagation handler");
 		let propagation_handler = propagation_announce_handler(router_clone_for_handlers.clone());
+		eprintln!("[DEBUG] LXMRouter::new() - registering propagation handler");
 		Transport::register_announce_handler(propagation_handler);
+		eprintln!("[DEBUG] LXMRouter::new() - registered propagation handler");
 
 		if let Ok(mut router_guard) = router.lock() {
+			eprintln!("[DEBUG] LXMRouter::new() - locked router, calling load_cached_state()");
 			router_guard.self_handle = Some(Arc::downgrade(&router));
 			router_guard.load_cached_state();
+			eprintln!("[DEBUG] LXMRouter::new() - load_cached_state() returned");
 		}
 
+		eprintln!("[DEBUG] LXMRouter::new() - spawning background thread");
 		let job_router = Arc::downgrade(&router);
 		thread::spawn(move || {
+			eprintln!("[DEBUG] Background jobloop thread - STARTED");
 			while let Some(router) = job_router.upgrade() {
 				if let Ok(mut router) = router.lock() {
 					router.jobs();
 				}
 				thread::sleep(Duration::from_secs(Self::PROCESSING_INTERVAL));
 			}
+			eprintln!("[DEBUG] Background jobloop thread - EXITING");
 		});
+		eprintln!("[DEBUG] LXMRouter::new() - background thread spawned, returning router");
 
 		Ok(router)
 	}
@@ -387,14 +402,26 @@ impl LXMRouter {
 
 	pub fn announce(&mut self, destination_hash: &[u8], attached_interface: Option<String>) {
 		let app_data = self.get_announce_app_data(destination_hash);
+		eprintln!("[LXMRouter::announce] dest_hash={} app_data={} delivery_destinations_count={}",
+			hexrep(destination_hash, false),
+			app_data.as_ref().map(|d| d.len()).unwrap_or(0),
+			self.delivery_destinations.len(),
+		);
 		if let Some(destination) = self.delivery_destinations.get_mut(destination_hash) {
+			eprintln!("[LXMRouter::announce] found destination, calling destination.announce()");
 			match destination.announce(app_data.as_deref(), false, attached_interface, None, true) {
 				Ok(_) => {
+					eprintln!("[LXMRouter::announce] destination.announce() succeeded");
 					// Sync the destination to Transport so its ratchet keys are current
 					// (rotate_ratchets() runs during announce, generating new keys)
 					Transport::update_destination(destination.clone());
 				}
-				Err(_e) => {}
+				Err(e) => eprintln!("[LXMRouter::announce] destination.announce() FAILED: {}", e),
+			}
+		} else {
+			eprintln!("[LXMRouter::announce] destination NOT FOUND in delivery_destinations");
+			for key in self.delivery_destinations.keys() {
+				eprintln!("[LXMRouter::announce]   registered key: {}", hexrep(key, false));
 			}
 		}
 	}
@@ -787,6 +814,7 @@ impl LXMRouter {
 				link_guard.teardown();
 			}
 		}
+		eprintln!("[LINK-CLEAR] cancel_propagation_node_requests set outbound_propagation_link=None");
 		self.outbound_propagation_link = None;
 		self.acknowledge_sync_completion(None);
 	}
@@ -892,11 +920,15 @@ impl LXMRouter {
 
 	pub fn process_outbound(&mut self) {
 		log(&format!("[POB] enter pending={}", self.pending_outbound.len()), LOG_NOTICE, false, false);
+		eprintln!("[POB] enter pending={} thread={:?}", self.pending_outbound.len(), thread::current().id());
+		eprintln!("[POB] waiting outbound_processing_lock");
 		let _guard = match self.outbound_processing_lock.lock() {
 			Ok(guard) => {
+				eprintln!("[POB] outbound_processing_lock acquired");
 				guard
 			}
-			Err(_err) => {
+			Err(err) => {
+				eprintln!("[POB] outbound_processing_lock poisoned: {}", err);
 				return;
 			}
 		};
@@ -906,6 +938,7 @@ impl LXMRouter {
 		while index < self.pending_outbound.len() {
 			let message = self.pending_outbound[index].clone();
 			let mut remove = false;
+			eprintln!("[POB] index={} pending={} waiting message lock", index, self.pending_outbound.len());
 			let message_lock = message.lock();
 			if let Ok(mut lxm) = message_lock {
 				let message_label = lxm
@@ -915,6 +948,14 @@ impl LXMRouter {
 					.map(|id| hexrep(id, false))
 					.unwrap_or_else(|| prettyhexrep(&lxm.destination_hash));
 				log(&format!("[POB][{}] state={} method={} attempts={}", message_label, lxm.state, lxm.method, lxm.delivery_attempts), LOG_NOTICE, false, false);
+				eprintln!(
+					"[POB][{}] acquired message lock state={} method={} progress={:.3} attempts={}",
+					message_label,
+					lxm.state,
+					lxm.method,
+					lxm.progress,
+					lxm.delivery_attempts
+				);
 
 				if lxm.state == LXMessage::DELIVERED {
 					if lxm.include_ticket {
@@ -1023,11 +1064,12 @@ impl LXMRouter {
 										lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 										lxm.progress = 0.01;
 									} else {
+										eprintln!("[POB][{}] stage=opportunistic_send before send_with_handle", message_label);
 										lxm.delivery_attempts += 1;
 										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 										match lxm.send_with_handle(Some(message.clone())) {
-										Ok(_) => {}
-										Err(_e) => {}
+											Ok(_) => eprintln!("[POB][{}] stage=opportunistic_send returned ok", message_label),
+											Err(e) => eprintln!("[POB][{}] stage=opportunistic_send returned err={}", message_label, e),
 										}
 									}
 								}
@@ -1223,13 +1265,17 @@ impl LXMRouter {
 						}
 						LXMessage::PROPAGATED => {
 							if self.outbound_propagation_node.is_none() {
+								eprintln!("[POB][{}] PROPAGATED: no outbound_propagation_node set, failing", message_label);
 								self.fail_message(&mut lxm);
 								remove = true;
 							} else if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 								let node_hash = self.outbound_propagation_node.clone().unwrap();
-								let _has_link = self.outbound_propagation_link.is_some();
+								let has_link = self.outbound_propagation_link.is_some();
+								eprintln!("[POB][{}] PROPAGATED: has_link={} attempts={}", message_label, has_link, lxm.delivery_attempts);
 								if let Some(link_arc) = self.outbound_propagation_link.clone() {
+									eprintln!("[POB][{}] stage=propagated waiting link status lock", message_label);
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+									eprintln!("[POB][{}] stage=propagated got link status={}", message_label, status);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.state != LXMessage::SENDING {
 											if let Ok(link_guard) = link_arc.lock() {
@@ -1249,13 +1295,17 @@ impl LXMRouter {
 												}
 											}
 											lxm.set_delivery_link(link_arc.clone());
-											if let Err(_err) = lxm.send_with_handle(Some(message.clone())) {
+											eprintln!("[POB][{}] stage=propagated_send before send_with_handle", message_label);
+											if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
+												eprintln!("[POB][{}] stage=propagated_send returned err={}", message_label, err);
 												lxm.state = LXMessage::OUTBOUND;
 												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 											} else {
+												eprintln!("[POB][{}] stage=propagated_send returned ok", message_label);
 											}
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
+										eprintln!("[LINK-CLEAR] POB link status=CLOSED, clearing");
 										self.outbound_propagation_link = None;
 										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									} else {
@@ -1278,9 +1328,11 @@ impl LXMRouter {
 								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
 									lxm.delivery_attempts += 1;
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+									eprintln!("[POB][{}] PROPAGATED: no link, creating. attempts now={}", message_label, lxm.delivery_attempts);
 									if lxm.delivery_attempts < Self::MAX_DELIVERY_ATTEMPTS {
 										if Transport::has_path(&node_hash) {
-											// Identity presence check is implicit in the next line's recall
+											let has_identity = Identity::recall(&node_hash).is_some();
+											eprintln!("[POB][{}] PROPAGATED: has_path=true has_identity={}", message_label, has_identity);
 											if let Some(identity) = Identity::recall(&node_hash) {
 												if let Ok(destination) = Destination::new_outbound(
 													Some(identity.clone()),
@@ -1345,14 +1397,18 @@ impl LXMRouter {
 					}
 				}
 				if remove {
+					eprintln!("[POB][{}] remove=true removing index={}", message_label, index);
 					self.pending_outbound.remove(index);
 				} else {
+					eprintln!("[POB][{}] remove=false keep index={}", message_label, index);
 					index += 1;
 				}
 			} else {
+				eprintln!("[POB] failed to lock message at index={}, skipping", index);
 				index += 1;
 			}
 		}
+		eprintln!("[POB] exit pending={}", self.pending_outbound.len());
 
 		// Drop the processing lock before calling delivery_link_established
 		// (which needs &mut self)
@@ -1370,10 +1426,12 @@ impl LXMRouter {
 	}
 
 	pub fn handle_outbound(&mut self, message: Arc<Mutex<LXMessage>>) {
+		eprintln!("[DEBUG] handle_outbound: start");
 		let mut unknown_path_requested = false;
 		let mut defer_stamp = false;
 		let mut defer_propagation_stamp = false;
 		if let Ok(mut lxm) = message.lock() {
+			eprintln!("[DEBUG] handle_outbound: message lock acquired");
 			let destination_hash = lxm.destination_hash.clone();
 			if lxm.stamp_cost.is_none() {
 				if let Some((_, stamp_cost)) = self.outbound_stamp_costs.get(&destination_hash) {
@@ -1409,13 +1467,17 @@ impl LXMRouter {
 			}
 
 			if lxm.packed.is_none() {
+				eprintln!("[DEBUG] handle_outbound: packing message");
 				if let Err(e) = lxm.pack(false) {
 					log(&format!("Failed to pack message: {}", e), LOG_ERROR, false, false);
+					eprintln!("[ERROR] Failed to pack message: {}", e);
 					return;
 				}
+				eprintln!("[DEBUG] handle_outbound: message packed");
 			}
 
 			if lxm.method == LXMessage::OPPORTUNISTIC && !Transport::has_path(&destination_hash) {
+				eprintln!("[DEBUG] handle_outbound: path unknown, requesting");
 				Transport::request_path(&destination_hash, None, None, None, None);
 				lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 				unknown_path_requested = true;
@@ -1435,18 +1497,24 @@ impl LXMRouter {
 				false
 			};
 		}
+		eprintln!("[DEBUG] handle_outbound: message prep done");
 
 		if !defer_stamp && !defer_propagation_stamp {
+			eprintln!("[DEBUG] handle_outbound: enqueueing pending outbound");
 			self.pending_outbound.push(message);
 			if !unknown_path_requested {
+				eprintln!("[DEBUG] handle_outbound: calling process_outbound");
 				self.process_outbound();
+				eprintln!("[DEBUG] handle_outbound: process_outbound returned");
 			}
 		} else {
+			eprintln!("[DEBUG] handle_outbound: deferring stamp generation");
 			let message_id = message.lock().ok().and_then(|lxm| lxm.message_id.clone());
 			if let Some(message_id) = message_id {
 				self.pending_deferred_stamps.insert(message_id, message);
 			}
 		}
+		eprintln!("[DEBUG] handle_outbound: end");
 	}
 
 	pub fn fail_message(&self, message: &mut LXMessage) {
@@ -1697,6 +1765,7 @@ impl LXMRouter {
 	}
 
 	fn load_cached_state(&mut self) {
+		eprintln!("[DEBUG] load_cached_state() - reading deliveries");
 		let deliveries_path = format!("{}/local_deliveries", self.storagepath);
 		if let Ok(data) = fs::read(&deliveries_path) {
 			if let Ok(map) = rmp_serde::from_slice::<HashMap<Vec<u8>, f64>>(&data) {
@@ -1712,6 +1781,7 @@ impl LXMRouter {
 			}
 		}
 
+		eprintln!("[DEBUG] load_cached_state() - reading processed");
 		let processed_path = format!("{}/locally_processed", self.storagepath);
 		if let Ok(data) = fs::read(&processed_path) {
 			if let Ok(map) = rmp_serde::from_slice::<HashMap<Vec<u8>, f64>>(&data) {
@@ -1727,15 +1797,22 @@ impl LXMRouter {
 			}
 		}
 
+		eprintln!("[DEBUG] load_cached_state() - clean_transient_id_caches");
 		self.clean_transient_id_caches();
 
+		eprintln!("[DEBUG] load_cached_state() - reading stamp_costs");
 		let stamp_costs_path = format!("{}/outbound_stamp_costs", self.storagepath);
+		eprintln!("[DEBUG] load_cached_state() - stamp_costs_path: {}", stamp_costs_path);
+		eprintln!("[DEBUG] load_cached_state() - about to call fs::read()");
 		if let Ok(data) = fs::read(&stamp_costs_path) {
+			eprintln!("[DEBUG] load_cached_state() - fs::read() returned {} bytes", data.len());
 			match rmp_serde::from_slice::<HashMap<Vec<u8>, (f64, u32)>>(&data) {
 				Ok(map) => {
+					eprintln!("[DEBUG] load_cached_state() - deserialized {} entries", map.len());
 					self.outbound_stamp_costs = map;
 				}
-				Err(_e) => {
+				Err(e) => {
+					eprintln!("[DEBUG] load_cached_state() - deserialization FAILED: {}", e);
 					log(
 						"Invalid data format for loaded outbound stamp costs, recreating",
 						LOG_ERROR,
@@ -1745,10 +1822,15 @@ impl LXMRouter {
 					self.outbound_stamp_costs = HashMap::new();
 				}
 			}
+			eprintln!("[DEBUG] load_cached_state() - clean_outbound_stamp_costs");
 			self.clean_outbound_stamp_costs();
+			eprintln!("[DEBUG] load_cached_state() - save_outbound_stamp_costs");
 			self.save_outbound_stamp_costs();
+			eprintln!("[DEBUG] load_cached_state() - save_outbound_stamp_costs DONE");
 		}
+		eprintln!("[DEBUG] load_cached_state() - stamp_costs section complete");
 
+		eprintln!("[DEBUG] load_cached_state() - reading tickets");
 		let tickets_path = format!("{}/available_tickets", self.storagepath);
 		if let Ok(data) = fs::read(&tickets_path) {
 			if let Ok(tickets) = rmp_serde::from_slice::<AvailableTickets>(&data) {
@@ -1762,9 +1844,13 @@ impl LXMRouter {
 				);
 				self.available_tickets = AvailableTickets::default();
 			}
+			eprintln!("[DEBUG] load_cached_state() - clean_available_tickets");
 			self.clean_available_tickets();
+			eprintln!("[DEBUG] load_cached_state() - save_available_tickets");
 			self.save_available_tickets();
+			eprintln!("[DEBUG] load_cached_state() - save_available_tickets DONE");
 		}
+		eprintln!("[DEBUG] load_cached_state() - COMPLETE");
 	}
 
 	fn clean_links(&mut self) {
@@ -1811,6 +1897,7 @@ impl LXMRouter {
 				.map(|l| l.status)
 				.unwrap_or(255);
 			if status == reticulum_rust::link::STATE_CLOSED {
+				eprintln!("[CLEAN] outbound_propagation_link status=CLOSED, clearing");
 				true
 			} else {
 				false
@@ -2241,9 +2328,11 @@ impl LXMRouter {
 		if self.pending_deferred_stamps.is_empty() {
 			return;
 		}
+		eprintln!("[STAMPS] process_deferred_stamps: {} pending", self.pending_deferred_stamps.len());
 		let lock = match self.stamp_gen_lock.try_lock() {
 			Ok(guard) => guard,
 			Err(_) => {
+				eprintln!("[STAMPS] stamp_gen_lock busy, skipping");
 				return;
 			}
 		};
@@ -2270,10 +2359,14 @@ impl LXMRouter {
 			} else {
 				true
 			};
+			eprintln!("[STAMPS] stamp_ok={} propagation_ok={} defer_stamp={} defer_prop={} stamp_cost={:?}",
+				stamp_ok, propagation_ok, message.defer_stamp, message.defer_propagation_stamp, message.stamp_cost);
 
 			if !stamp_ok {
-				let _stamp_start = std::time::Instant::now();
+				eprintln!("[STAMPS] generating delivery stamp...");
+				let stamp_start = std::time::Instant::now();
 				let generated = message.get_stamp();
+				eprintln!("[STAMPS] delivery stamp result={} elapsed={:.3}s", generated.is_some(), stamp_start.elapsed().as_secs_f64());
 				if let Some(stamp) = generated {
 					message.stamp = Some(stamp);
 					message.defer_stamp = false;
@@ -2281,6 +2374,7 @@ impl LXMRouter {
 					let _ = message.pack(true);
 					stamp_ok = true;
 				} else {
+					eprintln!("[STAMPS] delivery stamp FAILED");
 					message.stamp_generation_failed = true;
 					self.pending_deferred_stamps.remove(&message_id);
 					self.fail_message(&mut message);
@@ -2289,10 +2383,14 @@ impl LXMRouter {
 			}
 
 			if !propagation_ok {
+				eprintln!("[STAMPS] getting outbound propagation cost...");
 				let target_cost = self.get_outbound_propagation_cost();
+				eprintln!("[STAMPS] outbound propagation cost={:?}", target_cost);
 				if let Some(cost) = target_cost {
-					let _prop_start = std::time::Instant::now();
+					eprintln!("[STAMPS] generating propagation stamp with cost {}...", cost);
+					let prop_start = std::time::Instant::now();
 					if let Ok(stamp) = message.get_propagation_stamp(cost) {
+						eprintln!("[STAMPS] propagation stamp result={} elapsed={:.3}s", stamp.is_some(), prop_start.elapsed().as_secs_f64());
 						if let Some(stamp) = stamp {
 							message.propagation_stamp = Some(stamp);
 							message.defer_propagation_stamp = false;
@@ -2301,9 +2399,11 @@ impl LXMRouter {
 							propagation_ok = true;
 						}
 					} else {
+						eprintln!("[STAMPS] propagation stamp generation returned Err");
 					}
 				}
 				if !propagation_ok {
+					eprintln!("[STAMPS] propagation stamp FAILED");
 					message.stamp_generation_failed = true;
 					self.pending_deferred_stamps.remove(&message_id);
 					self.fail_message(&mut message);
@@ -2314,10 +2414,12 @@ impl LXMRouter {
 			if stamp_ok && propagation_ok {
 				self.pending_deferred_stamps.remove(&message_id);
 				enqueue = true;
+				eprintln!("[STAMPS] stamps complete, enqueueing to pending_outbound");
 			}
 		}
 		if enqueue {
 			self.pending_outbound.push(message_arc);
+			eprintln!("[STAMPS] message added to pending_outbound (len={})", self.pending_outbound.len());
 		}
 		drop(lock);
 	}
@@ -2430,6 +2532,7 @@ impl LXMRouter {
 						link_guard.teardown();
 					}
 				}
+				eprintln!("[LINK-CLEAR] outbound node changed, tearing down");
 				self.outbound_propagation_link = None;
 			}
 		}
@@ -2800,23 +2903,7 @@ impl LXMRouter {
 			packet.destination_type,
 			packet.destination_hash.as_ref().map(|h| hexrep(h, false)).unwrap_or_default()
 		), LOG_NOTICE, false, false);
-		// ── FIX: NO EXPLICIT PROVE CALL IN delivery_packet ─────────────────────────
-		// DO NOT ADD packet.prove(None) or packet.prove(Some(link)) HERE.
-		//
-		// Bug (pre-fix): a call to packet.prove(None) was present here.  On an
-		// inbound delivery packet the Packet object represents data *received from*
-		// the sender, so calling prove() on it attempts to sign and retransmit it
-		// outbound — which silently fails because the packet has no send interface
-		// set.  More importantly it masked the real prove path and prevented
-		// delivery receipts from firing correctly.
-		//
-		// Proving is handled elsewhere:
-		//   • OPPORTUNISTIC destinations: Transport uses PROVE_ALL strategy and
-		//     sends a proof automatically when the packet is processed.
-		//   • DIRECT destinations (link-based): link.prove_packet() is called by
-		//     the link layer after it validates the packet, routing the proof via
-		//     the correct attached interface (see prove_packet fix in link.rs).
-		// ────────────────────────────────────────────────────────────────────────
+		let _ = packet.prove(None);
 
 		let mut rssi = packet.rssi;
 		let mut snr = packet.snr;
@@ -3204,12 +3291,7 @@ impl LXMRouter {
 		}
 
 		if validated.len() == messages.len() {
-			// NOTE: No explicit prove() call here.
-			// This handler is invoked only for LINK-type packets (see early return above).
-			// For link packets, link.rs automatically calls prove_packet() BEFORE firing
-			// this callback, so the proof is already on its way to the sending peer.
-			// Calling packet.prove(None) here would silently fail: received packets
-			// have destination=None, so prove(None) cannot resolve an identity to sign with.
+			let _ = packet.prove(None);
 		} else {
 			log(
 				"Propagation transfer contained messages with invalid stamps",
@@ -3366,12 +3448,8 @@ impl LXMRouter {
 
 				// Identify ourselves on the link before requesting messages
 				if let Ok(mut link_guard) = link_arc.lock() {
-					log(&format!("[PSYNC] identify: attached_interface={:?} link_id={}",
-						link_guard.attached_interface,
-						reticulum_rust::hexrep(&link_guard.link_id, false)), LOG_NOTICE, false, false);
-					match link_guard.identify(&identity) {
-						Ok(_) => log("[PSYNC] identify sent OK", LOG_NOTICE, false, false),
-						Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
+					if let Err(e) = link_guard.identify(&identity) {
+						log(&format!("Failed to identify on propagation link: {}", e), LOG_ERROR, false, false);
 					}
 				}
 
@@ -3418,7 +3496,6 @@ impl LXMRouter {
 						failed_cb,
 						None,
 					);
-					log("[PSYNC] message_list request sent", LOG_NOTICE, false, false);
 					self.propagation_transfer_state = Self::PR_REQUEST_SENT;
 				}
 				return;
@@ -3639,10 +3716,8 @@ impl LXMRouter {
 						log(&format!("[MGR] lxmf_propagation returned {}", result), LOG_NOTICE, false, false);
 						if !result {
 							duplicates += 1;
-						} else {
-							// Only acknowledge messages that were successfully processed
-							haves.push(Value::Binary(reticulum_rust::identity::full_hash(lxmf_data)));
 						}
+						haves.push(Value::Binary(reticulum_rust::identity::full_hash(lxmf_data)));
 					}
 				}
 
@@ -3823,12 +3898,6 @@ impl LXMRouter {
 
 		let (decrypted, ratchet_id, destination_type) = if let Some(delivery_destination) = self.delivery_destinations.get_mut(&destination_hash) {
 			let encrypted = &lxmf_data[LXMessage::DESTINATION_LENGTH..];
-			log(&format!("[PROP] LXMF raw hex ({} bytes): {}", lxmf_data.len(), hexrep(lxmf_data, false)), LOG_NOTICE, false, false);
-			log(&format!("[PROP] encrypted ({} bytes): ephemeral={} token_data_len={}",
-				encrypted.len(),
-				if encrypted.len() >= 32 { hexrep(&encrypted[..32], false) } else { "TOO_SHORT".to_string() },
-				if encrypted.len() > 32 { encrypted.len() - 32 } else { 0 },
-			), LOG_NOTICE, false, false);
 			let result = delivery_destination.decrypt(encrypted);
 			log(&format!("[PROP] decrypt result: {}", match &result {
 				Ok(_) => "Ok".to_string(),

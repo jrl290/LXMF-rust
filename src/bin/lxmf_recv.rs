@@ -53,12 +53,34 @@ fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
 
+    // --prop-node: hex hash of propagation node to sync from on startup
+    let prop_node_hex = arg_value_flexible(&args, "--prop-node");
+
+    // --sync-timeout: seconds to wait for propagation sync to complete (default 60)
+    let sync_timeout: u64 = arg_value(&args, "--sync-timeout")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    // --storage: override LXMF storage directory (defaults to RETICULUM_WORKDIR/cli-tests/lxmf_storage/rust_receiver)
+    let storage_path = if let Some(path) = arg_value_flexible(&args, "--storage") {
+        PathBuf::from(path)
+    } else if !base_dir.as_os_str().is_empty() {
+        base_dir.join("cli-tests/lxmf_storage/rust_receiver")
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("Failed to read cwd: {e}"))?
+            .join("cli-tests/lxmf_storage/rust_receiver")
+    };
+
     // --verbose: noisy per-field dump of incoming messages
     let verbose = has_flag(&args, "--verbose") || has_flag(&args, "-v");
 
-    eprintln!("[config] Config dir: {}", config_dir.display());
+    eprintln!("[config] Config dir:   {}", config_dir.display());
+    eprintln!("[config] Storage path: {}", storage_path.display());
     eprintln!("[config] Display name: {}", display_name);
     eprintln!("[config] Announce interval: {}s", announce_interval);
+    eprintln!("[config] Prop node: {}", prop_node_hex.as_deref().unwrap_or("none"));
+    eprintln!("[config] Sync timeout: {}s", sync_timeout);
     eprintln!("[config] Verbose: {}", verbose);
 
     // ── Reticulum init ──────────────────────────────────────────────
@@ -88,9 +110,6 @@ fn main() -> Result<(), String> {
     );
 
     // ── LXMF router ────────────────────────────────────────────────
-    let cwd = env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?;
-    let storage_path = cwd.join("cli-tests/lxmf_storage/rust_receiver");
-
     eprintln!("[step] create router");
     let router = LXMRouter::new(
         None,
@@ -210,6 +229,85 @@ fn main() -> Result<(), String> {
         "[timing] startup: {:.3}s",
         run_start.elapsed().as_secs_f64()
     );
+
+    // ── Optional propagation sync ───────────────────────────────────
+    if let Some(ref prop_hex) = prop_node_hex {
+        let prop_bytes = lxmf_rust::decode_key(prop_hex)
+            .map_err(|e| format!("Invalid --prop-node hex: {e}"))?;
+        eprintln!("[sync] Setting outbound propagation node: {}", prop_hex);
+        {
+            let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
+            router_guard.set_outbound_propagation_node(prop_bytes.clone()).map_err(|e| format!("set_outbound_propagation_node: {e}"))?;
+        }
+
+        // Wait for path to propagation node (announce may take time to arrive)
+        eprintln!("[sync] Waiting for path to propagation node...");
+        let path_start = Instant::now();
+        loop {
+            if reticulum_rust::transport::Transport::has_path(&prop_bytes) {
+                eprintln!("[sync] Path acquired in {:.1}s", path_start.elapsed().as_secs_f64());
+                break;
+            }
+            if path_start.elapsed().as_secs() >= sync_timeout {
+                eprintln!("[sync] Path timeout after {}s — trying anyway", sync_timeout);
+                break;
+            }
+            if path_start.elapsed().as_secs() % 15 == 0 && path_start.elapsed().as_secs() > 0 {
+                reticulum_rust::transport::Transport::request_path(&prop_bytes, None, None, None, None);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+
+        eprintln!("[sync] Requesting messages from propagation node...");
+        let key_bytes2 = lxmf_rust::decode_key(&key_value)?;
+        let identity2 = Identity::from_bytes(&key_bytes2)?;
+        {
+            let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
+            router_guard.request_messages_from_propagation_node(identity2, None);
+        }
+
+        let sync_start = Instant::now();
+        let terminal_states: &[u8] = &[
+            LXMRouter::PR_COMPLETE,
+            LXMRouter::PR_NO_PATH,
+            LXMRouter::PR_LINK_FAILED,
+            LXMRouter::PR_TRANSFER_FAILED,
+            LXMRouter::PR_NO_IDENTITY_RCVD,
+            LXMRouter::PR_NO_ACCESS,
+            LXMRouter::PR_FAILED,
+        ];
+        let mut last_state = 255u8;
+        loop {
+            let state = router.lock().map_err(|_| "Router lock poisoned")?.propagation_transfer_state;
+            if state != last_state {
+                eprintln!("[sync] state={} ({:.1}s)", state, sync_start.elapsed().as_secs_f64());
+                last_state = state;
+            }
+            if terminal_states.contains(&state) {
+                let label = match state {
+                    LXMRouter::PR_COMPLETE => "COMPLETE",
+                    LXMRouter::PR_NO_PATH => "NO_PATH",
+                    LXMRouter::PR_LINK_FAILED => "LINK_FAILED",
+                    LXMRouter::PR_TRANSFER_FAILED => "TRANSFER_FAILED",
+                    LXMRouter::PR_NO_IDENTITY_RCVD => "NO_IDENTITY_RCVD",
+                    LXMRouter::PR_NO_ACCESS => "NO_ACCESS",
+                    LXMRouter::PR_FAILED => "FAILED",
+                    _ => "UNKNOWN",
+                };
+                eprintln!("[sync] Finished: {} ({:.1}s)", label, sync_start.elapsed().as_secs_f64());
+                break;
+            }
+            if sync_start.elapsed().as_secs() >= sync_timeout {
+                eprintln!("[sync] Timed out after {}s", sync_timeout);
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+        // Brief pause to let delivery callbacks fire
+        thread::sleep(Duration::from_secs(2));
+        let count = msg_count.load(Ordering::Relaxed);
+        eprintln!("[sync] Messages received so far: {}", count);
+    }
 
     // ── Main loop: announce periodically, wait for messages ─────
     let mut last_announce = Instant::now();

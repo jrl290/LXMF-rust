@@ -226,6 +226,10 @@ fn job_simple(stamp_cost: u32, workblock: &[u8], message_id: &[u8]) -> (Option<V
 		if rounds % 2500 == 0 {
 			let elapsed = rounds_start.elapsed().as_secs_f64();
 			let speed = if elapsed > 0.0 { rounds as f64 / elapsed } else { 0.0 };
+			eprintln!(
+				"[STAMPGEN] {} rounds in {:.1}s ({:.0} r/s) cost={}",
+				rounds, elapsed, speed, stamp_cost
+			);
 			log(
 				format!(
 					"Stamp generation running. {} rounds completed so far, {} rounds per second",

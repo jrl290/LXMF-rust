@@ -16,12 +16,21 @@ path = "src/bin/lxmf_recv.rs"
 name = "lxmd"
 path = "src/bin/lxmd.rs"
 
+[[bin]]
+name = "decrypt_test"
+path = "src/bin/decrypt_test.rs"
+
+[[bin]]
+name = "rmp_format_test"
+path = "src/bin/rmp_format_test.rs"
+
 [dependencies]
 reticulum_rust = { path = "../Reticulum-rust" }
 rmp = "0.8.14"
 rmpv = "=1.0.0"
 rmp-serde = "1.1"
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
 hkdf = "0.12.3"
 sha2 = "0.10"
 rand = "0.8"

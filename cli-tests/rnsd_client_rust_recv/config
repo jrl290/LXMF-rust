@@ -1,0 +1,19 @@
+[reticulum]
+# Rust LXMF receiver client
+enable_transport = no
+share_instance = no
+instance_name = cli_rust_receiver
+
+[interfaces]
+
+  [[LOCAL]]
+    type = TCPClientInterface
+    enabled = no
+    target_host = 192.168.2.113
+    target_port = 4242
+
+  [[NAS]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = 192.168.2.107
+    target_port = 5454
