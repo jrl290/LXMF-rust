@@ -150,6 +150,8 @@ pub struct LXMRouter {
 
 	pub delivery_callback: Option<Arc<dyn Fn(&LXMessage) + Send + Sync>>,
 	pub announce_callback: Option<Arc<dyn Fn(&[u8], Option<String>) + Send + Sync>>,
+	/// Fires when propagation sync completes with the count of messages received.
+	pub sync_complete_callback: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 	/// Destination hashes we care about (contacts, pending targets).
 	/// Announces from destinations NOT in this set are ignored.
 	pub watched_destinations: HashSet<Vec<u8>>,
@@ -334,6 +336,7 @@ impl LXMRouter {
 			peer_distribution_queue: VecDeque::new(),
 			delivery_callback: None,
 			announce_callback: None,
+			sync_complete_callback: None,
 			watched_destinations: HashSet::new(),
 			self_handle: None,
 		}));
@@ -891,7 +894,7 @@ impl LXMRouter {
 	}
 
 	pub fn process_outbound(&mut self) {
-		log(&format!("[POB] enter pending={}", self.pending_outbound.len()), LOG_NOTICE, false, false);
+		log(&format!("[POB] enter pending={}", self.pending_outbound.len()), LOG_VERBOSE, false, false);
 		let _guard = match self.outbound_processing_lock.lock() {
 			Ok(guard) => {
 				guard
@@ -2536,7 +2539,10 @@ impl LXMRouter {
 
 		// Enable ratchets
 		let ratchet_file = format!("{}/{}.ratchets", self.ratchetpath, hexrep(&delivery_destination.hash, false));
-		let _ = delivery_destination.enable_ratchets(ratchet_file);
+		log(&format!("[RATCHET] enable_ratchets: path={} exists={}", ratchet_file, std::path::Path::new(&ratchet_file).exists()), LOG_NOTICE, false, false);
+		let ratchet_result = delivery_destination.enable_ratchets(ratchet_file);
+		log(&format!("[RATCHET] enable_ratchets result: {:?} loaded_count={}", ratchet_result,
+			delivery_destination.ratchets.as_ref().map(|r| r.len()).unwrap_or(0)), LOG_NOTICE, false, false);
 
 		if self.enforce_ratchets {
 			let _ = delivery_destination.enforce_ratchets();
@@ -2585,6 +2591,12 @@ impl LXMRouter {
 	/// Register a callback to be called when messages are delivered
 	pub fn register_delivery_callback(&mut self, callback: Arc<dyn Fn(&LXMessage) + Send + Sync>) {
 		self.delivery_callback = Some(callback);
+	}
+
+	/// Register a callback that fires when propagation sync completes.
+	/// The callback receives the number of messages that were synced.
+	pub fn register_sync_complete_callback(&mut self, callback: Arc<dyn Fn(u32) + Send + Sync>) {
+		self.sync_complete_callback = Some(callback);
 	}
 
 	/// Register a callback that fires when a delivery announce is received.
@@ -3317,7 +3329,7 @@ impl LXMRouter {
 				if now() > timeout {
 					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
 						if let Ok(mut router) = router_arc.lock() {
-							log("Propagation node path request timed out", LOG_DEBUG, false, false);
+							log("[PSYNC] path job: path request TIMED OUT", LOG_WARNING, false, false);
 							router.acknowledge_sync_completion(Some(Self::PR_NO_PATH));
 						}
 					}
@@ -3325,6 +3337,7 @@ impl LXMRouter {
 				}
 
 				if Transport::has_path(&destination_hash) {
+					log("[PSYNC] path job: path now available, retrying sync", LOG_NOTICE, false, false);
 					if let (Some(router_arc), Some(identity)) = (router_weak.as_ref().and_then(|w| w.upgrade()), identity) {
 						if let Ok(mut router) = router_arc.lock() {
 								let max_messages = router.propagation_transfer_max_messages;
@@ -3347,17 +3360,25 @@ impl LXMRouter {
 		let outbound_node = match self.outbound_propagation_node.clone() {
 			Some(node) => node,
 			None => {
-				log("Cannot request LXMF propagation node sync, no default propagation node configured", LOG_WARNING, false, false);
+				log("[PSYNC] Cannot request sync, no outbound propagation node configured", LOG_WARNING, false, false);
 				return;
 			}
 		};
 
+		log(&format!("[PSYNC] request_messages_from_propagation_node: node={} has_link={} has_path={} state=0x{:02x}",
+			reticulum_rust::hexrep(&outbound_node, false),
+			self.outbound_propagation_link.is_some(),
+			Transport::has_path(&outbound_node),
+			self.propagation_transfer_state,
+		), LOG_NOTICE, false, false);
+
 		if let Some(link_arc) = self.outbound_propagation_link.clone() {
 			let link_status = link_arc.lock().ok().map(|l| l.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+			log(&format!("[PSYNC] existing link status={}", link_status), LOG_NOTICE, false, false);
 			// If a link is already pending (being established), don't create another one —
 			// replacing the Arc here would drop the first link before its PROOF arrives.
 			if link_status == reticulum_rust::link::STATE_PENDING {
-				log("Propagation link already pending establishment, skipping duplicate sync request", LOG_DEBUG, false, false);
+				log("[PSYNC] link pending, skipping duplicate sync request", LOG_NOTICE, false, false);
 				return;
 			}
 			let link_is_active = link_status == reticulum_rust::link::STATE_ACTIVE;
@@ -3426,6 +3447,7 @@ impl LXMRouter {
 		}
 
 		if Transport::has_path(&outbound_node) {
+			log("[PSYNC] has path → establishing new link", LOG_NOTICE, false, false);
 			self.propagation_transfer_state = Self::PR_LINK_ESTABLISHING;
 			if let Some(prop_identity) = Identity::recall(&outbound_node) {
 				if let Ok(destination) = Destination::new_outbound(
@@ -3440,6 +3462,7 @@ impl LXMRouter {
 						let router_weak = self.self_handle.clone();
 						if let Ok(mut link_guard) = link_arc.lock() {
 							link_guard.callbacks.link_established = Some(Arc::new(move |_| {
+								log("[PSYNC] propagation link ESTABLISHED", LOG_NOTICE, false, false);
 								if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
 									if let Ok(mut router) = router_arc.lock() {
 										let max_messages = router.propagation_transfer_max_messages;
@@ -3459,6 +3482,7 @@ impl LXMRouter {
 				}
 			}
 		} else {
+			log(&format!("[PSYNC] no path to {} → requesting path, starting path job", reticulum_rust::hexrep(&outbound_node, false)), LOG_NOTICE, false, false);
 			Transport::request_path(&outbound_node, None, None, None, None);
 			self.wants_download_on_path_available_from = Some(outbound_node);
 			self.wants_download_on_path_available_to = Some(identity);
@@ -3523,6 +3547,10 @@ impl LXMRouter {
 					self.propagation_transfer_state = Self::PR_COMPLETE;
 					self.propagation_transfer_progress = 1.0;
 					self.propagation_transfer_last_result = Some(0);
+					if let Some(cb) = &self.sync_complete_callback {
+						let cb = cb.clone();
+						std::thread::spawn(move || cb(0));
+					}
 					return;
 				}
 
@@ -3673,6 +3701,11 @@ impl LXMRouter {
 				self.propagation_transfer_last_duplicates = Some(duplicates);
 				self.propagation_transfer_last_result = Some(messages.len());
 				self.save_locally_delivered_transient_ids();
+				if let Some(cb) = &self.sync_complete_callback {
+					let cb = cb.clone();
+					let count = messages.len() as u32;
+					std::thread::spawn(move || cb(count));
+				}
 			}
 		}
 	}
@@ -3683,7 +3716,7 @@ impl LXMRouter {
 	}
 
 	pub fn message_get_failed(&mut self, _receipt: reticulum_rust::link::RequestReceipt) {
-		log("Message list/get request failed", LOG_DEBUG, false, false);
+		log("[PSYNC] message list/get request FAILED", LOG_WARNING, false, false);
 		if let Some(link) = self.outbound_propagation_link.as_ref() {
 			if let Ok(mut link_guard) = link.lock() {
 				link_guard.teardown();

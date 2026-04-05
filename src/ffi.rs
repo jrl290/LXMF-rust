@@ -155,6 +155,25 @@ pub fn router_set_delivery_callback(
     Ok(())
 }
 
+/// Register a callback that fires when propagation sync completes.
+///
+/// The callback receives the number of messages that were synced (0 means
+/// the propagation node had nothing new).
+pub fn router_set_sync_complete_callback(
+    router_handle: u64,
+    callback: Arc<dyn Fn(u32) + Send + Sync>,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .register_sync_complete_callback(callback);
+
+    Ok(())
+}
+
 /// Register a callback that fires when a delivery announce is received.
 ///
 /// The callback receives the 16-byte destination hash and an optional

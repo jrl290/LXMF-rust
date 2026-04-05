@@ -1,3 +1,5 @@
+pub mod client;
+pub mod cffi;
 pub mod handlers;
 pub mod lx_message;
 pub mod lx_stamper;
@@ -11,6 +13,7 @@ pub mod ffi;
 
 pub use lx_message::LXMessage;
 pub use lxm_router::LXMRouter;
+pub use client::{LxmfClient, ClientConfig, ClientCallbacks};
 
 /// Decode a base32-or-hex identity key string into raw bytes.
 ///
