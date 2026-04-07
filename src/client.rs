@@ -1,21 +1,12 @@
-//! High-level Reticulum + LXMF client.
+//! High-level LXMF client, composed on top of [`ReticulumClient`].
 //!
-//! `LxmfClient` encapsulates the common protocol sequence shared by every
-//! consumer (iOS main app, NSE, Android, CLI tools, etc.):
-//!
-//!   1. Initialize Reticulum transport
-//!   2. Load or create an identity
-//!   3. Create an LXMF router + delivery endpoint
-//!   4. Enable ratchets
-//!   5. Wire callbacks (delivery, announce, sync-complete)
-//!   6. Sync from a propagation node
-//!   7. Tear down
-//!
-//! Consumers only need to supply a [`ClientConfig`] and optional callbacks.
+//! `LxmfClient` adds the LXMF protocol layer (router, delivery endpoint,
+//! ratchets, propagation sync, messaging) to a running Reticulum transport
+//! instance.  Consumers supply a [`ClientConfig`] and optional callbacks.
 
 use std::sync::Arc;
 
-use reticulum_rust::ffi as rns;
+use reticulum_rust::client::{ReticulumClient, ReticulumConfig};
 
 use crate::ffi as lxmf;
 use crate::ffi::ReceivedMessage;
@@ -66,15 +57,16 @@ pub struct ClientCallbacks {
 // Client
 // ---------------------------------------------------------------------------
 
-/// A running LXMF client.  All protocol state is owned here; callers only
-/// interact through the public methods.
+/// A running LXMF client.
+///
+/// Owns a [`ReticulumClient`] (transport + identity) and adds LXMF-specific
+/// protocol state (router, delivery destination, ratchets).
 pub struct LxmfClient {
-    pub identity_handle: u64,
+    /// The underlying Reticulum transport client.
+    pub rns: ReticulumClient,
+
     pub router_handle: u64,
     pub dest_handle: u64,
-
-    /// The 16-byte identity hash.
-    pub identity_hash: Vec<u8>,
 
     /// The 16-byte LXMF delivery destination hash.
     pub dest_hash: Vec<u8>,
@@ -82,45 +74,26 @@ pub struct LxmfClient {
 
 impl LxmfClient {
     /// Stand up the full Reticulum + LXMF stack.
-    ///
-    /// This performs steps 1–5 of the protocol sequence.  After `start()`
-    /// returns the transport interfaces are connecting and the router is
-    /// ready to receive messages.
     pub fn start(
         config: ClientConfig,
         callbacks: ClientCallbacks,
     ) -> Result<Self, String> {
-        // 1. Init Reticulum transport
-        rns::init(&config.config_dir, config.log_level)?;
+        // 1–2. Init transport + identity via ReticulumClient
+        let rns_config = ReticulumConfig {
+            config_dir: config.config_dir,
+            identity_path: config.identity_path,
+            create_identity: config.create_identity,
+            log_level: config.log_level,
+        };
+        let rns_client = ReticulumClient::start(rns_config)?;
 
-        // Re-apply stderr logging so Xcode / logcat can see it.
-        rns::set_log_callback(|msg| {
-            eprintln!("{}", msg);
-        });
-
-        // 2. Load or create identity
-        let identity_handle =
-            match rns::identity_from_file(&config.identity_path) {
-                Ok(h) => h,
-                Err(_) if config.create_identity => {
-                    let h = rns::identity_create()?;
-                    rns::identity_to_file(h, &config.identity_path)?;
-                    h
-                }
-                Err(e) => return Err(e),
-            };
-
-        let identity_hash = rns::identity_hash(identity_handle)?;
-
-        let dest_hash = rns::destination_hash_for(
-            identity_handle,
-            "lxmf",
-            &["delivery"],
-        )?;
+        let dest_hash = rns_client.destination_hash("lxmf", &["delivery"])?;
 
         // 3. Create router + register delivery endpoint
-        let router_handle =
-            lxmf::router_create(identity_handle, &config.lxmf_storage_path)?;
+        let router_handle = lxmf::router_create(
+            rns_client.identity_handle,
+            &config.lxmf_storage_path,
+        )?;
 
         let display = if config.display_name.is_empty() {
             None
@@ -129,12 +102,10 @@ impl LxmfClient {
         };
         let dest_handle = lxmf::router_register_delivery(
             router_handle,
-            identity_handle,
+            rns_client.identity_handle,
             display,
             config.stamp_cost,
         )?;
-
-        // Ratchets are enabled automatically inside register_delivery_identity.
 
         // 4. Wire callbacks
         if let Some(cb) = callbacks.on_delivery {
@@ -148,38 +119,43 @@ impl LxmfClient {
         }
 
         Ok(LxmfClient {
-            identity_handle,
+            rns: rns_client,
             router_handle,
             dest_handle,
-            identity_hash,
             dest_hash,
         })
+    }
+
+    /// Convenience: the 16-byte identity hash (delegated to ReticulumClient).
+    pub fn identity_hash(&self) -> &[u8] {
+        &self.rns.identity_hash
+    }
+
+    /// Convenience: the identity handle (delegated to ReticulumClient).
+    pub fn identity_handle(&self) -> u64 {
+        self.rns.identity_handle
     }
 
     // -------------------------------------------------------------------
     // Propagation
     // -------------------------------------------------------------------
 
-    /// Set the outbound propagation node and request messages.
     pub fn sync_from_propagation_node(
         &self,
         node_hash: &[u8],
     ) -> Result<(), String> {
         lxmf::router_set_propagation_node(self.router_handle, node_hash)?;
-        lxmf::router_request_messages(self.router_handle, self.identity_handle)
+        lxmf::router_request_messages(self.router_handle, self.rns.identity_handle)
     }
 
-    /// Current propagation transfer state byte.
     pub fn propagation_state(&self) -> Result<u8, String> {
         lxmf::router_get_propagation_state(self.router_handle)
     }
 
-    /// Current propagation transfer progress (0.0–1.0).
     pub fn propagation_progress(&self) -> Result<f64, String> {
         lxmf::router_get_propagation_progress(self.router_handle)
     }
 
-    /// Cancel an in-progress propagation transfer.
     pub fn cancel_propagation(&self) -> Result<(), String> {
         lxmf::router_cancel_propagation(self.router_handle)
     }
@@ -188,12 +164,10 @@ impl LxmfClient {
     // Announce
     // -------------------------------------------------------------------
 
-    /// Announce this client's delivery destination on the network.
     pub fn announce(&self) -> Result<(), String> {
         lxmf::router_announce(self.router_handle, &self.dest_hash)
     }
 
-    /// Add a destination hash to the announce watch list.
     pub fn watch_destination(&self, dest_hash: &[u8]) -> Result<(), String> {
         lxmf::router_watch_destination(self.router_handle, dest_hash)
     }
@@ -202,7 +176,6 @@ impl LxmfClient {
     // Outbound messages
     // -------------------------------------------------------------------
 
-    /// Process outbound message queue (retries, link management).
     pub fn process_outbound(&self) -> Result<(), String> {
         lxmf::router_process_outbound(self.router_handle)
     }
@@ -211,7 +184,6 @@ impl LxmfClient {
     // Callbacks (set after start)
     // -------------------------------------------------------------------
 
-    /// Set or replace the delivery callback.
     pub fn set_delivery_callback(
         &self,
         cb: Arc<dyn Fn(ReceivedMessage) + Send + Sync>,
@@ -219,7 +191,6 @@ impl LxmfClient {
         lxmf::router_set_delivery_callback(self.router_handle, cb)
     }
 
-    /// Set or replace the announce callback.
     pub fn set_announce_callback(
         &self,
         cb: Arc<dyn Fn(&[u8], Option<String>) + Send + Sync>,
@@ -227,7 +198,6 @@ impl LxmfClient {
         lxmf::router_set_announce_callback(self.router_handle, cb)
     }
 
-    /// Set or replace the sync-complete callback.
     pub fn set_sync_complete_callback(
         &self,
         cb: Arc<dyn Fn(u32) + Send + Sync>,
@@ -236,18 +206,9 @@ impl LxmfClient {
     }
 
     // -------------------------------------------------------------------
-    // Outbound messages
+    // Messages
     // -------------------------------------------------------------------
 
-    /// Create a new outbound message.
-    ///
-    /// The client's identity is used for signing and the client's delivery
-    /// destination hash is used as the source.  The caller only supplies the
-    /// recipient and content — no protocol knowledge needed.
-    ///
-    /// Returns a message handle.  Optionally decorate with
-    /// [`lxmf::message_add_field_string`] / [`lxmf::message_add_attachment`]
-    /// before calling [`send_message`].
     pub fn create_message(
         &self,
         dest_hash: &[u8],
@@ -261,11 +222,10 @@ impl LxmfClient {
             content,
             title,
             method,
-            self.identity_handle,
+            self.rns.identity_handle,
         )
     }
 
-    /// Submit a previously created message for delivery.
     pub fn send_message(&self, msg_handle: u64) -> Result<(), String> {
         lxmf::message_send(self.router_handle, msg_handle)
     }
@@ -276,14 +236,12 @@ impl LxmfClient {
 
     /// Persist path table and cached data to disk.
     pub fn persist(&self) {
-        rns::persist_data();
+        self.rns.persist();
     }
 
-    /// Shut down the client: destroy router, identity, and Reticulum transport.
+    /// Shut down: destroy router, then delegate identity + transport to ReticulumClient.
     pub fn shutdown(&self) -> Result<(), String> {
-        // Order matters: router first (closes links), then identity, then transport.
         lxmf::router_destroy(self.router_handle)?;
-        rns::identity_destroy(self.identity_handle)?;
-        rns::shutdown()
+        self.rns.shutdown()
     }
 }

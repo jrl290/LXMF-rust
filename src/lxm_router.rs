@@ -1411,9 +1411,40 @@ impl LXMRouter {
 				}
 			}
 
+			// Resolve the Destination object from the hash if needed.
+			// PROPAGATED and OPPORTUNISTIC delivery require the destination
+			// (with its public key) for encryption during pack().
+			if lxm.destination().is_none() {
+				match Destination::from_destination_hash(
+					&destination_hash,
+					"lxmf",
+					&["delivery"],
+				) {
+					Ok(dest) => {
+						let _ = lxm.set_destination(dest);
+					}
+					Err(e) => {
+						log(
+							&format!(
+								"Could not resolve destination for {}: {}",
+								prettyhexrep(&destination_hash),
+								e
+							),
+							LOG_NOTICE,
+							false,
+							false,
+						);
+					}
+				}
+			}
+
 			if lxm.packed.is_none() {
 				if let Err(e) = lxm.pack(false) {
 					log(&format!("Failed to pack message: {}", e), LOG_ERROR, false, false);
+					lxm.state = LXMessage::FAILED;
+					if let Some(callback) = lxm.failed_callback() {
+						callback(&lxm);
+					}
 					return;
 				}
 			}
@@ -2436,6 +2467,21 @@ impl LXMRouter {
 				self.outbound_propagation_link = None;
 			}
 		}
+
+		// Proactively request the path so it is available before the first sync attempt
+		if !Transport::has_path(&destination_hash) {
+			log(
+				&format!(
+					"No path to propagation node {}, requesting proactively",
+					reticulum_rust::hexrep(&destination_hash, false)
+				),
+				LOG_DEBUG,
+				false,
+				false,
+			);
+			Transport::request_path(&destination_hash, None, None, None, None);
+		}
+
 		Ok(())
 	}
 

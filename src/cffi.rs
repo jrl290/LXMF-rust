@@ -235,7 +235,7 @@ pub extern "C" fn lxmf_client_identity_handle(client: u64) -> u64 {
         }
     };
     let c = arc.lock().unwrap();
-    c.identity_handle
+    c.identity_handle()
 }
 
 // =========================================================================
@@ -376,7 +376,7 @@ pub extern "C" fn lxmf_client_identity_hash(
     buf_len: u32,
 ) -> i32 {
     with_client!(client, c, {
-        let hash = &c.identity_hash;
+        let hash = c.identity_hash();
         if buf_len < hash.len() as u32 {
             set_error("buffer too small");
             return -1;
