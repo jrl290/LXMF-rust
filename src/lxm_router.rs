@@ -159,11 +159,14 @@ pub struct LXMRouter {
 }
 
 impl LXMRouter {
-	pub const MAX_DELIVERY_ATTEMPTS: u32 = 5;
-	pub const PROCESSING_INTERVAL: u64 = 4;
-	pub const DELIVERY_RETRY_WAIT: f64 = 10.0;
+	pub const MAX_DELIVERY_ATTEMPTS: u32 = 2;
+	pub const PROCESSING_INTERVAL: u64 = 2;
+	pub const DELIVERY_RETRY_WAIT: f64 = 2.0;
 	pub const PATH_REQUEST_WAIT: f64 = 7.0;
 	pub const MAX_PATHLESS_TRIES: u32 = 1;
+	// TCP default. When slower interfaces (RNode/Serial/LoRa) are added,
+	// look up the dest's path entry via_interface and use a longer timeout.
+	pub const DIRECT_LINK_TIMEOUT: f64 = 4.0;
 	pub const LINK_MAX_INACTIVITY: f64 = 10.0 * 60.0;
 	pub const P_LINK_MAX_INACTIVITY: f64 = 3.0 * 60.0;
 
@@ -458,8 +461,8 @@ impl LXMRouter {
 			Value::Boolean(false),
 			Value::Integer((now() as i64).into()),
 			Value::Boolean(node_state),
-			Value::F64(self.propagation_per_transfer_limit),
-			Value::F64(self.propagation_per_sync_limit),
+			Value::Integer((self.propagation_per_transfer_limit as i64).into()),
+			Value::Integer((self.propagation_per_sync_limit as i64).into()),
 			stamp_costs,
 			self.get_propagation_node_announce_metadata(),
 		]);
@@ -1150,16 +1153,37 @@ impl LXMRouter {
 													.unwrap_or(0.0)
 											})
 											.unwrap_or(0.0);
-										log(
-											&format!(
-												"[POB][{}] DIRECT link PENDING ({:.1}s elapsed)",
-												message_label,
-												pending_for
-											),
-											LOG_NOTICE,
-											false,
-											false,
-										);
+										if pending_for > Self::DIRECT_LINK_TIMEOUT {
+											log(
+												&format!(
+													"[POB][{}] DIRECT link PENDING {:.1}s > {:.0}s timeout → failing to propagation",
+													message_label, pending_for, Self::DIRECT_LINK_TIMEOUT
+												),
+												LOG_NOTICE,
+												false,
+												false,
+											);
+											if let Ok(mut lg) = link_arc.lock() {
+												lg.teardown();
+											}
+											self.direct_links.remove(&dest_hash);
+											self.backchannel_links.remove(&dest_hash);
+											self.backchannel_identified_links.remove(&dest_hash);
+											lxm.clear_delivery_link();
+											self.fail_message(&mut lxm);
+											remove = true;
+										} else {
+											log(
+												&format!(
+													"[POB][{}] DIRECT link PENDING ({:.1}s elapsed)",
+													message_label,
+													pending_for
+												),
+												LOG_NOTICE,
+												false,
+												false,
+											);
+										}
 									}
 								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true)
 									|| Transport::has_path(&dest_hash) {
@@ -2500,7 +2524,7 @@ impl LXMRouter {
 
 	fn get_outbound_propagation_cost(&self) -> Option<u32> {
 		let pn_hash = self.outbound_propagation_node.clone()?;
-		let mut target_cost = Identity::recall_app_data(&pn_hash)
+		let target_cost = Identity::recall_app_data(&pn_hash)
 			.and_then(|data| if pn_announce_data_is_valid(&data) { Self::decode_value(&data) } else { None })
 			.and_then(|value| match value {
 				Value::Array(values) => values.get(5).cloned(),
@@ -2512,28 +2536,11 @@ impl LXMRouter {
 			});
 
 		if target_cost.is_none() {
+			// Fire off a path request so future sends will have the cached cost,
+			// but don't block — default to 0 so the message ships immediately.
 			Transport::request_path(&pn_hash, None, None, None, None);
-			let timeout = now() + Self::PATH_REQUEST_WAIT;
-			let has_valid_data = || Identity::recall_app_data(&pn_hash)
-				.map(|d| pn_announce_data_is_valid(&d))
-				.unwrap_or(false);
-			while !has_valid_data() && now() < timeout {
-				thread::sleep(Duration::from_millis(500));
-			}
-			target_cost = Identity::recall_app_data(&pn_hash)
-				.and_then(|data| if pn_announce_data_is_valid(&data) { Self::decode_value(&data) } else { None })
-				.and_then(|value| match value {
-					Value::Array(values) => values.get(5).cloned(),
-					_ => None,
-				})
-				.and_then(|value| match value {
-					Value::Array(costs) => costs.get(0).and_then(|v| v.as_i64()).map(|v| v as u32),
-					_ => None,
-				});
-		}
-
-		if target_cost.is_none() {
-			log("Propagation node stamp cost still unavailable after path request", LOG_ERROR, false, false);
+			log("Propagation node stamp cost not cached, requesting path and defaulting to 0", LOG_NOTICE, false, false);
+			return Some(0);
 		}
 
 		target_cost
