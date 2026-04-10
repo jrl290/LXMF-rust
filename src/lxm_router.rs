@@ -166,7 +166,7 @@ impl LXMRouter {
 	pub const MAX_PATHLESS_TRIES: u32 = 1;
 	// TCP default. When slower interfaces (RNode/Serial/LoRa) are added,
 	// look up the dest's path entry via_interface and use a longer timeout.
-	pub const DIRECT_LINK_TIMEOUT: f64 = 4.0;
+	pub const DIRECT_LINK_TIMEOUT: f64 = 8.0;
 	pub const LINK_MAX_INACTIVITY: f64 = 10.0 * 60.0;
 	pub const P_LINK_MAX_INACTIVITY: f64 = 3.0 * 60.0;
 
@@ -1144,21 +1144,20 @@ impl LXMRouter {
 										// Retry immediately on next cycle instead of waiting DELIVERY_RETRY_WAIT
 										lxm.next_delivery_attempt = Some(now());
 									} else {
-										let (pending_for, link_establishment_timeout) = link_arc
+										let pending_for = link_arc
 											.lock()
 											.map(|link| {
-												let pending = link
+												link
 													.request_time
 													.map(|requested| (now() - requested).max(0.0))
-													.unwrap_or(0.0);
-												(pending, link.establishment_timeout)
+													.unwrap_or(0.0)
 											})
-											.unwrap_or((0.0, Self::DIRECT_LINK_TIMEOUT));
-										if pending_for > link_establishment_timeout {
+											.unwrap_or(0.0);
+										if pending_for > Self::DIRECT_LINK_TIMEOUT {
 											log(
 												&format!(
 													"[POB][{}] DIRECT link PENDING {:.1}s > {:.0}s timeout → failing to propagation",
-													message_label, pending_for, link_establishment_timeout
+													message_label, pending_for, Self::DIRECT_LINK_TIMEOUT
 												),
 												LOG_NOTICE,
 												false,
