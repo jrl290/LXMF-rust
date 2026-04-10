@@ -1153,27 +1153,32 @@ impl LXMRouter {
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.state != LXMessage::SENDING {
-											if let Ok(link_guard) = link_arc.lock() {
-												if let Ok(destination_guard) = link_guard.destination.lock() {
-													let mut link_destination = destination_guard.clone();
-													link_destination.dest_type = DestinationType::Link;
-													link_destination.hash = link_guard.link_id.clone();
-													link_destination.hexhash = hexrep(&link_destination.hash, false);
-													link_destination.link = Some(reticulum_rust::destination::LinkInfo {
-														rtt: link_guard.rtt,
-														traffic_timeout_factor: link_guard.traffic_timeout_factor,
-														status_closed: false,
-														mtu: Some(link_guard.mtu),
-														attached_interface: link_guard.attached_interface.clone(),
-													});
-													lxm.set_delivery_destination(link_destination);
+											// Ensure propagation_packed is ready (set during initial pack())
+											let propagation_packed = lxm.propagation_packed.clone();
+											if let Some(pdata) = propagation_packed {
+												// Match Python: link.send_packet(lxm.propagation_packed); lxm.state = SENT
+												// Using link.send_packet() directly (not Packet::new → pack → encrypt)
+												// because link.send_packet() correctly uses the link session key.
+												match link_arc.lock()
+													.map_err(|_| "link lock poisoned".to_string())
+													.and_then(|g| g.send_packet(&pdata))
+												{
+													Ok(()) => {
+														log(&format!("[POB][{}] PROPAGATED sent via link → SENT", message_label), LOG_NOTICE, false, false);
+														lxm.state = LXMessage::SENT; // fire-and-forget
+													}
+													Err(e) => {
+														log(&format!("[POB][{}] PROPAGATED send_packet failed: {}", message_label, e), LOG_NOTICE, false, false);
+														lxm.state = LXMessage::OUTBOUND;
+														lxm.delivery_attempts += 1;
+														lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+													}
 												}
-											}
-											lxm.set_delivery_link(link_arc.clone());
-											if let Err(_err) = lxm.send_with_handle(Some(message.clone())) {
-												lxm.state = LXMessage::OUTBOUND;
-												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 											} else {
+												log(&format!("[POB][{}] PROPAGATED propagation_packed is None — re-packing not supported", message_label), LOG_NOTICE, false, false);
+												lxm.state = LXMessage::OUTBOUND;
+												lxm.delivery_attempts += 1;
+												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 											}
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
