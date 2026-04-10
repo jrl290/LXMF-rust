@@ -671,6 +671,22 @@ impl LXMessage {
 				};
 			}
 			Some(Self::PROPAGATED) => {
+				// PROTOCOL: For outbound PROPAGATED delivery over a link, the wire format is
+				// msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | pn_stamp?]]])
+				// stored in self.propagation_packed.
+				//
+				// CRITICAL — DO NOT use send_with_handle() / as_packet() / Packet::new() to
+				// send a PROPAGATED message over an active link. That path calls
+				// destination.encrypt() → runtime_encrypt_for_destination() which tries to
+				// re-acquire the link's session key via RUNTIME_LINKS.  It will fail silently,
+				// leaving the message stuck in OUTBOUND forever.
+				//
+				// CORRECT: call link.send_packet(&lxm.propagation_packed) directly.
+				// link.send_packet() encrypts using the link's AES session key and manually
+				// builds the raw packet bytes — exactly what Python does:
+				//   link.send_packet(lxm.propagation_packed)
+				//   lxm.state = SENT  (fire-and-forget)
+				// See: LXMRouter::process_outbound — LXMessage::PROPAGATED ACTIVE branch.
 				let destination = self
 					.destination
 					.as_mut()
@@ -811,7 +827,17 @@ impl LXMessage {
 					_ => {}
 				}
 			}
-			Self::PROPAGATED => {
+			// PROTOCOL WARNING: PROPAGATED delivery over an active propagation-node *link*
+		// must NOT go through this code path. send_with_handle → as_packet → Packet::new
+		// → destination.encrypt → runtime_encrypt_for_destination fails silently for
+		// Link-type destinations, leaving the message stuck in OUTBOUND forever.
+		//
+		// This send_with_handle PROPAGATED branch is only correct for a plain
+		// DestinationType::Single destination (i.e., the RNS transport layer will
+		// route the packet, not a pre-established link).  In practice the router NEVER
+		// calls send_with_handle for propagation; it uses link.send_packet() directly.
+		// See: LXMRouter::process_outbound — PROPAGATED ACTIVE branch.
+		Self::PROPAGATED => {
 				self.state = Self::SENDING;
 				match self.representation {
 					Self::PACKET => {
@@ -1138,6 +1164,11 @@ impl LXMessage {
 		Ok(message)
 	}
 
+	// PROTOCOL: as_packet() for PROPAGATED returns propagation_packed as the payload.
+	// However, do NOT use as_packet() to transmit a PROPAGATED message over a Link —
+	// the resulting Packet::new(link_dest).pack() calls destination.encrypt() which
+	// routes through runtime_encrypt_for_destination() and fails for Link destinations.
+	// To send over a link: call link.send_packet(&lxm.propagation_packed) directly.
 	fn as_packet(&mut self) -> Result<Packet, String> {
 		if self.packed.is_none() {
 			self.pack(false)?;

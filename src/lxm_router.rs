@@ -1153,10 +1153,21 @@ impl LXMRouter {
 									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.state != LXMessage::SENDING {
-											// Ensure propagation_packed is ready (set during initial pack())
+											// PROTOCOL: Send propagation_packed over the link using link.send_packet().
+											// propagation_packed = msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | pn_stamp?]]])
+											// This matches Python: link.send_packet(lxm.propagation_packed); lxm.state = SENT
+											//
+											// DO NOT use send_with_handle() / as_packet() / Packet::new() here.
+											// That path calls destination.encrypt() → runtime_encrypt_for_destination()
+											// which fails silently for Link-type destinations (the error was being swallowed),
+											// leaving the message stuck in OUTBOUND forever, retrying every 2 seconds.
+											//
+											// link.send_packet() uses the link's AES-256-CBC session key directly and
+											// builds the raw packet bytes without touching RUNTIME_LINKS.
+											// After a successful send state = SENT immediately (fire-and-forget);
+											// the propagation node does not send a delivery receipt.
 											let propagation_packed = lxm.propagation_packed.clone();
 											if let Some(pdata) = propagation_packed {
-												// Match Python: link.send_packet(lxm.propagation_packed); lxm.state = SENT
 												// Using link.send_packet() directly (not Packet::new → pack → encrypt)
 												// because link.send_packet() correctly uses the link session key.
 												match link_arc.lock()
