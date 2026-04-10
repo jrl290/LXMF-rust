@@ -534,6 +534,133 @@ pub extern "C" fn lxmf_client_watch(
     })
 }
 
+/// Mark a peer as "active" so the router proactively maintains a direct link.
+/// Call when a chat conversation is opened.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_set_active_peer(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.set_active_peer(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Remove a peer from the proactive link pool.
+/// Call when a chat conversation is closed.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_clear_active_peer(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.clear_active_peer(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Query the current direct-link status for a peer.
+/// Returns: 0 = no link / closed, 1 = pending (establishing), 2 = active.
+/// Returns -1 on parameter error.
+#[no_mangle]
+pub extern "C" fn lxmf_peer_link_status(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.peer_link_status(hash) {
+            Ok(s) => s as i32,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Look up the cached display name for a destination hash.
+///
+/// Reads the announce app-data stored in the Reticulum Identity table when
+/// the announce was received, and decodes the LXMF display-name field from
+/// it.  Returns the number of bytes written to `out_buf` (including the NUL
+/// terminator), or 0 if no name is known or `out_buf` is too small.
+///
+/// The returned string is always NUL-terminated.
+#[no_mangle]
+pub extern "C" fn lxmf_client_recall_display_name(
+    _client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    out_buf: *mut c_char,
+    buf_len: u32,
+) -> i32 {
+    let hash = if dest_hash.is_null() || dest_len == 0 {
+        return 0;
+    } else {
+        unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+    };
+
+    let app_data = reticulum_rust::identity::Identity::recall_app_data(hash);
+    let name = crate::lxmf::display_name_from_app_data(app_data.as_deref());
+
+    match name {
+        Some(n) if !n.is_empty() => {
+            match CString::new(n.as_str()) {
+                Ok(cstr) => {
+                    let bytes = cstr.as_bytes_with_nul();
+                    if out_buf.is_null() || (buf_len as usize) < bytes.len() {
+                        return 0;
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr() as *const c_char,
+                            out_buf,
+                            bytes.len(),
+                        );
+                    }
+                    bytes.len() as i32
+                }
+                Err(_) => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
 // =========================================================================
 // Outbound messages
 // =========================================================================

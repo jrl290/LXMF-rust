@@ -465,3 +465,37 @@ pub fn router_cancel_propagation(router_handle: u64) -> Result<(), String> {
     guard.cancel_propagation_node_requests();
     Ok(())
 }
+
+/// Mark a peer as "active" so the router maintains a proactive direct link.
+pub fn router_set_active_peer(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .set_active_peer(dest_hash.to_vec());
+    Ok(())
+}
+
+/// Stop maintaining a proactive link for a peer.
+pub fn router_clear_active_peer(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clear_active_peer(dest_hash);
+    Ok(())
+}
+
+/// Return the direct-link status for a peer: 0=none, 1=pending, 2=active.
+pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let guard = router.lock().map_err(|e| e.to_string())?;
+    let status = guard.peer_link_status(dest_hash);
+    Ok(status)
+}
