@@ -1197,7 +1197,7 @@ impl LXMRouter {
 									log(&format!("[POB][{}] DIRECT no-link try: attempts={} has_path={}", message_label, lxm.delivery_attempts, has_path), LOG_NOTICE, false, false);
 									lxm.delivery_attempts += 1;
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-									if lxm.delivery_attempts < Self::MAX_DELIVERY_ATTEMPTS {
+									if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 										if Transport::has_path(&dest_hash) {
 											// If the message has no Destination object, try to resolve it from the hash
 											if lxm.destination().is_none() {
