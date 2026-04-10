@@ -1144,20 +1144,21 @@ impl LXMRouter {
 										// Retry immediately on next cycle instead of waiting DELIVERY_RETRY_WAIT
 										lxm.next_delivery_attempt = Some(now());
 									} else {
-										let pending_for = link_arc
+										let (pending_for, link_establishment_timeout) = link_arc
 											.lock()
 											.map(|link| {
-												link
+												let pending = link
 													.request_time
 													.map(|requested| (now() - requested).max(0.0))
-													.unwrap_or(0.0)
+													.unwrap_or(0.0);
+												(pending, link.establishment_timeout)
 											})
-											.unwrap_or(0.0);
-										if pending_for > Self::DIRECT_LINK_TIMEOUT {
+											.unwrap_or((0.0, Self::DIRECT_LINK_TIMEOUT));
+										if pending_for > link_establishment_timeout {
 											log(
 												&format!(
 													"[POB][{}] DIRECT link PENDING {:.1}s > {:.0}s timeout → failing to propagation",
-													message_label, pending_for, Self::DIRECT_LINK_TIMEOUT
+													message_label, pending_for, link_establishment_timeout
 												),
 												LOG_NOTICE,
 												false,
