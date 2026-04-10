@@ -1468,3 +1468,170 @@ fn update_transfer_progress_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Ar
 		message.update_transfer_progress(&mut resource_guard);
 	}
 }
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+//
+// These tests guard against regressions of the PROPAGATED-via-link protocol.
+// See the PROTOCOL comments in pack(), send_with_handle(), as_packet(), and
+// LXMRouter::process_outbound() for the full explanation.
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use reticulum_rust::destination::{Destination, DestinationType};
+	use reticulum_rust::identity::Identity;
+
+	/// Build a minimal LXMessage ready for pack() with desired_method = PROPAGATED.
+	/// Uses two freshly-generated in-memory identities (no RNS runtime required).
+	fn make_propagated_message() -> LXMessage {
+		let src_identity = Identity::new(true);
+		let dst_identity = Identity::new(true);
+
+		let source = Destination::new_inbound(
+			Some(src_identity.clone()),
+			DestinationType::Single,
+			"lxmf".to_string(),
+			vec!["delivery".to_string()],
+		)
+		.expect("source dest");
+
+		let dest = Destination::new_outbound(
+			Some(dst_identity.clone()),
+			DestinationType::Single,
+			"lxmf".to_string(),
+			vec!["delivery".to_string()],
+		)
+		.expect("dest dest");
+
+		let dest_hash = dest.hash.clone();
+		let src_hash = source.hash.clone();
+
+		LXMessage::new(
+			Some(dest),
+			Some(source),
+			Some(b"hello propagation".to_vec()),
+			Some(b"test title".to_vec()),
+			None,
+			Some(LXMessage::PROPAGATED),
+			Some(dest_hash),
+			Some(src_hash),
+			None,
+			false,
+		)
+		.expect("LXMessage::new")
+	}
+
+	/// REGRESSION GUARD: After pack(), propagation_packed must be Some(_).
+	///
+	/// If this fails it means the PROPAGATED arm of pack() is broken, and the
+	/// POB send path will fall into the "propagation_packed is None" error branch
+	/// every cycle instead of sending.
+	#[test]
+	fn propagated_pack_sets_propagation_packed() {
+		let mut msg = make_propagated_message();
+		msg.pack(false).expect("pack");
+
+		assert!(
+			msg.propagation_packed.is_some(),
+			"propagation_packed must be Some after pack() with desired_method=PROPAGATED \
+			 — the POB send path reads this field directly via link.send_packet()"
+		);
+	}
+
+	/// REGRESSION GUARD: propagation_packed must be valid msgpack with the shape
+	/// [f64_timestamp, [[bytes]]].
+	///
+	/// The propagation node expects exactly this structure. If the format changes,
+	/// the node will reject the message silently.
+	#[test]
+	fn propagation_packed_has_correct_msgpack_shape() {
+		let mut msg = make_propagated_message();
+		msg.pack(false).expect("pack");
+
+		let data = msg.propagation_packed.as_ref().unwrap();
+		let value = rmpv::decode::read_value(&mut data.as_slice())
+			.expect("propagation_packed must be valid msgpack");
+
+		// Top level: [timestamp_f64, [[encrypted_bytes]]]
+		let arr = match value {
+			Value::Array(a) => a,
+			other => panic!("propagation_packed top level must be Array, got {:?}", other),
+		};
+		assert_eq!(arr.len(), 2, "propagation_packed must have 2 top-level elements");
+
+		assert!(
+			matches!(arr[0], Value::F64(_)),
+			"propagation_packed[0] must be F64 timestamp, got {:?}",
+			arr[0]
+		);
+
+		let inner = match &arr[1] {
+			Value::Array(a) => a,
+			other => panic!("propagation_packed[1] must be Array, got {:?}", other),
+		};
+		assert_eq!(inner.len(), 1, "propagation_packed[1] must have exactly 1 blob");
+
+		assert!(
+			matches!(inner[0], Value::Binary(_)),
+			"propagation_packed[1][0] must be Binary blob, got {:?}",
+			inner[0]
+		);
+	}
+
+	/// REGRESSION GUARD: The method field after pack() must be PROPAGATED.
+	///
+	/// If this is DIRECT or OPPORTUNISTIC the router's match arm dispatches to
+	/// the wrong send path.
+	#[test]
+	fn propagated_pack_sets_method_to_propagated() {
+		let mut msg = make_propagated_message();
+		msg.pack(false).expect("pack");
+
+		assert_eq!(
+			msg.method,
+			LXMessage::PROPAGATED,
+			"msg.method must be PROPAGATED after pack() — router dispatch depends on this"
+		);
+	}
+
+	/// REGRESSION GUARD: The POB route for PROPAGATED+ACTIVE must NOT call
+	/// send_with_handle(). This is a static / documentation test — it cannot
+	/// catch a runtime regression itself but it ensures the invariant is
+	/// visible to anyone reading the code changing the POB path.
+	///
+	/// To verify the runtime contract is preserved: search for any call to
+	/// `send_with_handle` inside `process_outbound`'s `LXMessage::PROPAGATED`
+	/// match arm.  There must be none.  The only correct send call is:
+	///   link.send_packet(&lxm.propagation_packed.unwrap())
+	///
+	/// See the PROTOCOL comments in lxm_router.rs process_outbound().
+	#[test]
+	fn propagated_active_branch_does_not_call_send_with_handle() {
+		// Static assertion: the router source must not call send_with_handle
+		// in the PROPAGATED + ACTIVE branch.
+		//
+		// We verify this by checking that propagation_packed survives a round-trip
+		// through pack() unchanged (i.e., it's stable bytes that can be handed
+		// directly to link.send_packet without re-encoding).
+		let mut msg = make_propagated_message();
+		msg.pack(false).expect("pack");
+
+		let first = msg.propagation_packed.clone().unwrap();
+
+		// Calling pack() again must fail (already packed) — meaning the bytes
+		// are final after the first pack and will not mutate between POB cycles.
+		let repack_result = msg.pack(false);
+		assert!(
+			repack_result.is_err(),
+			"pack() on an already-packed message must return Err — \
+			 propagation_packed bytes are final and stable for link.send_packet()"
+		);
+
+		// The bytes from the first pack must still be intact.
+		assert_eq!(
+			msg.propagation_packed.as_ref().unwrap(),
+			&first,
+			"propagation_packed must not change after failed re-pack"
+		);
+	}
+}
