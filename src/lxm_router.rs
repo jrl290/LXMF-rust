@@ -1118,9 +1118,8 @@ impl LXMRouter {
 											log(&format!("[POB][{}] DIRECT send OK", message_label), LOG_NOTICE, false, false);
 										}
 									}
-								} else {
-									// Link is CLOSED or PENDING — clean up and route via propagation immediately.
-									// `maintain_peer_links` will re-establish the direct link in the background.
+								} else if status == reticulum_rust::link::STATE_CLOSED {
+									// Link is CLOSED — clean up and retry with fresh link.
 									if lxm.state == LXMessage::SENDING {
 										lxm.state = LXMessage::OUTBOUND;
 										lxm.resource_representation = None;
@@ -1130,16 +1129,73 @@ impl LXMRouter {
 									self.backchannel_links.remove(&dest_hash);
 									self.backchannel_identified_links.remove(&dest_hash);
 									log(
-										&format!("[POB][{}] DIRECT link not ACTIVE (status={}) → downgrading to PROPAGATED", message_label, status),
+										&format!("[POB][{}] DIRECT link CLOSED → requesting new path", message_label),
 										LOG_NOTICE, false, false,
 									);
-									lxm.method = LXMessage::PROPAGATED;
+									Transport::request_path(&dest_hash, None, None, None, None);
+									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+								} else {
+									// Link is PENDING/HANDSHAKE — just wait for it to become active.
+									log(
+										&format!("[POB][{}] DIRECT link PENDING (status={}), waiting", message_label, status),
+										LOG_NOTICE, false, false,
+									);
 								}
 							} else {
-								// No link at all — route via propagation immediately.
-								// `maintain_peer_links` will establish a direct link for future messages.
-								log(&format!("[POB][{}] DIRECT no link → downgrading to PROPAGATED", message_label), LOG_NOTICE, false, false);
-								lxm.method = LXMessage::PROPAGATED;
+								// No link exists — establish one (matching Python LXMRouter behavior).
+								if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
+									lxm.delivery_attempts += 1;
+									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+
+									if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
+										if Transport::has_path(&dest_hash) {
+											log(&format!("[POB][{}] DIRECT no link → establishing link (attempt {})", message_label, lxm.delivery_attempts), LOG_NOTICE, false, false);
+											let destination = match Destination::from_destination_hash(&dest_hash, "lxmf", &["delivery"]) {
+												Ok(d) => d,
+												Err(e) => {
+													log(&format!("[POB][{}] DIRECT dest resolve failed: {}", message_label, e), LOG_ERROR, false, false);
+													// Will retry on next process_outbound cycle
+													continue;
+												}
+											};
+											match Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
+												Ok(link) => {
+													let link_arc = Arc::new(Mutex::new(link));
+													let router_weak = self.self_handle.clone();
+													if let Ok(mut link_guard) = link_arc.lock() {
+														link_guard.callbacks.link_established = Some(Arc::new(move |_| {
+															log("[POB] Direct delivery link ESTABLISHED", LOG_NOTICE, false, false);
+															if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+																if let Ok(mut router) = router_arc.lock() {
+																	router.process_outbound();
+																}
+															}
+														}));
+														if let Err(e) = link_guard.initiate() {
+															log(&format!("[POB][{}] DIRECT link initiate failed: {}", message_label, e), LOG_ERROR, false, false);
+															continue;
+														}
+													}
+													register_runtime_link(Arc::clone(&link_arc));
+													self.direct_links.insert(dest_hash.clone(), link_arc);
+													lxm.progress = 0.03;
+												}
+												Err(e) => {
+													log(&format!("[POB][{}] DIRECT Link::new_outbound failed: {}", message_label, e), LOG_ERROR, false, false);
+												}
+											}
+										} else {
+											log(&format!("[POB][{}] DIRECT no link, no path → requesting", message_label), LOG_NOTICE, false, false);
+											Transport::request_path(&dest_hash, None, None, None, None);
+											lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+											lxm.progress = 0.01;
+										}
+									} else {
+										log(&format!("[POB][{}] DIRECT max attempts reached", message_label), LOG_NOTICE, false, false);
+										self.fail_message(&mut lxm);
+										remove = true;
+									}
+								}
 							}
 						}
 						LXMessage::PROPAGATED => {
