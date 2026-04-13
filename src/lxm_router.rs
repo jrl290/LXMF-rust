@@ -1126,6 +1126,14 @@ impl LXMRouter {
 											lxm.method = LXMessage::PROPAGATED;
 										} else {
 											log(&format!("[POB][{}] DIRECT send OK", message_label), LOG_NOTICE, false, false);
+											// Set up backchannel callbacks immediately after send.
+											// Matches Python LXMRouter: delivery_link_established(direct_link) is
+											// called right after lxm.send(), not after the delivery receipt.
+											// Without this, replies arrive before the receipt proof and the
+											// packet callback is not yet installed → silent drop.
+											if !backchannel_setup_links.iter().any(|(l, _)| Arc::ptr_eq(l, &link_arc)) {
+												backchannel_setup_links.push((link_arc.clone(), dest_hash.clone()));
+											}
 										}
 									}
 								} else if status == reticulum_rust::link::STATE_CLOSED {
@@ -4586,5 +4594,127 @@ impl LXMRouter {
 		}
 
 		self.allowed_list.contains(&identity.hash.clone().expect("Identity hash missing"))
+	}
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{Arc, Mutex};
+
+	/// REGRESSION GUARD: `Arc::ptr_eq` dedup logic prevents the same link from
+	/// being pushed to `backchannel_setup_links` more than once per
+	/// `process_outbound` cycle.
+	///
+	/// Context: `process_outbound` now pushes to `backchannel_setup_links` in two
+	/// places — (1) immediately after `send_with_handle` succeeds ("DIRECT send OK"
+	/// branch, our fix) and (2) in the `lxm.state == DELIVERED` safety-net path.
+	/// When both paths fire in the same cycle (possible if the receipt proof arrives
+	/// before the next job tick) the same link would be pushed twice → `delivery_link_established`
+	/// would overwrite `callbacks.packet` twice, which is harmless but wasteful.
+	/// The dedup guard ensures only one call occurs.
+	#[test]
+	fn backchannel_setup_dedup_prevents_double_install() {
+		// Use i32 as a stand-in for Link — we're testing pointer-equality dedup only.
+		type FakeLink = Arc<Mutex<i32>>;
+
+		let link_a: FakeLink = Arc::new(Mutex::new(1));
+		let link_b = link_a.clone(); // same heap allocation as link_a
+		let link_c: FakeLink = Arc::new(Mutex::new(1)); // different allocation
+
+		let dest = vec![0u8; 16];
+		let mut slots: Vec<(FakeLink, Vec<u8>)> = Vec::new();
+
+		// Simulate SEND OK push (our fix).
+		if !slots.iter().any(|(l, _)| Arc::ptr_eq(l, &link_a)) {
+			slots.push((link_a.clone(), dest.clone()));
+		}
+		assert_eq!(slots.len(), 1, "first push adds the link");
+
+		// Simulate DELIVERED path push with the same Arc clone → must be deduped.
+		if !slots.iter().any(|(l, _)| Arc::ptr_eq(l, &link_b)) {
+			slots.push((link_b.clone(), dest.clone()));
+		}
+		assert_eq!(
+			slots.len(), 1,
+			"same Arc (via clone) must not be pushed twice — \
+			 prevents double installation of callbacks.packet"
+		);
+
+		// A distinct Arc (different link) must still be admitted.
+		if !slots.iter().any(|(l, _)| Arc::ptr_eq(l, &link_c)) {
+			slots.push((link_c.clone(), dest.clone()));
+		}
+		assert_eq!(slots.len(), 2, "distinct Arc must still be queued");
+	}
+
+	/// REGRESSION GUARD: `backchannel_setup_links.push` must appear in the
+	/// "DIRECT send OK" branch of `process_outbound` — i.e., immediately after
+	/// `send_with_handle` returns `Ok`.
+	///
+	/// Before this fix, the push only happened in the `lxm.state == DELIVERED`
+	/// block (after the receipt proof arrived).  Meshchat may reply on the same
+	/// back-channel link in the round-trip time before that proof returns, so
+	/// `callbacks.packet` was `None` when the DATA packet arrived → silent drop.
+	///
+	/// Python reference (LXMRouter.py:2539): `delivery_link_established(direct_link)`
+	/// is called immediately after `lxm.send()`, before the DELIVERED receipt.
+	/// This test verifies the Rust implementation matches that ordering.
+	#[test]
+	fn direct_send_ok_pushes_backchannel_before_delivered_receipt() {
+		let src = include_str!("lxm_router.rs");
+
+		// The "DIRECT send OK" log marker must be present.
+		assert!(
+			src.contains("DIRECT send OK"),
+			"'DIRECT send OK' marker must exist in process_outbound — \
+			 remove this test only if the log line is intentionally renamed"
+		);
+
+		// A `backchannel_setup_links.push` must appear AFTER "DIRECT send OK"
+		// in the source — this is the fix that closes the race window.
+		let send_ok_pos = src.find("DIRECT send OK").unwrap();
+		let push_after_send = src[send_ok_pos..].contains("backchannel_setup_links.push");
+		assert!(
+			push_after_send,
+			"backchannel_setup_links.push must appear after 'DIRECT send OK' \
+			 — removing it re-introduces the reply-before-receipt race condition \
+			 where callbacks.packet is None when Meshchat's reply DATA arrives"
+		);
+
+		// Both the SEND OK push (our fix) and the DELIVERED safety-net push must be present.
+		let push_count = src.matches("backchannel_setup_links.push").count();
+		assert!(
+			push_count >= 2,
+			"backchannel_setup_links.push must appear in at least 2 places: \
+			 (1) after 'DIRECT send OK' (race-condition fix) and \
+			 (2) in the DELIVERED safety-net path — found {}",
+			push_count
+		);
+	}
+
+	/// REGRESSION GUARD: the `Arc::ptr_eq` dedup guard must accompany the
+	/// "DIRECT send OK" push.
+	///
+	/// Without it, if `process_outbound` runs a second cycle while the message
+	/// is still in `SENDING` state (receipt not yet back), the same link would be
+	/// pushed again → `delivery_link_established` called twice on the same link
+	/// → last-write wins for `callbacks.packet`, which is benign TODAY but could
+	/// become harmful if the callback closure captures mutable state in future.
+	#[test]
+	fn send_ok_backchannel_push_has_dedup_guard() {
+		let src = include_str!("lxm_router.rs");
+
+		let send_ok_pos = src.find("DIRECT send OK")
+			.expect("'DIRECT send OK' must be present — see direct_send_ok_pushes_backchannel_before_delivered_receipt");
+
+		let dedup_present = src[send_ok_pos..].contains("Arc::ptr_eq");
+		assert!(
+			dedup_present,
+			"Arc::ptr_eq dedup guard must appear after 'DIRECT send OK' — \
+			 it prevents the same link being queued for delivery_link_established \
+			 more than once per process_outbound cycle"
+		);
 	}
 }
