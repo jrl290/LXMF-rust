@@ -395,17 +395,27 @@ impl LXMRouter {
 			.map(|entry| entry.1)
 	}
 
-	pub fn announce(&mut self, destination_hash: &[u8], attached_interface: Option<String>) {
+	pub fn announce(&mut self, destination_hash: &[u8], attached_interface: Option<String>) -> bool {
 		let app_data = self.get_announce_app_data(destination_hash);
 		if let Some(destination) = self.delivery_destinations.get_mut(destination_hash) {
+			let dest_hex = reticulum_rust::hexrep(destination_hash, false);
 			match destination.announce(app_data.as_deref(), false, attached_interface, None, true) {
 				Ok(_) => {
+					reticulum_rust::log(&format!("[LXMF] Announce sent dest={}", dest_hex), reticulum_rust::LOG_NOTICE, false, false);
 					// Sync the destination to Transport so its ratchet keys are current
 					// (rotate_ratchets() runs during announce, generating new keys)
 					Transport::update_destination(destination.clone());
+					true
 				}
-				Err(_e) => {}
+				Err(e) => {
+					reticulum_rust::log(&format!("[LXMF] Announce FAILED dest={}: {}", dest_hex, e), reticulum_rust::LOG_ERROR, false, false);
+					false
+				}
 			}
+		} else {
+			let dest_hex = reticulum_rust::hexrep(destination_hash, false);
+			reticulum_rust::log(&format!("[LXMF] Announce: delivery destination {} not registered", dest_hex), reticulum_rust::LOG_ERROR, false, false);
+			false
 		}
 	}
 

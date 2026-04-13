@@ -198,11 +198,11 @@ pub fn router_announce(router_handle: u64, dest_hash: &[u8]) -> Result<(), Strin
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;
 
-    router
+    let ok = router
         .lock()
         .map_err(|e| e.to_string())?
         .announce(dest_hash, None);
-    Ok(())
+    if ok { Ok(()) } else { Err("announce failed or destination not registered".to_string()) }
 }
 
 /// Add a destination hash to the announce watch list.

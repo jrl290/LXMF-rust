@@ -267,7 +267,7 @@ fn main() -> Result<(), String> {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
         let dest = router_guard.register_delivery_identity(source_identity, Some("Python Sender".to_string()), None)?;
         eprintln!("[step] announce sender destination");
-        router_guard.announce(&dest.hash, None);
+        let _ = router_guard.announce(&dest.hash, None);
         dest
     };
     eprintln!(

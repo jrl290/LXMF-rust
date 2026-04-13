@@ -222,7 +222,7 @@ fn main() -> Result<(), String> {
     {
         let mut router_guard = router.lock().map_err(|_| "Router lock poisoned")?;
         eprintln!("[step] announce receiver destination");
-        router_guard.announce(&dest_hash, None);
+        let _ = router_guard.announce(&dest_hash, None);
     }
     eprintln!("[step] receiver ready on: {}", to_hex(&dest_hash));
     eprintln!(
@@ -326,7 +326,7 @@ fn main() -> Result<(), String> {
 
         if last_announce.elapsed() >= Duration::from_secs(announce_interval) {
             if let Ok(mut router_guard) = router.lock() {
-                router_guard.announce(&dest_hash, None);
+                let _ = router_guard.announce(&dest_hash, None);
                 eprintln!("[announce] re-announced (interval={}s)", announce_interval);
             }
             last_announce = Instant::now();
