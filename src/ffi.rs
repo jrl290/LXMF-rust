@@ -466,30 +466,6 @@ pub fn router_cancel_propagation(router_handle: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Mark a peer as "active" so the router maintains a proactive direct link.
-pub fn router_set_active_peer(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
-    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
-        .ok_or_else(|| "invalid router handle".to_string())?;
-
-    router
-        .lock()
-        .map_err(|e| e.to_string())?
-        .set_active_peer(dest_hash.to_vec());
-    Ok(())
-}
-
-/// Stop maintaining a proactive link for a peer.
-pub fn router_clear_active_peer(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
-    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
-        .ok_or_else(|| "invalid router handle".to_string())?;
-
-    router
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clear_active_peer(dest_hash);
-    Ok(())
-}
-
 /// Return the direct-link status for a peer: 0=none, 1=pending, 2=active.
 pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8, String> {
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
@@ -498,4 +474,197 @@ pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u
     let guard = router.lock().map_err(|e| e.to_string())?;
     let status = guard.peer_link_status(dest_hash);
     Ok(status)
+}
+
+/// Register a callback that fires when an outbound message changes delivery state.
+///
+/// The callback receives the 16-byte message hash and the new state byte:
+///   0x02 = SENDING, 0x04 = SENT (propagated), 0x08 = DELIVERED,
+///   0xFD = REJECTED, 0xFE = CANCELLED, 0xFF = FAILED.
+pub fn router_set_message_state_callback(
+    router_handle: u64,
+    callback: Arc<dyn Fn(&[u8], u8) + Send + Sync>,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .register_message_state_callback(callback);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lx_message::LXMessage;
+    use reticulum_rust::destination::{Destination, DestinationType};
+    use reticulum_rust::ffi::store_handle;
+    use reticulum_rust::identity::Identity;
+
+    /// Build a minimal outbound LXMessage handle, no network required.
+    fn make_msg_handle() -> u64 {
+        let src_identity = Identity::new(true);
+        let dst_identity = Identity::new(true);
+
+        let source = Destination::new_inbound(
+            Some(src_identity),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .expect("source dest");
+
+        let dest = Destination::new_outbound(
+            Some(dst_identity),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .expect("dest dest");
+
+        let dest_hash = dest.hash.clone();
+        let src_hash = source.hash.clone();
+
+        let msg = LXMessage::new(
+            Some(dest),
+            Some(source),
+            Some(b"hello world".to_vec()),
+            Some(b"test".to_vec()),
+            None,
+            Some(LXMessage::PROPAGATED),
+            Some(dest_hash),
+            Some(src_hash),
+            None,
+            false,
+        )
+        .expect("LXMessage::new");
+
+        store_handle(Arc::new(Mutex::new(msg)))
+    }
+
+    /// REGRESSION GUARD: message_get_hash returns Err before pack().
+    ///
+    /// The hash is only computed during pack(), which runs synchronously inside
+    /// handle_outbound() (i.e. sendMessage() in the FFI).  Calling
+    /// message_get_hash before sendMessage returns `Err("message has no hash yet")`.
+    ///
+    /// In Swift / iOS this means messageHash(msgHandle) returns nil and the guard
+    /// exits, silently swallowing the send with no UI bubble.  The fix is to call
+    /// sendMessage() first, then read the hash.
+    ///
+    /// If this test is broken (hash becomes available before pack), the ordering
+    /// constraint no longer matters — update the Swift call sites accordingly.
+    #[test]
+    fn message_get_hash_before_pack_is_err() {
+        let handle = make_msg_handle();
+
+        let result = message_get_hash(handle);
+        assert!(
+            result.is_err(),
+            "message_get_hash must return Err before pack() runs — \
+             Swift callers must call sendMessage() first, then read the hash. \
+             Got: {:?}",
+            result
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "message has no hash yet",
+            "error string must be 'message has no hash yet'"
+        );
+
+        destroy_handle(handle);
+    }
+
+    /// REGRESSION GUARD: message_get_hash returns Ok after pack().
+    ///
+    /// pack() is called synchronously from handle_outbound() / sendMessage().
+    /// After sendMessage() returns the hash is guaranteed to be set.
+    /// If this test fails, pack() has stopped writing the hash field.
+    #[test]
+    fn message_get_hash_after_pack_is_ok() {
+        let handle = make_msg_handle();
+
+        // Simulate what handle_outbound() does: call pack() directly.
+        {
+            let msg: Arc<Mutex<LXMessage>> = get_handle(handle).unwrap();
+            msg.lock().unwrap().pack(false).expect("pack");
+        }
+
+        let result = message_get_hash(handle);
+        assert!(
+            result.is_ok(),
+            "message_get_hash must return Ok after pack() — got: {:?}",
+            result
+        );
+        assert!(
+            !result.unwrap().is_empty(),
+            "hash returned by message_get_hash must be non-empty"
+        );
+
+        destroy_handle(handle);
+    }
+
+    /// REGRESSION GUARD: message_get_hash matches the internal LXMessage.hash field.
+    ///
+    /// Ensures message_get_hash is reading the correct field and not truncating
+    /// or otherwise corrupting the bytes.
+    #[test]
+    fn message_get_hash_matches_internal_hash_field() {
+        let handle = make_msg_handle();
+
+        {
+            let msg: Arc<Mutex<LXMessage>> = get_handle(handle).unwrap();
+            msg.lock().unwrap().pack(false).expect("pack");
+        }
+
+        let via_fn = message_get_hash(handle).expect("hash must be available after pack");
+
+        let via_field: Vec<u8> = {
+            let msg: Arc<Mutex<LXMessage>> = get_handle(handle).unwrap();
+            let guard = msg.lock().unwrap();
+            guard.hash.clone().expect("LXMessage.hash must be Some after pack")
+        };
+
+        assert_eq!(
+            via_fn, via_field,
+            "message_get_hash must return the same bytes as LXMessage.hash"
+        );
+
+        destroy_handle(handle);
+    }
+
+    /// REGRESSION GUARD: two separate messages produce distinct hashes.
+    ///
+    /// Each LXMF message includes a unique timestamp, so hash collisions between
+    /// independently created messages are not expected.  A collision would cause
+    /// the second message to overwrite the first in the pendingOutbound dict,
+    /// losing its state-callback tracking.
+    #[test]
+    fn distinct_messages_have_distinct_hashes() {
+        let h1 = make_msg_handle();
+        let h2 = make_msg_handle();
+
+        for h in [h1, h2] {
+            let msg: Arc<Mutex<LXMessage>> = get_handle(h).unwrap();
+            msg.lock().unwrap().pack(false).expect("pack");
+        }
+
+        let hash1 = message_get_hash(h1).unwrap();
+        let hash2 = message_get_hash(h2).unwrap();
+
+        assert_ne!(
+            hash1, hash2,
+            "two independently created messages must have distinct hashes"
+        );
+
+        destroy_handle(h1);
+        destroy_handle(h2);
+    }
 }

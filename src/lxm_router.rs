@@ -155,10 +155,10 @@ pub struct LXMRouter {
 	/// Destination hashes we care about (contacts, pending targets).
 	/// Announces from destinations NOT in this set are ignored.
 	pub watched_destinations: HashSet<Vec<u8>>,
-	/// Destination hashes that should have a live link maintained proactively.
-	/// The app inserts a peer here when a chat is opened, removes on close.
-	pub maintained_peers: HashSet<Vec<u8>>,
 	pub self_handle: Option<Weak<Mutex<LXMRouter>>>,
+	/// Fires when an outbound message changes delivery state.
+	/// Args: message hash bytes, new state byte (LXMessage::DELIVERED etc.).
+	pub message_state_callback: Option<Arc<dyn Fn(&[u8], u8) + Send + Sync>>,
 }
 
 impl LXMRouter {
@@ -344,8 +344,8 @@ impl LXMRouter {
 			announce_callback: None,
 			sync_complete_callback: None,
 			watched_destinations: HashSet::new(),
-			maintained_peers: HashSet::new(),
 			self_handle: None,
+			message_state_callback: None,
 		}));
 
 		// Register announce handlers BEFORE any locking to avoid deadlock
@@ -944,6 +944,11 @@ impl LXMRouter {
 						self.save_available_tickets();
 					}
 
+					// Fire state-change callback so the app knows without polling.
+					if let Some(hash) = lxm.hash.as_ref() {
+						self.fire_message_state(hash, LXMessage::DELIVERED);
+					}
+
 					// Prepare link for backchannel communications (matches Python LXMRouter.py L2527-2540)
 					// After delivery, we identify on our outbound link and set up delivery callbacks
 					// so the remote peer can send messages BACK to us on the same link.
@@ -988,13 +993,22 @@ impl LXMRouter {
 
 					remove = true;
 				} else if lxm.method == LXMessage::PROPAGATED && lxm.state == LXMessage::SENT {
+					if let Some(hash) = lxm.hash.as_ref() {
+						self.fire_message_state(hash, LXMessage::SENT);
+					}
 					remove = true;
 				} else if lxm.state == LXMessage::CANCELLED {
+					if let Some(hash) = lxm.hash.as_ref() {
+						self.fire_message_state(hash, LXMessage::CANCELLED);
+					}
 					if let Some(callback) = lxm.failed_callback() {
 						callback(&lxm);
 					}
 					remove = true;
 				} else if lxm.state == LXMessage::REJECTED {
+					if let Some(hash) = lxm.hash.as_ref() {
+						self.fire_message_state(hash, LXMessage::REJECTED);
+					}
 					if let Some(callback) = lxm.failed_callback() {
 						callback(&lxm);
 					}
@@ -1450,10 +1464,9 @@ impl LXMRouter {
 				if let Err(e) = lxm.pack(false) {
 					log(&format!("Failed to pack message: {}", e), LOG_ERROR, false, false);
 					lxm.state = LXMessage::FAILED;
-					if let Some(callback) = lxm.failed_callback() {
-						callback(&lxm);
-					}
-					return;
+				if let Some(hash) = lxm.hash.as_ref() {
+					self.fire_message_state(hash, LXMessage::FAILED);
+				}
 				}
 			}
 
@@ -1495,6 +1508,9 @@ impl LXMRouter {
 		log(&format!("{} failed to send", message), LOG_DEBUG, false, false);
 		message.progress = 0.0;
 		message.state = LXMessage::FAILED;
+		if let Some(hash) = message.hash.as_ref() {
+			self.fire_message_state(hash, LXMessage::FAILED);
+		}
 		if let Some(callback) = message.failed_callback() {
 			callback(message);
 		}
@@ -1712,7 +1728,6 @@ impl LXMRouter {
 
 		if self.processing_count % Self::JOB_LINKS_INTERVAL == 0 {
 			self.clean_links();
-			self.maintain_peer_links();
 		}
 
 		if self.processing_count % Self::JOB_TRANSIENT_INTERVAL == 0 {
@@ -2655,32 +2670,6 @@ impl LXMRouter {
 		self.watched_destinations.remove(dest_hash);
 	}
 
-	// -----------------------------------------------------------------------
-	// Proactive link maintenance — "maintained peers"
-	// -----------------------------------------------------------------------
-
-	/// Mark a peer destination as one that should always have an active link.
-	/// Call this when a chat is opened.  The router begins establishing (or
-	/// keeping alive) a direct link on the next `jobs()` tick.
-	pub fn set_active_peer(&mut self, dest_hash: Vec<u8>) {
-		log(
-			&format!("[LINKS] set_active_peer {}", prettyhexrep(&dest_hash)),
-			LOG_NOTICE, false, false,
-		);
-		self.maintained_peers.insert(dest_hash);
-	}
-
-	/// Stop maintaining a proactive link for a peer.
-	/// Call this when a chat is closed.  The link may linger until inactivity
-	/// timeout tears it down; that is fine.
-	pub fn clear_active_peer(&mut self, dest_hash: &[u8]) {
-		log(
-			&format!("[LINKS] clear_active_peer {}", prettyhexrep(dest_hash)),
-			LOG_NOTICE, false, false,
-		);
-		self.maintained_peers.remove(dest_hash);
-	}
-
 	/// Return the current state of a direct link to a peer.
 	/// 0 = no link / closed, 1 = pending (establishing), 2 = active.
 	pub fn peer_link_status(&self, dest_hash: &[u8]) -> u8 {
@@ -2701,78 +2690,17 @@ impl LXMRouter {
 		}
 	}
 
-	/// Ensure that every peer in `maintained_peers` has an active or pending
-	/// direct link.  Called from `jobs()` on every `JOB_LINKS_INTERVAL` tick.
-	fn maintain_peer_links(&mut self) {
-		for dest_hash in self.maintained_peers.clone().iter() {
-			let status = self.peer_link_status(dest_hash);
-			if status >= 1 {
-				// Link is already active (2) or pending (1) — nothing to do.
-				continue;
-			}
+	/// Register a callback that fires whenever an outbound message changes
+	/// delivery state.  The callback receives the message hash bytes and the
+	/// new state value (one of `LXMessage::SENT`, `DELIVERED`, `FAILED`, etc.).
+	pub fn register_message_state_callback(&mut self, callback: Arc<dyn Fn(&[u8], u8) + Send + Sync>) {
+		self.message_state_callback = Some(callback);
+	}
 
-			// Status 0: no link or was closed.  Remove stale entries and try
-			// to establish a fresh link if a path exists.
-			self.direct_links.remove(dest_hash);
-			self.backchannel_links.remove(dest_hash);
-			self.backchannel_identified_links.remove(dest_hash);
-
-			if !Transport::has_path(dest_hash) {
-				log(
-					&format!("[LINKS] maintain: no path to {}, requesting", prettyhexrep(dest_hash)),
-					LOG_NOTICE, false, false,
-				);
-				Transport::request_path(dest_hash, None, None, None, None);
-				continue;
-			}
-
-			// Resolve destination from hash.
-			let destination = match Destination::from_destination_hash(dest_hash, "lxmf", &["delivery"]) {
-				Ok(d) => d,
-				Err(e) => {
-					log(
-						&format!("[LINKS] maintain: destination resolve failed for {}: {}", prettyhexrep(dest_hash), e),
-						LOG_WARNING, false, false,
-					);
-					continue;
-				}
-			};
-
-			match Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
-				Ok(link) => {
-					let link_arc = Arc::new(Mutex::new(link));
-					let router_weak = self.self_handle.clone();
-					if let Ok(mut link_guard) = link_arc.lock() {
-						link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-							log("[LINKS] maintained peer link ESTABLISHED", LOG_NOTICE, false, false);
-							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-								if let Ok(mut router) = router_arc.lock() {
-									router.process_outbound();
-								}
-							}
-						}));
-						if let Err(e) = link_guard.initiate() {
-							log(
-								&format!("[LINKS] maintain: link initiate failed for {}: {}", prettyhexrep(dest_hash), e),
-								LOG_ERROR, false, false,
-							);
-							continue;
-						}
-					}
-					reticulum_rust::link::register_runtime_link(Arc::clone(&link_arc));
-					self.direct_links.insert(dest_hash.clone(), link_arc);
-					log(
-						&format!("[LINKS] maintain: link created for {}", prettyhexrep(dest_hash)),
-						LOG_NOTICE, false, false,
-					);
-				}
-				Err(e) => {
-					log(
-						&format!("[LINKS] maintain: Link::new_outbound failed for {}: {}", prettyhexrep(dest_hash), e),
-						LOG_ERROR, false, false,
-					);
-				}
-			}
+	/// Fire the message-state callback, if one is registered.
+	fn fire_message_state(&self, hash: &[u8], state: u8) {
+		if let Some(cb) = &self.message_state_callback {
+			cb(hash, state);
 		}
 	}
 

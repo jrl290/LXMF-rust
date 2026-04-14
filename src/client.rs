@@ -160,14 +160,6 @@ impl LxmfClient {
         lxmf::router_cancel_propagation(self.router_handle)
     }
 
-    pub fn set_active_peer(&self, dest_hash: &[u8]) -> Result<(), String> {
-        lxmf::router_set_active_peer(self.router_handle, dest_hash)
-    }
-
-    pub fn clear_active_peer(&self, dest_hash: &[u8]) -> Result<(), String> {
-        lxmf::router_clear_active_peer(self.router_handle, dest_hash)
-    }
-
     pub fn peer_link_status(&self, dest_hash: &[u8]) -> Result<u8, String> {
         lxmf::router_peer_link_status(self.router_handle, dest_hash)
     }
@@ -215,6 +207,13 @@ impl LxmfClient {
         cb: Arc<dyn Fn(u32) + Send + Sync>,
     ) -> Result<(), String> {
         lxmf::router_set_sync_complete_callback(self.router_handle, cb)
+    }
+
+    pub fn set_message_state_callback(
+        &self,
+        cb: Arc<dyn Fn(&[u8], u8) + Send + Sync>,
+    ) -> Result<(), String> {
+        lxmf::router_set_message_state_callback(self.router_handle, cb)
     }
 
     // -------------------------------------------------------------------

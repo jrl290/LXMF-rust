@@ -107,6 +107,17 @@ pub type LxmfSyncCompleteCallback = extern "C" fn(
     message_count: u32,
 );
 
+/// Message-state callback: fired whenever an outbound message changes state.
+/// `msg_hash` is a pointer to the 16-byte message hash; `hash_len` is always 16.
+/// `state` is one of: 0x02=SENDING, 0x04=SENT (propagated), 0x08=DELIVERED,
+///   0xFD=REJECTED, 0xFE=CANCELLED, 0xFF=FAILED.
+pub type LxmfMessageStateCallback = extern "C" fn(
+    context: *mut std::ffi::c_void,
+    msg_hash: *const u8,
+    hash_len: u32,
+    state: u8,
+);
+
 // =========================================================================
 // Library-level
 // =========================================================================
@@ -363,6 +374,38 @@ pub extern "C" fn lxmf_client_set_sync_complete_callback(
     }
 }
 
+/// Set the message-state callback.  Fires when an outbound message changes
+/// delivery state (SENDING, SENT, DELIVERED, REJECTED, CANCELLED, FAILED).
+/// Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn lxmf_client_set_message_state_callback(
+    client: u64,
+    callback: LxmfMessageStateCallback,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return -1;
+        }
+    };
+    let guard = arc.lock().unwrap();
+
+    let ctx = SendPtr(context);
+    let adapter = Arc::new(move |hash: &[u8], state: u8| {
+        callback(ctx.ptr(), hash.as_ptr(), hash.len() as u32, state);
+    });
+
+    match guard.set_message_state_callback(adapter) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
 // =========================================================================
 // Client queries
 // =========================================================================
@@ -525,58 +568,6 @@ pub extern "C" fn lxmf_client_watch(
             unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
         };
         match c.watch_destination(hash) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_error(e);
-                -1
-            }
-        }
-    })
-}
-
-/// Mark a peer as "active" so the router proactively maintains a direct link.
-/// Call when a chat conversation is opened.
-/// Returns 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn lxmf_set_active_peer(
-    client: u64,
-    dest_hash: *const u8,
-    dest_len: u32,
-) -> i32 {
-    with_client!(client, c, {
-        let hash = if dest_hash.is_null() || dest_len == 0 {
-            set_error("null dest hash");
-            return -1;
-        } else {
-            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
-        };
-        match c.set_active_peer(hash) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_error(e);
-                -1
-            }
-        }
-    })
-}
-
-/// Remove a peer from the proactive link pool.
-/// Call when a chat conversation is closed.
-/// Returns 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn lxmf_clear_active_peer(
-    client: u64,
-    dest_hash: *const u8,
-    dest_len: u32,
-) -> i32 {
-    with_client!(client, c, {
-        let hash = if dest_hash.is_null() || dest_len == 0 {
-            set_error("null dest hash");
-            return -1;
-        } else {
-            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
-        };
-        match c.clear_active_peer(hash) {
             Ok(()) => 0,
             Err(e) => {
                 set_error(e);
