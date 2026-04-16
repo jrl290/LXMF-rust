@@ -155,6 +155,10 @@ pub struct LXMRouter {
 	/// Destination hashes we care about (contacts, pending targets).
 	/// Announces from destinations NOT in this set are ignored.
 	pub watched_destinations: HashSet<Vec<u8>>,
+	/// Destinations the app has opened for pre-connection (chat screen visible).
+	/// Links for these destinations are established proactively and exempt from
+	/// inactivity cleanup.  No automatic re-establishment on failure.
+	pub app_links: HashSet<Vec<u8>>,
 	pub self_handle: Option<Weak<Mutex<LXMRouter>>>,
 	/// Fires when an outbound message changes delivery state.
 	/// Args: message hash bytes, new state byte (LXMessage::DELIVERED etc.).
@@ -350,6 +354,7 @@ impl LXMRouter {
 			announce_callback: None,
 			sync_complete_callback: None,
 			watched_destinations: HashSet::new(),
+			app_links: HashSet::new(),
 			self_handle: None,
 			message_state_callback: None,
 			outbound_wake_tx,
@@ -1831,6 +1836,11 @@ impl LXMRouter {
 	fn clean_links(&mut self) {
 		let mut closed_links = Vec::new();
 		for (link_hash, link_arc) in self.direct_links.iter() {
+			// Skip inactivity cleanup for app_links — their lifetime is
+			// managed explicitly by app_link_open / app_link_close.
+			if self.app_links.contains(link_hash.as_slice()) {
+				continue;
+			}
 			if let Ok(link) = link_arc.lock() {
 				if link.no_data_for() as f64 > Self::LINK_MAX_INACTIVITY {
 					closed_links.push(link_hash.clone());
@@ -2689,6 +2699,179 @@ impl LXMRouter {
 				} else {
 					0
 				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------
+	// App links — proactive link establishment for open chat screens
+	// -------------------------------------------------------------------
+
+	/// Status constants for [`app_link_status`].
+	pub const APP_LINK_NONE: u8 = 0x00;
+	pub const APP_LINK_PATH_REQUESTED: u8 = 0x01;
+	pub const APP_LINK_ESTABLISHING: u8 = 0x02;
+	pub const APP_LINK_ACTIVE: u8 = 0x03;
+	pub const APP_LINK_DISCONNECTED: u8 = 0x04;
+
+	/// Open an app link for a destination.
+	///
+	/// Adds the destination to the `app_links` set, ensures it is watched at
+	/// both LXMF and transport levels, and kicks off path request / link
+	/// establishment as far as current state allows.  Returns immediately.
+	///
+	/// If a path is already known, the link is initiated inline.  If not,
+	/// a path request is sent; the announce handler will establish the link
+	/// when the path response arrives (push, no polling).
+	///
+	/// Keepalive is maintained automatically.  If the link fails, the status
+	/// becomes `APP_LINK_DISCONNECTED`; it will be re-established automatically
+	/// when the next announce arrives from the destination (push-driven via
+	/// `watched_destinations`).
+	pub fn app_link_open(&mut self, dest_hash: &[u8]) {
+		self.app_links.insert(dest_hash.to_vec());
+		self.watched_destinations.insert(dest_hash.to_vec());
+		Transport::watch_announce(dest_hash.to_vec());
+
+		// If we already have an active link, nothing to do.
+		if self.peer_link_status(dest_hash) == 2 {
+			return;
+		}
+
+		// If we have a pending link, let it finish.
+		if self.peer_link_status(dest_hash) == 1 {
+			return;
+		}
+
+		// Clean any stale/closed link entry before trying fresh.
+		self.direct_links.remove(dest_hash);
+		self.backchannel_identified_links.remove(dest_hash);
+
+		if Transport::has_path(dest_hash) {
+			self.establish_app_link(dest_hash);
+		} else {
+			log(
+				&format!("[APP_LINK] No path → requesting for {}", hexrep(dest_hash, false)),
+				LOG_NOTICE, false, false,
+			);
+			Transport::request_path(dest_hash, None, None, None, None);
+		}
+	}
+
+	/// Close an app link.
+	///
+	/// Removes the destination from `app_links`, tears down the associated
+	/// direct link (if any), and removes it from `direct_links`.  Does NOT
+	/// remove from `watched_destinations` — the caller controls that separately.
+	pub fn app_link_close(&mut self, dest_hash: &[u8]) {
+		self.app_links.remove(dest_hash);
+		if let Some(link_arc) = self.direct_links.remove(dest_hash) {
+			if let Ok(mut link) = link_arc.lock() {
+				link.teardown();
+				self.validated_peer_links.remove(&link.link_id);
+			}
+		}
+		self.backchannel_identified_links.remove(dest_hash);
+	}
+
+	/// Query the current state of an app link.
+	///
+	/// This is a snapshot — no polling is involved.  Status reflects the
+	/// combination of app_links membership, path availability, and link state.
+	///
+	/// Returns one of the `APP_LINK_*` constants:
+	///   0 = not in app_links (or unknown),
+	///   1 = path requested (no path yet),
+	///   2 = link establishing (PENDING/HANDSHAKE),
+	///   3 = link active (ready to send),
+	///   4 = disconnected (will reconnect on next announce).
+	pub fn app_link_status(&self, dest_hash: &[u8]) -> u8 {
+		if !self.app_links.contains(dest_hash) {
+			return Self::APP_LINK_NONE;
+		}
+
+		let link = self.direct_links.get(dest_hash)
+			.or_else(|| self.backchannel_links.get(dest_hash));
+
+		match link {
+			Some(arc) => {
+				let status = arc.lock()
+					.map(|l| l.status)
+					.unwrap_or(reticulum_rust::link::STATE_CLOSED);
+				match status {
+					reticulum_rust::link::STATE_ACTIVE => Self::APP_LINK_ACTIVE,
+					reticulum_rust::link::STATE_PENDING
+					| reticulum_rust::link::STATE_HANDSHAKE => Self::APP_LINK_ESTABLISHING,
+					_ => Self::APP_LINK_DISCONNECTED,
+				}
+			}
+			None => {
+				if Transport::has_path(dest_hash) {
+					// Path exists but no link — link was lost and will be
+					// re-established on the next announce.
+					Self::APP_LINK_DISCONNECTED
+				} else {
+					Self::APP_LINK_PATH_REQUESTED
+				}
+			}
+		}
+	}
+
+	/// Create and initiate a link for an app_links destination.
+	///
+	/// Assumes path exists.  The link-established callback wakes the outbound
+	/// processing thread so any queued messages are sent immediately.
+	pub fn establish_app_link(&mut self, dest_hash: &[u8]) {
+		// Check if an existing link is still alive — if so, leave it alone.
+		if let Some(existing) = self.direct_links.get(dest_hash) {
+			let status = existing.lock()
+				.map(|l| l.status)
+				.unwrap_or(reticulum_rust::link::STATE_CLOSED);
+			if status == reticulum_rust::link::STATE_ACTIVE
+				|| status == reticulum_rust::link::STATE_PENDING
+			{
+				return;
+			}
+		}
+		// Clean dead link entry before creating a new one.
+		if let Some(old) = self.direct_links.remove(dest_hash) {
+			if let Ok(mut link) = old.lock() {
+				link.teardown();
+				self.validated_peer_links.remove(&link.link_id);
+			}
+		}
+		self.backchannel_identified_links.remove(dest_hash);
+
+		log(
+			&format!("[APP_LINK] Establishing link to {}", hexrep(dest_hash, false)),
+			LOG_NOTICE, false, false,
+		);
+		let destination = match Destination::from_destination_hash(dest_hash, "lxmf", &["delivery"]) {
+			Ok(d) => d,
+			Err(e) => {
+				log(&format!("[APP_LINK] Destination resolve failed: {}", e), LOG_ERROR, false, false);
+				return;
+			}
+		};
+		match Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
+			Ok(link) => {
+				let link_arc = Arc::new(Mutex::new(link));
+				let wake_tx = self.outbound_wake_tx.clone();
+				if let Ok(mut link_guard) = link_arc.lock() {
+					link_guard.callbacks.link_established = Some(Arc::new(move |_| {
+						log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
+						let _ = wake_tx.send(());
+					}));
+					if let Err(e) = link_guard.initiate() {
+						log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
+						return;
+					}
+				}
+				register_runtime_link(Arc::clone(&link_arc));
+				self.direct_links.insert(dest_hash.to_vec(), link_arc);
+			}
+			Err(e) => {
+				log(&format!("[APP_LINK] Link::new_outbound failed: {}", e), LOG_ERROR, false, false);
 			}
 		}
 	}

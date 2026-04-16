@@ -165,6 +165,22 @@ impl LxmfClient {
     }
 
     // -------------------------------------------------------------------
+    // App links
+    // -------------------------------------------------------------------
+
+    pub fn app_link_open(&self, dest_hash: &[u8]) -> Result<(), String> {
+        lxmf::router_app_link_open(self.router_handle, dest_hash)
+    }
+
+    pub fn app_link_close(&self, dest_hash: &[u8]) -> Result<(), String> {
+        lxmf::router_app_link_close(self.router_handle, dest_hash)
+    }
+
+    pub fn app_link_status(&self, dest_hash: &[u8]) -> Result<u8, String> {
+        lxmf::router_app_link_status(self.router_handle, dest_hash)
+    }
+
+    // -------------------------------------------------------------------
     // Announce
     // -------------------------------------------------------------------
 

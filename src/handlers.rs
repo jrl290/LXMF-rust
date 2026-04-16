@@ -63,6 +63,14 @@ pub fn delivery_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHandl
 			if should_trigger {
 				router.process_outbound();
 			}
+
+			// App links: if this destination is in app_links and no active
+			// link exists, establish one now that the path is available.
+			if router.app_links.contains(destination_hash)
+				&& router.peer_link_status(destination_hash) == 0
+			{
+				router.establish_app_link(destination_hash);
+			}
 		}
 	});
 

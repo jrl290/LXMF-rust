@@ -603,6 +603,95 @@ pub extern "C" fn lxmf_peer_link_status(
     })
 }
 
+// =========================================================================
+// App links — proactive link establishment for open chat screens
+// =========================================================================
+
+/// Open an app link for a destination (e.g. when the user opens a chat screen).
+///
+/// Watches the destination, requests a path if needed, and establishes a
+/// direct link when the path becomes available — all push-driven, no polling.
+/// The link is kept alive automatically and exempt from inactivity cleanup.
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_open(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.app_link_open(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Close an app link (e.g. when the user leaves the chat screen).
+///
+/// Tears down the direct link and removes the destination from app_links.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_close(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.app_link_close(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Query the status of an app link.
+///
+/// Returns: 0 = not tracked, 1 = path requested, 2 = link establishing,
+///          3 = link active, 4 = disconnected (reconnects on next announce).
+/// Returns -1 on parameter error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_status(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.app_link_status(hash) {
+            Ok(s) => s as i32,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
 /// Look up the cached display name for a destination hash.
 ///
 /// Reads the announce app-data stored in the Reticulum Identity table when

@@ -488,6 +488,50 @@ pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u
     Ok(status)
 }
 
+// ---------------------------------------------------------------------------
+// App links — proactive link establishment
+// ---------------------------------------------------------------------------
+
+/// Open an app link: watch + request path + establish link when available.
+///
+/// Returns immediately.  The link is established asynchronously via the
+/// announce handler (push, no polling).
+pub fn router_app_link_open(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_open(dest_hash);
+    Ok(())
+}
+
+/// Close an app link: tear down the direct link and remove from app_links.
+pub fn router_app_link_close(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_close(dest_hash);
+    Ok(())
+}
+
+/// Query the current app-link status.
+///
+/// Returns: 0 = not tracked, 1 = path requested, 2 = link establishing,
+///          3 = link active, 4 = disconnected (reconnects on next announce).
+/// Returns `Err` on parameter error.
+pub fn router_app_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let guard = router.lock().map_err(|e| e.to_string())?;
+    Ok(guard.app_link_status(dest_hash))
+}
+
 /// Register a callback that fires when an outbound message changes delivery state.
 ///
 /// The callback receives the 16-byte message hash and the new state byte:
