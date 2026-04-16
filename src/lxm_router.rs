@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -159,6 +159,10 @@ pub struct LXMRouter {
 	/// Fires when an outbound message changes delivery state.
 	/// Args: message hash bytes, new state byte (LXMessage::DELIVERED etc.).
 	pub message_state_callback: Option<Arc<dyn Fn(&[u8], u8) + Send + Sync>>,
+	/// Channel to wake the job thread for immediate process_outbound.
+	/// Link-established callbacks send on this instead of calling
+	/// process_outbound inline, which would block the TCP read thread.
+	pub outbound_wake_tx: mpsc::Sender<()>,
 }
 
 impl LXMRouter {
@@ -265,6 +269,8 @@ impl LXMRouter {
 			vec!["propagation".to_string()],
 		)?;
 
+		let (outbound_wake_tx, outbound_wake_rx) = mpsc::channel::<()>();
+
 		let router = Arc::new(Mutex::new(LXMRouter {
 			pending_inbound: Vec::new(),
 			pending_outbound: Vec::new(),
@@ -346,6 +352,7 @@ impl LXMRouter {
 			watched_destinations: HashSet::new(),
 			self_handle: None,
 			message_state_callback: None,
+			outbound_wake_tx,
 		}));
 
 		// Register announce handlers BEFORE any locking to avoid deadlock
@@ -367,7 +374,11 @@ impl LXMRouter {
 				if let Ok(mut router) = router.lock() {
 					router.jobs();
 				}
-				thread::sleep(Duration::from_secs(Self::PROCESSING_INTERVAL));
+				// Wait for the processing interval, but wake early if a
+				// link_established callback signals that outbound work is ready.
+				// This keeps the TCP read thread free — callbacks just send on
+				// the channel instead of calling process_outbound inline.
+				let _ = outbound_wake_rx.recv_timeout(Duration::from_secs(Self::PROCESSING_INTERVAL));
 			}
 		});
 
@@ -1193,15 +1204,11 @@ impl LXMRouter {
 											match Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
 												Ok(link) => {
 													let link_arc = Arc::new(Mutex::new(link));
-													let router_weak = self.self_handle.clone();
+													let wake_tx = self.outbound_wake_tx.clone();
 													if let Ok(mut link_guard) = link_arc.lock() {
 														link_guard.callbacks.link_established = Some(Arc::new(move |_| {
 															log("[POB] Direct delivery link ESTABLISHED", LOG_NOTICE, false, false);
-															if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-																if let Ok(mut router) = router_arc.lock() {
-																	router.process_outbound();
-																}
-															}
+															let _ = wake_tx.send(());
 														}));
 														if let Err(e) = link_guard.initiate() {
 															log(&format!("[POB][{}] DIRECT link initiate failed: {}", message_label, e), LOG_ERROR, false, false);
@@ -1315,16 +1322,12 @@ impl LXMRouter {
 												) {
 													if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
 														let link_arc = Arc::new(Mutex::new(link));
-														let router_weak_established = self.self_handle.clone();
+														let wake_tx = self.outbound_wake_tx.clone();
 														let router_weak_packet = self.self_handle.clone();
 														let message_id = lxm.message_id.clone();
 														if let Ok(mut link_guard) = link_arc.lock() {
 															link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-																if let Some(router_arc) = router_weak_established.as_ref().and_then(|w| w.upgrade()) {
-																	if let Ok(mut router) = router_arc.lock() {
-																		router.process_outbound();
-																	}
-																}
+																let _ = wake_tx.send(());
 															}));
 															link_guard.callbacks.packet = Some(Arc::new(move |data, _packet| {
 																if let Some(router_arc) = router_weak_packet.as_ref().and_then(|w| w.upgrade()) {
