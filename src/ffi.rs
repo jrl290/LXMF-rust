@@ -241,6 +241,18 @@ pub fn router_process_outbound(router_handle: u64) -> Result<(), String> {
 
 /// Destroy a router handle.
 pub fn router_destroy(router_handle: u64) -> Result<(), String> {
+    // Clear all callbacks first so that Transport background threads that are
+    // already in-flight (or will fire from network packets arriving after
+    // shutdown) cannot call into a stale context pointer after the test
+    // (or caller) has released the ctx memory.
+    if let Some(router) = get_handle::<Arc<Mutex<LXMRouter>>>(router_handle) {
+        if let Ok(mut r) = router.lock() {
+            r.announce_callback = None;
+            r.delivery_callback = None;
+            r.sync_complete_callback = None;
+            r.message_state_callback = None;
+        }
+    }
     if destroy_handle(router_handle) {
         Ok(())
     } else {
