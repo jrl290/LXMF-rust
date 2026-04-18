@@ -154,39 +154,42 @@ pub fn pn_announce_data_is_valid(data: &[u8]) -> bool {
 		return false;
 	}
 
+	// items[1]: node timebase — must be an integer timestamp
 	if value_to_i64(items.get(1).unwrap_or(&Value::Nil)).is_none() {
 		return false;
 	}
 
+	// items[2]: propagation node state flag — must be boolean
 	match items.get(2) {
 		Some(Value::Boolean(_)) => {}
 		_ => return false,
 	}
 
-	if value_to_i64(items.get(3).unwrap_or(&Value::Nil)).is_none() {
-		return false;
+	// items[3] and items[4]: per-transfer and per-sync limits.
+	// Python LXMF sends these as float, int, or None depending on configuration.
+	// We accept any numeric type or nil — we only need to confirm presence.
+	match items.get(3) {
+		Some(Value::Integer(_)) | Some(Value::F32(_)) | Some(Value::F64(_)) | Some(Value::Nil) | None => {}
+		_ => return false,
+	}
+	match items.get(4) {
+		Some(Value::Integer(_)) | Some(Value::F32(_)) | Some(Value::F64(_)) | Some(Value::Nil) | None => {}
+		_ => return false,
 	}
 
-	if value_to_i64(items.get(4).unwrap_or(&Value::Nil)).is_none() {
-		return false;
-	}
-
+	// items[5]: stamp cost array. Only items[0] (the required stamp cost) needs to
+	// be a valid integer. items[1] (flexibility) and items[2] (peering cost) may
+	// be nil when the prop node hasn't configured them.
 	let stamp_costs = match items.get(5) {
 		Some(Value::Array(values)) => values,
 		_ => return false,
 	};
 
-	if stamp_costs.len() < 3 {
+	if stamp_costs.is_empty() {
 		return false;
 	}
 
 	if value_to_i64(&stamp_costs[0]).is_none() {
-		return false;
-	}
-	if value_to_i64(&stamp_costs[1]).is_none() {
-		return false;
-	}
-	if value_to_i64(&stamp_costs[2]).is_none() {
 		return false;
 	}
 

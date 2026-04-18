@@ -969,7 +969,7 @@ impl LXMRouter {
 					if lxm.method == LXMessage::DIRECT {
 						let dest_hash = lxm.destination_hash.clone();
 						if let Some(direct_link) = self.direct_links.get(&dest_hash).cloned() {
-							let is_initiator = direct_link.snapshot().map(|s| s.initiator).unwrap_or(false);
+							let is_initiator = direct_link.initiator;
 							if is_initiator {
 								// Step 1: Identify if not already done
 								if !self.backchannel_identified_links.contains_key(&dest_hash) {
@@ -3084,7 +3084,7 @@ impl LXMRouter {
 	/// Callback when delivery link is established
 	pub fn delivery_link_established(&mut self, link: LinkHandle) {
 		let link_id_hex = hexrep(&link.link_id(), false);
-		let is_initiator = link.snapshot().map(|s| s.initiator).unwrap_or(false);
+		let is_initiator = link.initiator;
 		log(&format!("delivery_link_established: link={} initiator={}", link_id_hex, is_initiator), LOG_NOTICE, false, false);
 		link.set_track_phy_stats(true);
 
@@ -3586,11 +3586,8 @@ impl LXMRouter {
 				self.propagation_transfer_state = Self::PR_LINK_ESTABLISHED;
 
 				// Identify ourselves on the link before requesting messages
-				if let Ok(snap) = link_arc.snapshot() {
-					log(&format!("[PSYNC] identify: attached_interface={:?} link_id={}",
-						snap.attached_interface,
-						reticulum_rust::hexrep(&snap.link_id, false)), LOG_NOTICE, false, false);
-				}
+				log(&format!("[PSYNC] identify: link_id={}",
+					reticulum_rust::hexrep(&link_arc.link_id(), false)), LOG_NOTICE, false, false);
 				match link_arc.identify(&identity) {
 					Ok(_) => log("[PSYNC] identify sent OK", LOG_NOTICE, false, false),
 					Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
