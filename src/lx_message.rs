@@ -9,7 +9,7 @@ use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::{self, Identity, SIGLENGTH, TRUNCATED_HASHLENGTH};
-use reticulum_rust::link::Link;
+use reticulum_rust::link::{Link, LinkHandle};
 use reticulum_rust::packet::{self, Packet};
 use reticulum_rust::resource::{Resource, ResourceData, ResourceStatus};
 use reticulum_rust::transport::Transport;
@@ -72,7 +72,7 @@ pub struct LXMessage {
 	destination: Option<Destination>,
 	source: Option<Destination>,
 	delivery_destination: Option<Destination>,
-	delivery_link: Option<Arc<Mutex<Link>>>,
+	delivery_link: Option<LinkHandle>,
 	delivery_callback: Option<Arc<dyn Fn(&LXMessage) + Send + Sync>>,
 	failed_callback: Option<Arc<dyn Fn(&LXMessage) + Send + Sync>>,
 	pn_encrypted_data: Option<Vec<u8>>,
@@ -423,7 +423,7 @@ impl LXMessage {
 		self.delivery_destination = Some(destination);
 	}
 
-	pub fn set_delivery_link(&mut self, link: Arc<Mutex<Link>>) {
+	pub fn set_delivery_link(&mut self, link: LinkHandle) {
 		self.delivery_link = Some(link);
 	}
 
@@ -787,9 +787,7 @@ impl LXMessage {
 						let mut packet = self.as_packet()?;
 						let receipt = packet.send()?;
 						if let Some(link) = self.delivery_link.as_ref() {
-							if let Ok(link_guard) = link.lock() {
-								self.ratchet_id = Some(link_guard.link_id.clone());
-							}
+							self.ratchet_id = Some(link.link_id());
 						}
 						if let Some(mut receipt) = receipt {
 							if let Some(handle) = handle.clone() {
@@ -809,17 +807,13 @@ impl LXMessage {
 							self.progress = 0.50;
 						} else {
 							if let Some(link) = self.delivery_link.as_ref() {
-								if let Ok(mut link_guard) = link.lock() {
-									link_guard.teardown();
-								}
+								link.teardown();
 							}
 						}
 					}
 					Self::RESOURCE => {
 						if let Some(link) = self.delivery_link.as_ref() {
-							if let Ok(link_guard) = link.lock() {
-								self.ratchet_id = Some(link_guard.link_id.clone());
-							}
+							self.ratchet_id = Some(link.link_id());
 						}
 						self.resource_representation = Some(self.as_resource(handle)?);
 						self.progress = 0.10;
@@ -861,17 +855,13 @@ impl LXMessage {
 							self.progress = 0.50;
 						} else {
 							if let Some(link) = self.delivery_link.as_ref() {
-								if let Ok(mut link_guard) = link.lock() {
-									link_guard.teardown();
-								}
+								link.teardown();
 							}
 						}
 					}
 					Self::RESOURCE => {
 						if let Some(link) = self.delivery_link.as_ref() {
-							if let Ok(link_guard) = link.lock() {
-								self.ratchet_id = Some(link_guard.link_id.clone());
-							}
+							self.ratchet_id = Some(link.link_id());
 						}
 						self.resource_representation = Some(self.as_resource(handle)?);
 						self.progress = 0.10;
@@ -1211,7 +1201,7 @@ impl LXMessage {
 			.as_ref()
 			.ok_or("Can't synthesize resource without delivery link")?
 			.clone();
-		let is_active = link.lock().map_err(|_| "Link lock poisoned")?.is_active();
+		let is_active = link.is_active();
 		if !is_active {
 			return Err("Tried to synthesize resource for LXMF message on inactive link".to_string());
 		}
@@ -1240,7 +1230,7 @@ impl LXMessage {
 		// Arc so the watchdog & link-registered resource share the same state.
 		let resource = Resource::new_internal(
 			resource_data,
-			link,
+			link.clone(),
 			None,
 			false,
 			reticulum_rust::resource::AutoCompressOption::Enabled,
@@ -1307,9 +1297,7 @@ impl LXMessage {
 			self.state = Self::REJECTED;
 		} else if self.state != Self::CANCELLED {
 			if let Some(link) = self.delivery_link.as_ref() {
-				if let Ok(mut link_guard) = link.lock() {
-					link_guard.teardown();
-				}
+				link.teardown();
 			}
 			self.state = Self::OUTBOUND;
 		}
@@ -1320,9 +1308,7 @@ impl LXMessage {
 			self.mark_propagated();
 		} else if self.state != Self::CANCELLED {
 			if let Some(link) = self.delivery_link.as_ref() {
-				if let Ok(mut link_guard) = link.lock() {
-					link_guard.teardown();
-				}
+				link.teardown();
 			}
 			self.state = Self::OUTBOUND;
 		}
@@ -1333,12 +1319,8 @@ impl LXMessage {
 		log(&format!("link_packet_timed_out msg={} state={}", msg_hash, self.state), LOG_NOTICE, false, false);
 		if self.state != Self::CANCELLED {
 			if let Some(link) = self.delivery_link.as_ref() {
-				if let Ok(mut link) = link.lock() {
-					log(&format!("link_packet_timed_out tearing down link={}", hexrep(&link.link_id, false)), LOG_NOTICE, false, false);
-					link.teardown();
-				} else {
-					log("link_packet_timed_out: link lock poisoned", LOG_ERROR, false, false);
-				}
+				log(&format!("link_packet_timed_out tearing down link={}", hexrep(&link.link_id(), false)), LOG_NOTICE, false, false);
+				link.teardown();
 			}
 			self.state = Self::OUTBOUND;
 		}

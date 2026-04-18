@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::Link;
+use reticulum_rust::link::{Link, LinkHandle};
 use reticulum_rust::resource::{Resource, ResourceData, ResourceStatus};
 use reticulum_rust::transport::Transport;
 use reticulum_rust::{log, prettyhexrep, prettysize, prettyspeed, prettytime, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
@@ -85,7 +85,7 @@ pub struct LXMPeer {
 	pub _hm_counts_synced: bool,
 	pub _um_counts_synced: bool,
 
-	pub link: Option<Arc<Mutex<Link>>>,
+	pub link: Option<LinkHandle>,
 	pub state: u8,
 	pub last_offer: Vec<Vec<u8>>,
 	pub current_sync_transfer_started: Option<f64>,
@@ -514,7 +514,7 @@ impl LXMPeer {
 			self.next_sync_attempt = now() + self.sync_backoff;
 			if let Some(destination) = self.destination.clone() {
 				if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
-					self.link = Some(Arc::new(Mutex::new(link)));
+					self.link = Some(LinkHandle::spawn(link));
 					self.state = Self::LINK_ESTABLISHING;
 				}
 			}
@@ -656,14 +656,15 @@ impl LXMPeer {
 						}) as Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>)
 					});
 
-					if let Ok(link) = link.lock() {
-						let _ = link.request(
-							Self::OFFER_REQUEST_PATH.to_string(),
-							buf,
-							response_cb,
-							failed_cb,
-							None,
-						);
+					if let Err(e) = link.request(
+						Self::OFFER_REQUEST_PATH.to_string(),
+						buf,
+						response_cb,
+						failed_cb,
+						None,
+					) {
+						log(&format!("Peer sync request failed: {}", e), LOG_ERROR, false, false);
+					} else {
 						self.last_offer = unhandled_ids;
 						self.state = Self::REQUEST_SENT;
 					}
@@ -837,7 +838,7 @@ impl LXMPeer {
 				// watchdog & link-registered resource share the same state.
 				let resource = Resource::new_internal(
 					resource_data,
-					link,
+					link.clone(),
 					None,
 					false,
 					reticulum_rust::resource::AutoCompressOption::Enabled,
@@ -944,13 +945,13 @@ impl LXMPeer {
 		}
 	}
 
-	pub fn link_established(&mut self, _link: Arc<Mutex<Link>>) {
+	pub fn link_established(&mut self, _link: LinkHandle) {
 		self.state = Self::LINK_READY;
 		self.next_sync_attempt = 0.0;
 		self.sync();
 	}
 
-	pub fn link_closed(&mut self, _link: Arc<Mutex<Link>>) {
+	pub fn link_closed(&mut self, _link: LinkHandle) {
 		self.link = None;
 		self.state = Self::IDLE;
 	}

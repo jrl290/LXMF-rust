@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL, ALLOW_LIST, PROVE_ALL};
 use reticulum_rust::identity::{Identity, HASHLENGTH, TRUNCATED_HASHLENGTH};
-use reticulum_rust::link::{Link, register_runtime_link};
+use reticulum_rust::link::{Link, LinkHandle, register_runtime_link_handle};
 use reticulum_rust::packet::Packet;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::resource::{Resource, ResourceStatus};
@@ -67,8 +67,8 @@ pub struct LXMRouter {
 	pub pending_inbound: Vec<Vec<u8>>,
 	pub pending_outbound: Vec<Arc<Mutex<LXMessage>>>,
 	pub failed_outbound: Vec<Arc<Mutex<LXMessage>>>,
-	pub direct_links: HashMap<Vec<u8>, Arc<Mutex<Link>>>,
-	pub backchannel_links: HashMap<Vec<u8>, Arc<Mutex<Link>>>,
+	pub direct_links: HashMap<Vec<u8>, LinkHandle>,
+	pub backchannel_links: HashMap<Vec<u8>, LinkHandle>,
 	pub backchannel_identified_links: HashMap<Vec<u8>, bool>,
 	pub delivery_destinations: HashMap<Vec<u8>, Destination>,
 	pub delivery_stamp_costs: HashMap<Vec<u8>, u32>,
@@ -93,7 +93,7 @@ pub struct LXMRouter {
 	pub messagepath: Option<String>,
 
 	pub outbound_propagation_node: Option<Vec<u8>>,
-	pub outbound_propagation_link: Option<Arc<Mutex<Link>>>,
+	pub outbound_propagation_link: Option<LinkHandle>,
 
 	pub message_storage_limit: Option<u64>,
 	pub information_storage_limit: Option<u64>,
@@ -118,7 +118,7 @@ pub struct LXMRouter {
 	pub propagation_transfer_last_duplicates: Option<usize>,
 	pub propagation_transfer_max_messages: Option<usize>,
 	pub prioritise_rotating_unreachable_peers: bool,
-	pub active_propagation_links: Vec<Arc<Mutex<Link>>>,
+	pub active_propagation_links: Vec<LinkHandle>,
 	pub validated_peer_links: HashMap<Vec<u8>, bool>,
 	pub locally_delivered_transient_ids: HashMap<Vec<u8>, f64>,
 	pub locally_processed_transient_ids: HashMap<Vec<u8>, f64>,
@@ -819,9 +819,7 @@ impl LXMRouter {
 
 	pub fn cancel_propagation_node_requests(&mut self) {
 		if let Some(link) = self.outbound_propagation_link.as_ref() {
-			if let Ok(mut link_guard) = link.lock() {
-				link_guard.teardown();
-			}
+			link.teardown();
 		}
 		self.outbound_propagation_link = None;
 		self.acknowledge_sync_completion(None);
@@ -938,7 +936,7 @@ impl LXMRouter {
 		};
 
 		let mut index = 0;
-		let mut backchannel_setup_links: Vec<(Arc<Mutex<Link>>, Vec<u8>)> = Vec::new();
+		let mut backchannel_setup_links: Vec<(LinkHandle, Vec<u8>)> = Vec::new();
 		while index < self.pending_outbound.len() {
 			let message = self.pending_outbound[index].clone();
 			let mut remove = false;
@@ -971,7 +969,7 @@ impl LXMRouter {
 					if lxm.method == LXMessage::DIRECT {
 						let dest_hash = lxm.destination_hash.clone();
 						if let Some(direct_link) = self.direct_links.get(&dest_hash).cloned() {
-							let is_initiator = direct_link.lock().map(|l| l.initiator).unwrap_or(false);
+							let is_initiator = direct_link.snapshot().map(|s| s.initiator).unwrap_or(false);
 							if is_initiator {
 								// Step 1: Identify if not already done
 								if !self.backchannel_identified_links.contains_key(&dest_hash) {
@@ -979,22 +977,20 @@ impl LXMRouter {
 									let backchannel_identity = self.delivery_destinations.get(&source_hash)
 										.and_then(|d| d.identity.clone());
 									if let Some(identity) = backchannel_identity {
-										if let Ok(mut link_guard) = direct_link.lock() {
-											match link_guard.identify(&identity) {
-												Ok(()) => {
-													self.backchannel_identified_links.insert(dest_hash.clone(), true);
-													log(&format!(
-														"Performed backchannel identification on outbound link to {}",
-														hexrep(&dest_hash, false)
-													), LOG_NOTICE, false, false);
-												},
-												Err(e) => {
-													log(&format!(
-														"Backchannel identify error: {}",
-														e
-													), LOG_NOTICE, false, false);
-												},
-											}
+										match direct_link.identify(&identity) {
+											Ok(()) => {
+												self.backchannel_identified_links.insert(dest_hash.clone(), true);
+												log(&format!(
+													"Performed backchannel identification on outbound link to {}",
+													hexrep(&dest_hash, false)
+												), LOG_NOTICE, false, false);
+											},
+											Err(e) => {
+												log(&format!(
+													"Backchannel identify error: {}",
+													e
+												), LOG_NOTICE, false, false);
+											},
 										}
 									}
 								}
@@ -1096,12 +1092,12 @@ impl LXMRouter {
 							} else if let Some(bl) = self.backchannel_links.get(&dest_hash).cloned() {
 								let dl_activated = direct_link
 									.as_ref()
-									.and_then(|d| d.lock().ok().and_then(|l| l.activated_at.map(|t| t as f64)))
+									.and_then(|d| d.snapshot().ok().and_then(|s| s.activated_at.map(|t| t as f64)))
 									.unwrap_or(0.0);
 								let bl_activated = bl
-									.lock()
+									.snapshot()
 									.ok()
-									.and_then(|l| l.activated_at.or(l.established_at).map(|t| t as f64))
+									.and_then(|s| s.activated_at.or(s.established_at).map(|t| t as f64))
 									.unwrap_or(0.0);
 								if bl_activated > dl_activated {
 									log(&format!("[POB][{}] Preferring newer backchannel link", message_label), LOG_NOTICE, false, false);
@@ -1110,20 +1106,20 @@ impl LXMRouter {
 							}
 
 							if let Some(link_arc) = direct_link {
-								let status = link_arc.lock().map(|l| l.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+								let status = link_arc.status();
 								log(&format!("[POB][{}] DIRECT has-link status={}", message_label, status), LOG_NOTICE, false, false);
-
 								if status == reticulum_rust::link::STATE_ACTIVE {
 									// Happy path: link is up — send now.
 									if lxm.progress < 0.05 { lxm.progress = 0.05; }
 									if lxm.state != LXMessage::SENDING {
 										log(&format!("[POB][{}] DIRECT ACTIVE sending", message_label), LOG_NOTICE, false, false);
-										if let Ok(mut link_guard) = link_arc.lock() {
-											if link_guard.initiator && !self.backchannel_identified_links.contains_key(&dest_hash) {
+										let snap = link_arc.snapshot().ok();
+										if let Some(ref snap) = snap {
+											if snap.initiator && !self.backchannel_identified_links.contains_key(&dest_hash) {
 												let source_identity = lxm.source().and_then(|s| s.identity.clone());
 												if let Some(identity) = source_identity {
-													log(&format!("[POB][{}] Pre-send identify on link {}", message_label, hexrep(&link_guard.link_id, false)), LOG_NOTICE, false, false);
-													if let Err(e) = link_guard.identify(&identity) {
+													log(&format!("[POB][{}] Pre-send identify on link {}", message_label, hexrep(&snap.link_id, false)), LOG_NOTICE, false, false);
+													if let Err(e) = link_arc.identify(&identity) {
 														log(&format!("[POB][{}] identify error: {}", message_label, e), LOG_NOTICE, false, false);
 													} else {
 														log(&format!("[POB][{}] Pre-send identify OK", message_label), LOG_NOTICE, false, false);
@@ -1131,20 +1127,9 @@ impl LXMRouter {
 													}
 												}
 											}
-											if let Ok(destination_guard) = link_guard.destination.lock() {
-												let mut link_destination = destination_guard.clone();
-												link_destination.dest_type = DestinationType::Link;
-												link_destination.hash = link_guard.link_id.clone();
-												link_destination.hexhash = hexrep(&link_destination.hash, false);
-												link_destination.link = Some(reticulum_rust::destination::LinkInfo {
-													rtt: link_guard.rtt,
-													traffic_timeout_factor: link_guard.traffic_timeout_factor,
-													status_closed: false,
-													mtu: Some(link_guard.mtu),
-													attached_interface: link_guard.attached_interface.clone(),
-												});
-												lxm.set_delivery_destination(link_destination);
-											}
+										}
+										if let Ok(link_destination) = link_arc.build_link_destination() {
+											lxm.set_delivery_destination(link_destination);
 										}
 										lxm.set_delivery_link(link_arc.clone());
 										if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
@@ -1156,12 +1141,7 @@ impl LXMRouter {
 											lxm.method = LXMessage::PROPAGATED;
 										} else {
 											log(&format!("[POB][{}] DIRECT send OK", message_label), LOG_NOTICE, false, false);
-											// Set up backchannel callbacks immediately after send.
-											// Matches Python LXMRouter: delivery_link_established(direct_link) is
-											// called right after lxm.send(), not after the delivery receipt.
-											// Without this, replies arrive before the receipt proof and the
-											// packet callback is not yet installed → silent drop.
-											if !backchannel_setup_links.iter().any(|(l, _)| Arc::ptr_eq(l, &link_arc)) {
+											if !backchannel_setup_links.iter().any(|(l, _)| l.same_link(&link_arc)) {
 												backchannel_setup_links.push((link_arc.clone(), dest_hash.clone()));
 											}
 										}
@@ -1208,20 +1188,18 @@ impl LXMRouter {
 											};
 											match Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
 												Ok(link) => {
-													let link_arc = Arc::new(Mutex::new(link));
+													let handle = LinkHandle::spawn(link);
 													let wake_tx = self.outbound_wake_tx.clone();
-													if let Ok(mut link_guard) = link_arc.lock() {
-														link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-															log("[POB] Direct delivery link ESTABLISHED", LOG_NOTICE, false, false);
-															let _ = wake_tx.send(());
-														}));
-														if let Err(e) = link_guard.initiate() {
-															log(&format!("[POB][{}] DIRECT link initiate failed: {}", message_label, e), LOG_ERROR, false, false);
-															continue;
-														}
+													handle.set_link_established_callback(Some(Arc::new(move |_| {
+														log("[POB] Direct delivery link ESTABLISHED", LOG_NOTICE, false, false);
+														let _ = wake_tx.send(());
+													})));
+													if let Err(e) = handle.initiate() {
+														log(&format!("[POB][{}] DIRECT link initiate failed: {}", message_label, e), LOG_ERROR, false, false);
+														continue;
 													}
-													register_runtime_link(Arc::clone(&link_arc));
-													self.direct_links.insert(dest_hash.clone(), link_arc);
+													register_runtime_link_handle(handle.clone());
+													self.direct_links.insert(dest_hash.clone(), handle);
 													lxm.progress = 0.03;
 												}
 												Err(e) => {
@@ -1250,7 +1228,7 @@ impl LXMRouter {
 								let node_hash = self.outbound_propagation_node.clone().unwrap();
 								let _has_link = self.outbound_propagation_link.is_some();
 								if let Some(link_arc) = self.outbound_propagation_link.clone() {
-									let status = link_arc.lock().map(|link| link.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+									let status = link_arc.status();
 									if status == reticulum_rust::link::STATE_ACTIVE {
 										if lxm.state != LXMessage::SENDING {
 											// PROTOCOL: Send propagation_packed over the link using link.send_packet().
@@ -1270,9 +1248,8 @@ impl LXMRouter {
 											if let Some(pdata) = propagation_packed {
 												// Using link.send_packet() directly (not Packet::new → pack → encrypt)
 												// because link.send_packet() correctly uses the link session key.
-												match link_arc.lock()
-													.map_err(|_| "link lock poisoned".to_string())
-													.and_then(|g| g.send_packet(&pdata))
+												match link_arc.send_packet(&pdata)
+													.map_err(|e| e.to_string())
 												{
 													Ok(()) => {
 														log(&format!("[POB][{}] PROPAGATED sent via link → SENT", message_label), LOG_NOTICE, false, false);
@@ -1297,13 +1274,9 @@ impl LXMRouter {
 										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									} else {
 										let pending_for = link_arc
-											.lock()
-											.map(|link| {
-												link
-													.request_time
-													.map(|requested| (now() - requested).max(0.0))
-													.unwrap_or(0.0)
-											})
+											.snapshot()
+											.ok()
+											.and_then(|s| s.request_time.map(|requested| (now() - requested).max(0.0)))
 											.unwrap_or(0.0);
 										log(
 											&format!("Propagation link to {} pending ({:.1}s elapsed)", prettyhexrep(&node_hash), pending_for),
@@ -1326,28 +1299,25 @@ impl LXMRouter {
 													vec!["propagation".to_string()],
 												) {
 													if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
-														let link_arc = Arc::new(Mutex::new(link));
+														let link_handle = LinkHandle::spawn(link);
 														let wake_tx = self.outbound_wake_tx.clone();
 														let router_weak_packet = self.self_handle.clone();
 														let message_id = lxm.message_id.clone();
-														if let Ok(mut link_guard) = link_arc.lock() {
-															link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-																let _ = wake_tx.send(());
-															}));
-															link_guard.callbacks.packet = Some(Arc::new(move |data, _packet| {
-																if let Some(router_arc) = router_weak_packet.as_ref().and_then(|w| w.upgrade()) {
-																	if let Ok(mut router) = router_arc.lock() {
-																		if let Some(message_id) = message_id.clone() {
-																			router.handle_propagation_transfer_signal(&message_id, data);
-																		}
+														link_handle.set_link_established_callback(Some(Arc::new(move |_| {
+															let _ = wake_tx.send(());
+														})));
+														link_handle.set_packet_callback(Some(Arc::new(move |data, _packet| {
+															if let Some(router_arc) = router_weak_packet.as_ref().and_then(|w| w.upgrade()) {
+																if let Ok(mut router) = router_arc.lock() {
+																	if let Some(message_id) = message_id.clone() {
+																		router.handle_propagation_transfer_signal(&message_id, data);
 																	}
 																}
-															}));
-															let _ = link_guard.initiate();
-															drop(link_guard);
-														}
-														reticulum_rust::link::register_runtime_link(Arc::clone(&link_arc));
-														self.outbound_propagation_link = Some(link_arc);
+															}
+														})));
+														let _ = link_handle.initiate();
+														reticulum_rust::link::register_runtime_link_handle(link_handle.clone());
+														self.outbound_propagation_link = Some(link_handle);
 													} else {
 														log("Could not establish propagation link", LOG_ERROR, false, false);
 													}
@@ -1841,19 +1811,15 @@ impl LXMRouter {
 			if self.app_links.contains(link_hash.as_slice()) {
 				continue;
 			}
-			if let Ok(link) = link_arc.lock() {
-				if link.no_data_for() as f64 > Self::LINK_MAX_INACTIVITY {
+			if link_arc.no_data_for().map(|n| n as f64 > Self::LINK_MAX_INACTIVITY).unwrap_or(false) {
 					closed_links.push(link_hash.clone());
 				}
-			}
 		}
 
 		for link_hash in closed_links.iter() {
 			if let Some(link_arc) = self.direct_links.get(link_hash) {
-				if let Ok(mut link) = link_arc.lock() {
-					link.teardown();
-					self.validated_peer_links.remove(&link.link_id);
-				}
+				self.validated_peer_links.remove(&link_arc.link_id());
+				link_arc.teardown();
 			}
 			self.direct_links.remove(link_hash);
 			self.backchannel_identified_links.remove(link_hash);
@@ -1862,30 +1828,18 @@ impl LXMRouter {
 
 		let mut inactive_links = Vec::new();
 		for link_arc in self.active_propagation_links.iter() {
-			if let Ok(link) = link_arc.lock() {
-				if link.no_data_for() as f64 > Self::P_LINK_MAX_INACTIVITY {
-					inactive_links.push(link_arc.clone());
-				}
+			if link_arc.no_data_for().map(|n| n as f64 > Self::P_LINK_MAX_INACTIVITY).unwrap_or(false) {
+				inactive_links.push(link_arc.clone());
 			}
 		}
 
 		for link_arc in inactive_links {
-			self.active_propagation_links.retain(|l| !Arc::ptr_eq(l, &link_arc));
-			if let Ok(mut link) = link_arc.lock() {
-				link.teardown();
-			}
+			self.active_propagation_links.retain(|l| !l.same_link(&link_arc));
+			link_arc.teardown();
 		}
 
 		let should_clear = if let Some(link_arc) = self.outbound_propagation_link.as_ref() {
-			let status = link_arc
-				.lock()
-				.map(|l| l.status)
-				.unwrap_or(255);
-			if status == reticulum_rust::link::STATE_CLOSED {
-				true
-			} else {
-				false
-			}
+			link_arc.status() == reticulum_rust::link::STATE_CLOSED
 		} else {
 			false
 		};
@@ -2486,10 +2440,7 @@ impl LXMRouter {
 		if self.outbound_propagation_node.as_ref() != Some(&destination_hash) {
 			self.outbound_propagation_node = Some(destination_hash.clone());
 			let should_teardown = if let Some(link) = self.outbound_propagation_link.as_ref() {
-				link
-					.lock()
-					.ok()
-					.and_then(|link_guard| link_guard.destination.lock().ok().map(|d| d.hash.clone()))
+				link.destination_hash()
 					.map(|hash| hash != destination_hash)
 					.unwrap_or(false)
 			} else {
@@ -2497,9 +2448,7 @@ impl LXMRouter {
 			};
 			if should_teardown {
 				if let Some(link) = self.outbound_propagation_link.as_ref() {
-					if let Ok(mut link_guard) = link.lock() {
-						link_guard.teardown();
-					}
+					link.teardown();
 				}
 				self.outbound_propagation_link = None;
 			}
@@ -2691,7 +2640,7 @@ impl LXMRouter {
 		match link_arc {
 			None => 0,
 			Some(arc) => {
-				let status = arc.lock().map(|l| l.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+				let status = arc.status();
 				if status == reticulum_rust::link::STATE_ACTIVE {
 					2
 				} else if status == reticulum_rust::link::STATE_PENDING {
@@ -2766,10 +2715,8 @@ impl LXMRouter {
 	pub fn app_link_close(&mut self, dest_hash: &[u8]) {
 		self.app_links.remove(dest_hash);
 		if let Some(link_arc) = self.direct_links.remove(dest_hash) {
-			if let Ok(mut link) = link_arc.lock() {
-				link.teardown();
-				self.validated_peer_links.remove(&link.link_id);
-			}
+			self.validated_peer_links.remove(&link_arc.link_id());
+			link_arc.teardown();
 		}
 		self.backchannel_identified_links.remove(dest_hash);
 	}
@@ -2795,9 +2742,7 @@ impl LXMRouter {
 
 		match link {
 			Some(arc) => {
-				let status = arc.lock()
-					.map(|l| l.status)
-					.unwrap_or(reticulum_rust::link::STATE_CLOSED);
+				let status = arc.status();
 				match status {
 					reticulum_rust::link::STATE_ACTIVE => Self::APP_LINK_ACTIVE,
 					reticulum_rust::link::STATE_PENDING
@@ -2824,9 +2769,7 @@ impl LXMRouter {
 	pub fn establish_app_link(&mut self, dest_hash: &[u8]) {
 		// Check if an existing link is still alive — if so, leave it alone.
 		if let Some(existing) = self.direct_links.get(dest_hash) {
-			let status = existing.lock()
-				.map(|l| l.status)
-				.unwrap_or(reticulum_rust::link::STATE_CLOSED);
+			let status = existing.status();
 			if status == reticulum_rust::link::STATE_ACTIVE
 				|| status == reticulum_rust::link::STATE_PENDING
 			{
@@ -2835,10 +2778,8 @@ impl LXMRouter {
 		}
 		// Clean dead link entry before creating a new one.
 		if let Some(old) = self.direct_links.remove(dest_hash) {
-			if let Ok(mut link) = old.lock() {
-				link.teardown();
-				self.validated_peer_links.remove(&link.link_id);
-			}
+			self.validated_peer_links.remove(&old.link_id());
+			old.teardown();
 		}
 		self.backchannel_identified_links.remove(dest_hash);
 
@@ -2855,20 +2796,18 @@ impl LXMRouter {
 		};
 		match Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
 			Ok(link) => {
-				let link_arc = Arc::new(Mutex::new(link));
+				let link_handle = LinkHandle::spawn(link);
 				let wake_tx = self.outbound_wake_tx.clone();
-				if let Ok(mut link_guard) = link_arc.lock() {
-					link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-						log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
-						let _ = wake_tx.send(());
-					}));
-					if let Err(e) = link_guard.initiate() {
-						log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
-						return;
-					}
+				link_handle.set_link_established_callback(Some(Arc::new(move |_| {
+					log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
+					let _ = wake_tx.send(());
+				})));
+				if let Err(e) = link_handle.initiate() {
+					log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
+					return;
 				}
-				register_runtime_link(Arc::clone(&link_arc));
-				self.direct_links.insert(dest_hash.to_vec(), link_arc);
+				register_runtime_link_handle(link_handle.clone());
+				self.direct_links.insert(dest_hash.to_vec(), link_handle);
 			}
 			Err(e) => {
 				log(&format!("[APP_LINK] Link::new_outbound failed: {}", e), LOG_ERROR, false, false);
@@ -3143,77 +3082,80 @@ impl LXMRouter {
 	}
 
 	/// Callback when delivery link is established
-	pub fn delivery_link_established(&mut self, link: Arc<Mutex<Link>>) {
-		if let Ok(mut link_guard) = link.lock() {
-			let link_id_hex = hexrep(&link_guard.link_id, false);
-			let is_initiator = link_guard.initiator;
-			log(&format!("delivery_link_established: link={} initiator={}", link_id_hex, is_initiator), LOG_NOTICE, false, false);
-			link_guard.track_phy_stats = true;
+	pub fn delivery_link_established(&mut self, link: LinkHandle) {
+		let link_id_hex = hexrep(&link.link_id(), false);
+		let is_initiator = link.snapshot().map(|s| s.initiator).unwrap_or(false);
+		log(&format!("delivery_link_established: link={} initiator={}", link_id_hex, is_initiator), LOG_NOTICE, false, false);
+		link.set_track_phy_stats(true);
 
-			// Set packet callback
-			let router_weak = self.self_handle.clone();
-			link_guard.callbacks.packet = Some(Arc::new(move |data, packet| {
-				if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-					if let Ok(mut router) = router_arc.lock() {
-						router.delivery_packet(data, packet);
-					}
+		// Set packet callback (via set_packet_callback so any early-arrival
+		// packets queued before this point are drained and proved).
+		let router_weak = self.self_handle.clone();
+		link.set_packet_callback(Some(Arc::new(move |data, packet| {
+			if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+				if let Ok(mut router) = router_arc.lock() {
+					router.delivery_packet(data, packet);
 				}
-			}));
+			}
+		})));
 
-			// Set resource strategy
-			link_guard.resource_strategy = reticulum_rust::link::ACCEPT_APP;
+		// Set resource strategy
+		link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
-			// Set resource callbacks
-			link_guard.callbacks.resource = Some(Arc::new({
-				let router_weak = self.self_handle.clone();
-				move |resource| {
-					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-						if let Ok(router) = router_arc.lock() {
-							if let Ok(resource_guard) = resource.lock() {
-								let allowed = router.delivery_resource_advertised(&resource_guard);
-								if !allowed {
-									if let Ok(link_guard) = resource_guard.link.lock() {
-										link_guard.cancel_incoming_resource(resource.clone());
-									}
-								}
+		// Set resource callbacks
+		let resource_cb = Arc::new({
+			let router_weak = self.self_handle.clone();
+			move |resource: Arc<Mutex<Resource>>| {
+				if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+					if let Ok(router) = router_arc.lock() {
+						if let Ok(resource_guard) = resource.lock() {
+							let allowed = router.delivery_resource_advertised(&resource_guard);
+							if !allowed {
+								resource_guard.link.cancel_incoming_resource(resource.clone());
 							}
 						}
 					}
 				}
-			}));
+			}
+		});
 
-			link_guard.callbacks.resource_started = Some(Arc::new(move |_resource| {
-				log(
-					&format!("Transfer began for LXMF delivery resource"),
-					LOG_DEBUG,
-					false,
-					false,
-				);
-			}));
+		let resource_started_cb = Arc::new(move |_resource: Arc<Mutex<Resource>>| {
+			log(
+				&format!("Transfer began for LXMF delivery resource"),
+				LOG_DEBUG,
+				false,
+				false,
+			);
+		});
 
-			let router_weak3 = self.self_handle.clone();
-			link_guard.callbacks.resource_concluded = Some(Arc::new(move |resource| {
-				log("LXMF delivery resource concluded", LOG_DEBUG, false, false);
-				if let Some(router_arc) = router_weak3.as_ref().and_then(|w| w.upgrade()) {
-					if let Ok(mut router) = router_arc.lock() {
-						router.delivery_resource_concluded(resource);
-					} else {
-						log("[LXMF] resource_concluded: FAILED to lock router", LOG_ERROR, false, false);
-					}
+		let router_weak3 = self.self_handle.clone();
+		let resource_concluded_cb = Arc::new(move |resource: Arc<Mutex<Resource>>| {
+			log("LXMF delivery resource concluded", LOG_DEBUG, false, false);
+			if let Some(router_arc) = router_weak3.as_ref().and_then(|w| w.upgrade()) {
+				if let Ok(mut router) = router_arc.lock() {
+					router.delivery_resource_concluded(resource);
 				} else {
-					log("[LXMF] resource_concluded: router Weak ref expired", LOG_ERROR, false, false);
+					log("[LXMF] resource_concluded: FAILED to lock router", LOG_ERROR, false, false);
 				}
-			}));
+			} else {
+				log("[LXMF] resource_concluded: router Weak ref expired", LOG_ERROR, false, false);
+			}
+		});
 
-			let router_weak4 = self.self_handle.clone();
-			link_guard.callbacks.remote_identified = Some(Arc::new(move |link, identity| {
-				if let Some(router_arc) = router_weak4.as_ref().and_then(|w| w.upgrade()) {
-					if let Ok(mut router) = router_arc.lock() {
-						router.delivery_remote_identified(link, identity);
-					}
+		link.set_resource_callbacks(
+			Some(resource_cb),
+			Some(resource_started_cb),
+			Some(resource_concluded_cb),
+		);
+
+		let router_weak4 = self.self_handle.clone();
+		link.set_remote_identified_callback(Some(Arc::new(move |link, identity| {
+			if let Some(router_arc) = router_weak4.as_ref().and_then(|w| w.upgrade()) {
+				if let Ok(mut router) = router_arc.lock() {
+					router.delivery_remote_identified(link, identity);
 				}
-			}));
-		}
+			}
+		})));
 	}
 
 	/// Check if an advertised resource should be accepted
@@ -3255,18 +3197,9 @@ impl LXMRouter {
 				};
 
 				let link_arc = res.link.clone();
-				let ratchet_id = if let Ok(l) = link_arc.lock() {
-					Some(l.link_id.clone())
-				} else {
-					None
-				};
+			let ratchet_id = Some(link_arc.link_id());
 
-				let phy_stats = if let Ok(l) = link_arc.lock() {
-					Some((l.rssi.map(|r| r as f64), l.snr, l.q))
-				} else {
-					None
-				};
-
+			let phy_stats = link_arc.snapshot().ok().map(|s| (s.rssi.map(|r| r as f64), s.snr, s.q));
 				self.lxmf_delivery(
 					&data,
 					Some(DestinationType::Link),
@@ -3281,7 +3214,7 @@ impl LXMRouter {
 	}
 
 	/// Handle remote identity identified on delivery link
-	pub fn delivery_remote_identified(&mut self, link: Arc<Mutex<Link>>, identity: Identity) {
+	pub fn delivery_remote_identified(&mut self, link: LinkHandle, identity: Identity) {
 		let destination_hash = Destination::hash_from_name_and_identity(
 			&format!("{}.delivery", APP_NAME),
 			Some(&identity),
@@ -3301,9 +3234,7 @@ impl LXMRouter {
 				false,
 				false,
 			);
-			if let Ok(mut old_guard) = old_link.lock() {
-				old_guard.teardown();
-			}
+			old_link.teardown();
 			self.backchannel_identified_links.remove(&destination_hash);
 		}
 
@@ -3385,56 +3316,58 @@ impl LXMRouter {
 	}
 
 	/// Callback when propagation link is established
-	pub fn propagation_link_established(&mut self, link: Arc<Mutex<Link>>) {
+	pub fn propagation_link_established(&mut self, link: LinkHandle) {
 		self.active_propagation_links.push(link.clone());
 		if let Some(link) = self.active_propagation_links.last() {
-			if let Ok(mut link_guard) = link.lock() {
-				link_guard.callbacks.packet = Some(Arc::new({
-					let router_weak = self.self_handle.clone();
-					move |data, packet| {
-						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-							if let Ok(mut router) = router_arc.lock() {
-								router.propagation_packet(data, packet);
-							}
+			link.set_packet_callback(Some(Arc::new({
+				let router_weak = self.self_handle.clone();
+				move |data, packet| {
+					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+						if let Ok(mut router) = router_arc.lock() {
+							router.propagation_packet(data, packet);
 						}
 					}
-				}));
+				}
+			})));
 
-				link_guard.resource_strategy = reticulum_rust::link::ACCEPT_APP;
+			link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
-				link_guard.callbacks.resource = Some(Arc::new({
-					let router_weak = self.self_handle.clone();
-					move |resource| {
-						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-							if let Ok(router) = router_arc.lock() {
-								let allowed = router.propagation_resource_advertised(resource.clone());
-								if !allowed {
-									if let Ok(resource_guard) = resource.lock() {
-										if let Ok(link_guard) = resource_guard.link.lock() {
-											link_guard.cancel_incoming_resource(resource.clone());
-										}
-									}
+			let resource_cb = Arc::new({
+				let router_weak = self.self_handle.clone();
+				move |resource: Arc<Mutex<Resource>>| {
+					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+						if let Ok(router) = router_arc.lock() {
+							let allowed = router.propagation_resource_advertised(resource.clone());
+							if !allowed {
+								if let Ok(resource_guard) = resource.lock() {
+									resource_guard.link.cancel_incoming_resource(resource.clone());
 								}
 							}
 						}
 					}
-				}));
+				}
+			});
 
-				link_guard.callbacks.resource_started = Some(Arc::new(|_resource| {
-					log("Propagation resource transfer started", LOG_DEBUG, false, false);
-				}));
+			let resource_started_cb = Arc::new(|_resource: Arc<Mutex<Resource>>| {
+				log("Propagation resource transfer started", LOG_DEBUG, false, false);
+			});
 
-				link_guard.callbacks.resource_concluded = Some(Arc::new({
-					let router_weak = self.self_handle.clone();
-					move |resource| {
-						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-							if let Ok(mut router) = router_arc.lock() {
-								router.propagation_resource_concluded(resource);
-							}
+			let resource_concluded_cb = Arc::new({
+				let router_weak = self.self_handle.clone();
+				move |resource: Arc<Mutex<Resource>>| {
+					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+						if let Ok(mut router) = router_arc.lock() {
+							router.propagation_resource_concluded(resource);
 						}
 					}
-				}));
-			}
+				}
+			});
+
+			link.set_resource_callbacks(
+				Some(resource_cb),
+				Some(resource_started_cb),
+				Some(resource_concluded_cb),
+			);
 		}
 
 		log("Propagation link established", LOG_DEBUG, false, false);
@@ -3513,11 +3446,7 @@ impl LXMRouter {
 		};
 
 		if self.from_static_only {
-			let remote_identity = resource_guard
-				.link
-				.lock()
-				.ok()
-				.and_then(|link| link.remote_identity.lock().ok().and_then(|ri| ri.clone()));
+			let remote_identity = resource_guard.link.remote_identity().ok().flatten();
 			let remote_identity = match remote_identity {
 				Some(identity) => identity,
 				None => return false,
@@ -3555,9 +3484,7 @@ impl LXMRouter {
 			if let Some(Value::Integer(code)) = values.get(0) {
 				if code.as_i64().unwrap_or(0) as u8 == LXMPeer::ERROR_INVALID_STAMP {
 					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						if let Ok(mut link_guard) = link.lock() {
-							link_guard.teardown();
-						}
+						link.teardown();
 					}
 					self.propagation_transfer_state = Self::PR_FAILED;
 				}
@@ -3646,7 +3573,7 @@ impl LXMRouter {
 		), LOG_NOTICE, false, false);
 
 		if let Some(link_arc) = self.outbound_propagation_link.clone() {
-			let link_status = link_arc.lock().ok().map(|l| l.status).unwrap_or(reticulum_rust::link::STATE_CLOSED);
+			let link_status = link_arc.status();
 			log(&format!("[PSYNC] existing link status={}", link_status), LOG_NOTICE, false, false);
 			// If a link is already pending (being established), don't create another one —
 			// replacing the Arc here would drop the first link before its PROOF arrives.
@@ -3659,62 +3586,58 @@ impl LXMRouter {
 				self.propagation_transfer_state = Self::PR_LINK_ESTABLISHED;
 
 				// Identify ourselves on the link before requesting messages
-				if let Ok(mut link_guard) = link_arc.lock() {
+				if let Ok(snap) = link_arc.snapshot() {
 					log(&format!("[PSYNC] identify: attached_interface={:?} link_id={}",
-						link_guard.attached_interface,
-						reticulum_rust::hexrep(&link_guard.link_id, false)), LOG_NOTICE, false, false);
-					match link_guard.identify(&identity) {
-						Ok(_) => log("[PSYNC] identify sent OK", LOG_NOTICE, false, false),
-						Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
+						snap.attached_interface,
+						reticulum_rust::hexrep(&snap.link_id, false)), LOG_NOTICE, false, false);
+				}
+				match link_arc.identify(&identity) {
+					Ok(_) => log("[PSYNC] identify sent OK", LOG_NOTICE, false, false),
+					Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
+				}
+
+				link_arc.set_packet_callback(Some(Arc::new({
+					let router_weak = self.self_handle.clone();
+					move |data, packet| {
+						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+							if let Ok(mut router) = router_arc.lock() {
+								router.propagation_transfer_signalling_packet(data, packet);
+							}
+						}
 					}
-				}
+				})));
 
-				if let Ok(mut link_guard) = link_arc.lock() {
-					link_guard.callbacks.packet = Some(Arc::new({
-						let router_weak = self.self_handle.clone();
-						move |data, packet| {
-							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-								if let Ok(mut router) = router_arc.lock() {
-									router.propagation_transfer_signalling_packet(data, packet);
-								}
+				let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+					let router_weak = self.self_handle.clone();
+					move |receipt: reticulum_rust::link::RequestReceipt| {
+						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+							if let Ok(mut router) = router_arc.lock() {
+								router.message_list_response(receipt);
 							}
 						}
-					}));
-				}
+					}
+				}));
 
-				if let Ok(link_guard) = link_arc.lock() {
-					let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-						let router_weak = self.self_handle.clone();
-						move |receipt: reticulum_rust::link::RequestReceipt| {
-							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-								if let Ok(mut router) = router_arc.lock() {
-									router.message_list_response(receipt);
-								}
+				let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+					let router_weak = self.self_handle.clone();
+					move |receipt: reticulum_rust::link::RequestReceipt| {
+						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+							if let Ok(mut router) = router_arc.lock() {
+								router.message_get_failed(receipt);
 							}
 						}
-					}));
+					}
+				}));
 
-					let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-						let router_weak = self.self_handle.clone();
-						move |receipt: reticulum_rust::link::RequestReceipt| {
-							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-								if let Ok(mut router) = router_arc.lock() {
-									router.message_get_failed(receipt);
-								}
-							}
-						}
-					}));
-
-					let _ = link_guard.request(
-						LXMPeer::MESSAGE_GET_PATH.to_string(),
-						Self::encode_value(Value::Array(vec![Value::Nil, Value::Nil])),
-						request_cb,
-						failed_cb,
-						None,
-					);
-					log("[PSYNC] message_list request sent", LOG_NOTICE, false, false);
-					self.propagation_transfer_state = Self::PR_REQUEST_SENT;
-				}
+				let _ = link_arc.request(
+					LXMPeer::MESSAGE_GET_PATH.to_string(),
+					Self::encode_value(Value::Array(vec![Value::Nil, Value::Nil])),
+					request_cb,
+					failed_cb,
+					None,
+				);
+				log("[PSYNC] message_list request sent", LOG_NOTICE, false, false);
+				self.propagation_transfer_state = Self::PR_REQUEST_SENT;
 				return;
 			}
 		}
@@ -3730,27 +3653,23 @@ impl LXMRouter {
 					vec!["propagation".to_string()],
 				) {
 					if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
-						let link_arc = Arc::new(Mutex::new(link));
-						self.outbound_propagation_link = Some(link_arc.clone());
+						let handle = LinkHandle::spawn(link);
 						let router_weak = self.self_handle.clone();
-						if let Ok(mut link_guard) = link_arc.lock() {
-							link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-								log("[PSYNC] propagation link ESTABLISHED", LOG_NOTICE, false, false);
-								if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-									if let Ok(mut router) = router_arc.lock() {
-										let max_messages = router.propagation_transfer_max_messages;
-										router.request_messages_from_propagation_node(identity.clone(), max_messages);
-									}
+						handle.set_link_established_callback(Some(Arc::new(move |_| {
+							log("[PSYNC] propagation link ESTABLISHED", LOG_NOTICE, false, false);
+							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+								if let Ok(mut router) = router_arc.lock() {
+									let max_messages = router.propagation_transfer_max_messages;
+									router.request_messages_from_propagation_node(identity.clone(), max_messages);
 								}
-							}));
-							if let Err(e) = link_guard.initiate() {
-								log(&format!("Failed to initiate propagation link: {}", e), LOG_ERROR, false, false);
-							} else {
-								// Register the Arc in RUNTIME_LINKS so the incoming PROOF can be dispatched
-								drop(link_guard);
-								register_runtime_link(link_arc.clone());
 							}
-						};
+						})));
+						if let Err(e) = handle.initiate() {
+							log(&format!("Failed to initiate propagation link: {}", e), LOG_ERROR, false, false);
+						} else {
+							register_runtime_link_handle(handle.clone());
+							self.outbound_propagation_link = Some(handle);
+						}
 					}
 				}
 			}
@@ -3780,18 +3699,14 @@ impl LXMRouter {
 				let code = code.as_i64().unwrap_or(0) as u8;
 				if code == LXMPeer::ERROR_NO_IDENTITY {
 					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						if let Ok(mut link_guard) = link.lock() {
-							link_guard.teardown();
-						}
+						link.teardown();
 					}
 					self.propagation_transfer_state = Self::PR_NO_IDENTITY_RCVD;
 					return;
 				}
 				if code == LXMPeer::ERROR_NO_ACCESS {
 					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						if let Ok(mut link_guard) = link.lock() {
-							link_guard.teardown();
-						}
+						link.teardown();
 					}
 					self.propagation_transfer_state = Self::PR_NO_ACCESS;
 					return;
@@ -3830,58 +3745,54 @@ impl LXMRouter {
 				log(&format!("[MLS] wants={} haves={}, sending second request", wants.len(), haves.len()), LOG_NOTICE, false, false);
 
 				if let Some(link) = self.outbound_propagation_link.as_ref() {
-					if let Ok(link_guard) = link.lock() {
-						let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-							let router_weak = self.self_handle.clone();
-							move |receipt: reticulum_rust::link::RequestReceipt| {
-								if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-									if let Ok(mut router) = router_arc.lock() {
-										router.message_get_response(receipt);
-									}
+					let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+						let router_weak = self.self_handle.clone();
+						move |receipt: reticulum_rust::link::RequestReceipt| {
+							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+								if let Ok(mut router) = router_arc.lock() {
+									router.message_get_response(receipt);
 								}
 							}
-						}));
-						let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-							let router_weak = self.self_handle.clone();
-							move |receipt: reticulum_rust::link::RequestReceipt| {
-								if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-									if let Ok(mut router) = router_arc.lock() {
-										router.message_get_failed(receipt);
-									}
+						}
+					}));
+					let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+						let router_weak = self.self_handle.clone();
+						move |receipt: reticulum_rust::link::RequestReceipt| {
+							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+								if let Ok(mut router) = router_arc.lock() {
+									router.message_get_failed(receipt);
 								}
 							}
-						}));
-						let progress_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-							let router_weak = self.self_handle.clone();
-							move |receipt: reticulum_rust::link::RequestReceipt| {
-								if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-									if let Ok(mut router) = router_arc.lock() {
-										router.message_get_progress(receipt);
-									}
+						}
+					}));
+					let progress_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+						let router_weak = self.self_handle.clone();
+						move |receipt: reticulum_rust::link::RequestReceipt| {
+							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+								if let Ok(mut router) = router_arc.lock() {
+									router.message_get_progress(receipt);
 								}
 							}
-						}));
+						}
+					}));
 
-						let payload = Value::Array(vec![
-							Value::Array(wants),
-							Value::Array(haves),
-							Value::F64(self.delivery_per_transfer_limit),
-						]);
-						let _ = link_guard.request(
-							LXMPeer::MESSAGE_GET_PATH.to_string(),
-							Self::encode_value(payload),
-							request_cb,
-							failed_cb,
-							progress_cb,
-						);
-					}
+					let payload = Value::Array(vec![
+						Value::Array(wants),
+						Value::Array(haves),
+						Value::F64(self.delivery_per_transfer_limit),
+					]);
+					let _ = link.request(
+						LXMPeer::MESSAGE_GET_PATH.to_string(),
+						Self::encode_value(payload),
+						request_cb,
+						failed_cb,
+						progress_cb,
+					);
 				}
 			} else {
 				log("Invalid message list data received from propagation node", LOG_DEBUG, false, false);
 				if let Some(link) = self.outbound_propagation_link.as_ref() {
-					if let Ok(mut link_guard) = link.lock() {
-						link_guard.teardown();
-					}
+					link.teardown();
 				}
 			}
 		}
@@ -3893,18 +3804,14 @@ impl LXMRouter {
 				let code = code.as_i64().unwrap_or(0) as u8;
 				if code == LXMPeer::ERROR_NO_IDENTITY {
 					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						if let Ok(mut link_guard) = link.lock() {
-							link_guard.teardown();
-						}
+						link.teardown();
 					}
 					self.propagation_transfer_state = Self::PR_NO_IDENTITY_RCVD;
 					return;
 				}
 				if code == LXMPeer::ERROR_NO_ACCESS {
 					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						if let Ok(mut link_guard) = link.lock() {
-							link_guard.teardown();
-						}
+						link.teardown();
 					}
 					self.propagation_transfer_state = Self::PR_NO_ACCESS;
 					return;
@@ -3948,26 +3855,24 @@ impl LXMRouter {
 				}
 
 				if let Some(link) = self.outbound_propagation_link.as_ref() {
-					if let Ok(link_guard) = link.lock() {
-						let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-							let router_weak = self.self_handle.clone();
-							move |receipt: reticulum_rust::link::RequestReceipt| {
-								if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-									if let Ok(mut router) = router_arc.lock() {
-										router.message_get_failed(receipt);
-									}
+					let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+						let router_weak = self.self_handle.clone();
+						move |receipt: reticulum_rust::link::RequestReceipt| {
+							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+								if let Ok(mut router) = router_arc.lock() {
+									router.message_get_failed(receipt);
 								}
 							}
-						}));
-						let payload = Value::Array(vec![Value::Nil, Value::Array(haves)]);
-						let _ = link_guard.request(
-							LXMPeer::MESSAGE_GET_PATH.to_string(),
-							Self::encode_value(payload),
-							None,
-							failed_cb,
-							None,
-						);
-					}
+						}
+					}));
+					let payload = Value::Array(vec![Value::Nil, Value::Array(haves)]);
+					let _ = link.request(
+						LXMPeer::MESSAGE_GET_PATH.to_string(),
+						Self::encode_value(payload),
+						None,
+						failed_cb,
+						None,
+					);
 				}
 				self.propagation_transfer_state = Self::PR_COMPLETE;
 				self.propagation_transfer_progress = 1.0;
@@ -3991,9 +3896,7 @@ impl LXMRouter {
 	pub fn message_get_failed(&mut self, _receipt: reticulum_rust::link::RequestReceipt) {
 		log("[PSYNC] message list/get request FAILED", LOG_WARNING, false, false);
 		if let Some(link) = self.outbound_propagation_link.as_ref() {
-			if let Ok(mut link_guard) = link.lock() {
-				link_guard.teardown();
-			}
+			link.teardown();
 		}
 		self.propagation_transfer_state = Self::PR_TRANSFER_FAILED;
 	}
@@ -4306,7 +4209,7 @@ impl LXMRouter {
 			_ => Vec::new(),
 		};
 
-		let remote_identity = link_arc.lock().ok().and_then(|l| l.remote_identity.lock().ok().and_then(|r| r.clone()));
+		let remote_identity = link_arc.remote_identity().ok().flatten();
 		let remote_hash = remote_identity.as_ref().map(|identity| {
 			Destination::hash_from_name_and_identity(&format!("{}.propagation", APP_NAME), Some(identity))
 		});
@@ -4364,9 +4267,7 @@ impl LXMRouter {
 			.unwrap_or(false);
 
 		if !peering_key_valid && messages.len() > 1 {
-			if let Ok(mut link) = link_arc.lock() {
-				link.teardown();
-			}
+			link_arc.teardown();
 			log(
 				"Received multiple propagation messages without a validated peering key",
 				LOG_WARNING,
@@ -4416,9 +4317,7 @@ impl LXMRouter {
 
 		let invalid_count = messages.len().saturating_sub(validated.len());
 		if invalid_count > 0 {
-			if let Ok(mut link) = link_arc.lock() {
-				link.teardown();
-			}
+			link_arc.teardown();
 			if let Some(hash) = remote_hash.as_ref() {
 				let throttle_until = now() + Self::PN_STAMP_THROTTLE;
 				self.throttled_peers.insert(hash.clone(), throttle_until);
