@@ -98,6 +98,13 @@ impl LXMessage {
 	pub const PAPER: u8 = 0x05;
 
 	pub const SOURCE_UNKNOWN: u8 = 0x01;
+
+	/// Returns true if this message has already reached a successful terminal state
+	/// (SENT via propagation or DELIVERED via direct). Failure states must never
+	/// overwrite a success state — a message that was already delivered cannot fail.
+	pub fn is_success_state(state: u8) -> bool {
+		state == Self::SENT || state == Self::DELIVERED
+	}
 	pub const SIGNATURE_INVALID: u8 = 0x02;
 
 	pub const DESTINATION_LENGTH: usize = TRUNCATED_HASHLENGTH / 8;
@@ -1293,6 +1300,13 @@ impl LXMessage {
 	fn resource_concluded(&mut self, resource: &Resource) {
 		if resource.status == ResourceStatus::Complete {
 			self.mark_delivered();
+		} else if Self::is_success_state(self.state) {
+			// Already succeeded via another path (e.g. propagation) — don't let a
+			// resource rejection or timeout on this path overwrite the success state.
+			log(
+				format!("resource_concluded: ignoring non-completion for {} (already {})", self, Self::state_name(self.state)),
+				LOG_DEBUG, false, false,
+			);
 		} else if resource.status == ResourceStatus::Rejected {
 			self.state = Self::REJECTED;
 		} else if self.state != Self::CANCELLED {

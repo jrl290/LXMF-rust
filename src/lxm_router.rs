@@ -1483,6 +1483,13 @@ impl LXMRouter {
 	}
 
 	pub fn fail_message(&self, message: &mut LXMessage) {
+		// Never overwrite a success state — if the message already succeeded via
+		// one path (e.g. propagation SENT) a failure on the other path (e.g. direct
+		// timeout) must not revert it back to FAILED.
+		if LXMessage::is_success_state(message.state) {
+			log(&format!("{} fail_message skipped — already in success state {}", message, LXMessage::state_name(message.state)), LOG_DEBUG, false, false);
+			return;
+		}
 		log(&format!("{} failed to send", message), LOG_DEBUG, false, false);
 		message.progress = 0.0;
 		message.state = LXMessage::FAILED;
