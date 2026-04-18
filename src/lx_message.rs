@@ -1249,6 +1249,7 @@ impl LXMessage {
 			None,
 			false,
 			0,
+			None,
 		)?;
 		let resource_arc = Arc::new(Mutex::new(resource));
 		Resource::advertise_shared(resource_arc.clone());

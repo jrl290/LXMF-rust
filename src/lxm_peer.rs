@@ -850,6 +850,7 @@ impl LXMPeer {
 					None,
 					false,
 					0,
+					None,
 				)
 				.map_err(|e| {
 					log(&format!("Failed to create sync resource: {}", e), LOG_ERROR, false, false);
