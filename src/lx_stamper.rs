@@ -49,11 +49,12 @@ pub fn stamp_workblock(material: &[u8], expand_rounds: usize) -> Vec<u8> {
 }
 
 pub fn stamp_value(workblock: &[u8], stamp: &[u8]) -> u32 {
-	use sha2::{Sha256, Digest};
-	let mut hasher = Sha256::new();
-	hasher.update(workblock);
-	hasher.update(stamp);
-	let hash = hasher.finalize();
+	// Must match Python: RNS.Identity.full_hash(workblock + stamp)
+	// full_hash = double SHA256 (sha256(sha256(data)))
+	let mut material = Vec::with_capacity(workblock.len() + stamp.len());
+	material.extend_from_slice(workblock);
+	material.extend_from_slice(stamp);
+	let hash = identity::full_hash(&material);
 
 	let mut value = 0u32;
 	for byte in hash.as_slice() {
