@@ -692,6 +692,47 @@ pub extern "C" fn lxmf_app_link_status(
     })
 }
 
+/// Register an app-link reconnect handler for a non-LXMF destination aspect.
+///
+/// Call this once per extra aspect during startup so the LXMF router
+/// re-establishes app-links to those destinations on announce.
+///
+/// # Arguments
+/// * `client`         – handle returned by `lxmf_client_start`.
+/// * `aspect_filter`  – NUL-terminated ASCII string of the full aspect name,
+///   e.g. `"rfed.channel"` or `"rfed.notify"`.
+///
+/// Returns 0 on success, -1 on error (call `lxmf_last_error` for details).
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_register_reconnect(
+    client: u64,
+    aspect_filter: *const c_char,
+) -> i32 {
+    with_client!(client, c, {
+        let aspect = if aspect_filter.is_null() {
+            set_error("null aspect_filter");
+            return -1;
+        } else {
+            unsafe {
+                match std::ffi::CStr::from_ptr(aspect_filter).to_str() {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => {
+                        set_error("aspect_filter is not valid UTF-8");
+                        return -1;
+                    }
+                }
+            }
+        };
+        match lxmf::router_register_app_link_reconnect_handler(c.router_handle, &aspect) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
 /// Look up the cached display name for a destination hash.
 ///
 /// Reads the announce app-data stored in the Reticulum Identity table when

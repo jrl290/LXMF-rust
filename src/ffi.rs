@@ -532,6 +532,23 @@ pub fn router_app_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8
     Ok(guard.app_link_status(dest_hash))
 }
 
+/// Register an app-link reconnect handler for a non-LXMF destination aspect.
+///
+/// LXMF only auto-reconnects app-links that announce under `lxmf.delivery`.
+/// For any other aspect (e.g. `rfed.channel`, `rfed.notify`) the caller must
+/// register one handler per aspect so the router reconnects when that
+/// destination announces.  Call once per aspect during application startup.
+pub fn router_register_app_link_reconnect_handler(
+    router_handle: u64,
+    aspect_filter: &str,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let handler = crate::handlers::app_link_reconnect_handler(router, aspect_filter.to_string());
+    reticulum_rust::transport::Transport::register_announce_handler(handler);
+    Ok(())
+}
+
 /// Register a callback that fires when an outbound message changes delivery state.
 ///
 /// The callback receives the 16-byte message hash and the new state byte:

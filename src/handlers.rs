@@ -157,3 +157,35 @@ pub fn propagation_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHa
 		callback,
 	}
 }
+
+/// Create an announce handler that re-establishes an app-link for a specific
+/// destination aspect whenever an announce (or path-response) arrives.
+///
+/// The `delivery_announce_handler` only fires for `lxmf.delivery`, so
+/// app-links to other aspects (e.g. `rfed.channel`) need their own handlers.
+/// Callers register one handler per extra aspect they care about.
+///
+/// # Arguments
+/// * `router`        – shared LXMRouter (the one holding `app_links`).
+/// * `aspect_filter` – full dot-separated name of the aspect to watch,
+///   e.g. `"rfed.channel"` or `"rfed.notify"`.
+pub fn app_link_reconnect_handler(
+	router: Arc<Mutex<LXMRouter>>,
+	aspect_filter: String,
+) -> AnnounceHandler {
+	let callback: AnnounceCallback = Arc::new(move |destination_hash, _identity, _app_data, _announce_hash, _is_path_response| {
+		if let Ok(mut router) = router.lock() {
+			if router.app_links.contains(destination_hash)
+				&& router.peer_link_status(destination_hash) == 0
+			{
+				router.establish_app_link(destination_hash);
+			}
+		}
+	});
+
+	AnnounceHandler {
+		aspect_filter: Some(aspect_filter),
+		receive_path_responses: true,
+		callback,
+	}
+}
