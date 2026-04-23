@@ -2689,14 +2689,16 @@ impl LXMRouter {
 		self.watched_destinations.insert(dest_hash.to_vec());
 		Transport::watch_announce(dest_hash.to_vec());
 
-		// If we already have an active link, nothing to do.
-		if self.peer_link_status(dest_hash) == 2 {
-			return;
-		}
-
-		// If we have a pending link, let it finish.
-		if self.peer_link_status(dest_hash) == 1 {
-			return;
+		// If the link is already active or in the process of being established
+		// (PENDING, HANDSHAKE, or any other pre-ACTIVE state), leave it alone.
+		// Use app_link_status rather than peer_link_status: the latter returns 0
+		// for STATE_HANDSHAKE, which would incorrectly tear down a link that is
+		// mid-handshake and replace it with a fresh one on every announce.
+		{
+			let als = self.app_link_status(dest_hash);
+			if als == Self::APP_LINK_ACTIVE || als == Self::APP_LINK_ESTABLISHING {
+				return;
+			}
 		}
 
 		// Clean any stale/closed link entry before trying fresh.
@@ -2775,10 +2777,15 @@ impl LXMRouter {
 	/// processing thread so any queued messages are sent immediately.
 	pub fn establish_app_link(&mut self, dest_hash: &[u8]) {
 		// Check if an existing link is still alive — if so, leave it alone.
+		// Must also check STATE_HANDSHAKE: a link transitions PENDING→HANDSHAKE
+		// during crypto setup before becoming ACTIVE.  Without this check a
+		// mid-handshake link would be torn down and replaced, causing repeated
+		// 15-20 second "state=0" teardown cycles in the log.
 		if let Some(existing) = self.direct_links.get(dest_hash) {
 			let status = existing.status();
 			if status == reticulum_rust::link::STATE_ACTIVE
 				|| status == reticulum_rust::link::STATE_PENDING
+				|| status == reticulum_rust::link::STATE_HANDSHAKE
 			{
 				return;
 			}

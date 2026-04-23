@@ -175,8 +175,13 @@ pub fn app_link_reconnect_handler(
 ) -> AnnounceHandler {
 	let callback: AnnounceCallback = Arc::new(move |destination_hash, _identity, _app_data, _announce_hash, _is_path_response| {
 		if let Ok(mut router) = router.lock() {
+			// Only reconnect when the link is truly DISCONNECTED (was established
+			// before, now gone).  Using peer_link_status == 0 was wrong for
+			// non-LXMF destinations (e.g. rfed.channel) because peer_link_status
+			// always returns 0 for them — triggering a new link request on every
+			// single announce even while a link was already establishing.
 			if router.app_links.contains(destination_hash)
-				&& router.peer_link_status(destination_hash) == 0
+				&& router.app_link_status(destination_hash) == LXMRouter::APP_LINK_DISCONNECTED
 			{
 				router.establish_app_link(destination_hash);
 			}
