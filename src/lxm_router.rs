@@ -2714,7 +2714,14 @@ impl LXMRouter {
 		}
 
 		// Clean any stale/closed link entry before trying fresh.
-		self.direct_links.remove(dest_hash);
+		// Clear callbacks BEFORE teardown so the link_closed_callback does not
+		// fire a spurious expire_path on a server that is still reachable.
+		if let Some(old) = self.direct_links.remove(dest_hash) {
+			self.validated_peer_links.remove(&old.link_id());
+			old.set_link_closed_callback(None);
+			old.set_link_established_callback(None);
+			old.teardown();
+		}
 		self.backchannel_identified_links.remove(dest_hash);
 
 		if Transport::has_path(dest_hash) {
@@ -2737,6 +2744,11 @@ impl LXMRouter {
 		self.app_links.remove(dest_hash);
 		if let Some(link_arc) = self.direct_links.remove(dest_hash) {
 			self.validated_peer_links.remove(&link_arc.link_id());
+			// Clear callbacks so the link_closed_callback does not fire
+			// expire_path when we intentionally close the link (the server
+			// is still reachable; this is a deliberate client-side close).
+			link_arc.set_link_closed_callback(None);
+			link_arc.set_link_established_callback(None);
 			link_arc.teardown();
 		}
 		self.backchannel_identified_links.remove(dest_hash);
@@ -2818,8 +2830,15 @@ impl LXMRouter {
 			}
 		}
 		// Clean dead link entry before creating a new one.
+		// Clear callbacks BEFORE teardown: the old link may already have been
+		// torn down by the transport (its callback already fired once for the
+		// stale-path expiry).  Calling teardown() again without clearing would
+		// fire link_closed_callback a second time, triggering another
+		// expire_path + request_path storm.
 		if let Some(old) = self.direct_links.remove(dest_hash) {
 			self.validated_peer_links.remove(&old.link_id());
+			old.set_link_closed_callback(None);
+			old.set_link_established_callback(None);
 			old.teardown();
 		}
 		self.backchannel_identified_links.remove(dest_hash);
