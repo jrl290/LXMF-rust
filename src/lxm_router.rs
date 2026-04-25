@@ -2862,6 +2862,12 @@ impl LXMRouter {
 				// can distinguish a clean teardown from a failed establishment.
 				let was_established = Arc::new(std::sync::atomic::AtomicBool::new(false));
 				let was_established_closed = was_established.clone();
+				// Defence-in-depth: Link::teardown() in Reticulum-rust is
+				// idempotent in *state* but NOT in callback firing — every call
+				// re-invokes link_closed() even when the link is already CLOSED.
+				// This latch ensures the expire_path branch runs at most once per
+				// link lifetime regardless of how many times the layer fires it.
+				let closed_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
 				let dest_for_closed = dest_hash.to_vec();
 				link_handle.set_link_established_callback(Some(Arc::new(move |_| {
 					log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
@@ -2874,6 +2880,9 @@ impl LXMRouter {
 				// the normal path-discovery flow instead of waiting up to 6 hours for
 				// the next server announce.
 				link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
+					if closed_fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						return; // already handled — ignore subsequent fires
+					}
 					if !was_established_closed.load(std::sync::atomic::Ordering::Relaxed) {
 						log(
 							&format!("[APP_LINK] Link closed before ACTIVE — expiring stale path for {}",
@@ -3306,18 +3315,26 @@ impl LXMRouter {
 		// The peer has established its own link, indicating it prefers this channel.
 		// Keeping the old link causes delivery failures: we'd send on a link the
 		// peer no longer services, the proof never arrives, and we time out.
-		if let Some(old_link) = self.direct_links.remove(&destination_hash) {
-			log(
-				&format!(
-					"Peer {} established backchannel; tearing down old direct link",
-					hexrep(&destination_hash, false)
-				),
-				LOG_NOTICE,
-				false,
-				false,
-			);
-			old_link.teardown();
-			self.backchannel_identified_links.remove(&destination_hash);
+		//
+		// EXCEPTION: app_links own their direct_links entry explicitly via
+		// app_link_open/close.  Tearing one down here would (a) break the user's
+		// app-link control plane and (b) risk firing expire_path on a healthy
+		// path if the link had not yet reached ACTIVE.  Leave it alone — the
+		// backchannel will still be recorded below for use as an alternate path.
+		if !self.app_links.contains(destination_hash.as_slice()) {
+			if let Some(old_link) = self.direct_links.remove(&destination_hash) {
+				log(
+					&format!(
+						"Peer {} established backchannel; tearing down old direct link",
+						hexrep(&destination_hash, false)
+					),
+					LOG_NOTICE,
+					false,
+					false,
+				);
+				old_link.teardown();
+				self.backchannel_identified_links.remove(&destination_hash);
+			}
 		}
 
 		self.backchannel_links.insert(destination_hash.clone(), link.clone());
