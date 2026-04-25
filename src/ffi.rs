@@ -532,6 +532,21 @@ pub fn router_app_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8
     Ok(guard.app_link_status(dest_hash))
 }
 
+/// Get a clone of the LinkHandle for an app-link destination, if one is
+/// currently available.  Returns `Ok(None)` if no link exists yet.
+///
+/// The lock is held only briefly to clone the handle — the caller can then
+/// send requests on the link without blocking other router operations.
+pub fn router_app_link_get_handle(
+    router_handle: u64,
+    dest_hash: &[u8],
+) -> Result<Option<reticulum_rust::link::LinkHandle>, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let guard = router.lock().map_err(|e| e.to_string())?;
+    Ok(guard.app_link_get_handle(dest_hash))
+}
+
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.
 ///
 /// LXMF only auto-reconnects app-links that announce under `lxmf.delivery`.

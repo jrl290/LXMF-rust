@@ -692,6 +692,177 @@ pub extern "C" fn lxmf_app_link_status(
     })
 }
 
+/// Send a blocking request on an existing app-link.
+///
+/// Looks up the LinkHandle for `dest_hash` from the router's `direct_links`
+/// table (or `backchannel_links`), checks that the link is `STATE_ACTIVE`,
+/// then issues `path` with `payload` and waits up to `timeout_secs` for a
+/// response.
+///
+/// This is the multiplexing equivalent of `retichat_link_request`: instead
+/// of opening a new outbound link per request, it reuses the persistent
+/// app-link that was opened with `lxmf_app_link_open`.
+///
+/// Caller MUST call `lxmf_app_link_open` first and wait for the link to be
+/// `APP_LINK_ACTIVE` (status == 3) before calling this.
+///
+/// Returns a pointer to the response bytes (caller must free with
+/// `lxmf_free_bytes`), or NULL on error / timeout / no link / link not
+/// active (check `lxmf_last_error`).
+///
+/// This call is **blocking** — Swift must invoke it from a background thread.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_request(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    path: *const c_char,
+    payload: *const u8,
+    payload_len: u32,
+    timeout_secs: f64,
+    out_len: *mut u32,
+) -> *mut u8 {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
+
+    // Validate args.
+    let hash = if dest_hash.is_null() || dest_len == 0 {
+        set_error("null dest hash");
+        return std::ptr::null_mut();
+    } else {
+        unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+    };
+    let path_str = if path.is_null() {
+        set_error("null path");
+        return std::ptr::null_mut();
+    } else {
+        unsafe {
+            match std::ffi::CStr::from_ptr(path).to_str() {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    set_error("path is not valid UTF-8");
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+    };
+    let payload_slice: &[u8] = if payload.is_null() || payload_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(payload, payload_len as usize) }
+    };
+
+    // Briefly lock the client to clone the LinkHandle, then drop the lock so
+    // the request/wait does not block other router operations.
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return std::ptr::null_mut();
+        }
+    };
+    let link_handle = {
+        let guard = arc.lock().unwrap();
+        match guard.app_link_get_handle(hash) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                set_error("no app-link to destination — call lxmf_app_link_open first");
+                return std::ptr::null_mut();
+            }
+            Err(e) => {
+                set_error(e);
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    // Verify the link is active before issuing the request.
+    let status = link_handle.status();
+    if status != reticulum_rust::link::STATE_ACTIVE {
+        set_error(format!(
+            "app-link not active (status={}) — wait for APP_LINK_ACTIVE before requesting",
+            status
+        ));
+        return std::ptr::null_mut();
+    }
+
+    // Set up callbacks to capture the response.
+    let response_data: Arc<StdMutex<Option<Vec<u8>>>> = Arc::new(StdMutex::new(None));
+    let request_done = Arc::new(AtomicBool::new(false));
+    let request_failed = Arc::new(AtomicBool::new(false));
+
+    let resp_ok = Arc::clone(&response_data);
+    let done_ok = Arc::clone(&request_done);
+    let response_cb: Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync> =
+        Arc::new(move |receipt: reticulum_rust::link::RequestReceipt| {
+            if let Some(ref data) = receipt.response {
+                if let Ok(mut r) = resp_ok.lock() {
+                    *r = Some(data.clone());
+                }
+            }
+            done_ok.store(true, Ordering::SeqCst);
+        });
+
+    let done_fail = Arc::clone(&request_done);
+    let failed_flag = Arc::clone(&request_failed);
+    let failed_cb: Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync> =
+        Arc::new(move |_receipt| {
+            failed_flag.store(true, Ordering::SeqCst);
+            done_fail.store(true, Ordering::SeqCst);
+        });
+
+    if let Err(e) = link_handle.request(
+        path_str,
+        payload_slice.to_vec(),
+        Some(response_cb),
+        Some(failed_cb),
+        None,
+    ) {
+        set_error(format!("link.request failed: {:?}", e));
+        return std::ptr::null_mut();
+    }
+
+    // Wait for completion or timeout.
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+    while !request_done.load(Ordering::SeqCst) {
+        if Instant::now() >= deadline {
+            set_error("app-link request timed out");
+            return std::ptr::null_mut();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Collect response.
+    let result = match response_data.lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => {
+            set_error("response lock poisoned");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match result {
+        Some(bytes) => {
+            let len = bytes.len() as u32;
+            let boxed = bytes.into_boxed_slice();
+            let raw = Box::into_raw(boxed);
+            if !out_len.is_null() {
+                unsafe { *out_len = len; }
+            }
+            raw as *mut u8
+        }
+        None => {
+            if request_failed.load(Ordering::SeqCst) {
+                set_error("app-link request failed (no response)");
+            } else {
+                set_error("app-link request completed without response");
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.
 ///
 /// Call this once per extra aspect during startup so the LXMF router

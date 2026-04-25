@@ -180,6 +180,15 @@ impl LxmfClient {
         lxmf::router_app_link_status(self.router_handle, dest_hash)
     }
 
+    /// Get the LinkHandle for an active app-link, if available.
+    /// Used to send requests on an existing app-link instead of opening
+    /// a fresh link per request.
+    pub fn app_link_get_handle(&self, dest_hash: &[u8])
+        -> Result<Option<reticulum_rust::link::LinkHandle>, String>
+    {
+        lxmf::router_app_link_get_handle(self.router_handle, dest_hash)
+    }
+
     // -------------------------------------------------------------------
     // Announce
     // -------------------------------------------------------------------

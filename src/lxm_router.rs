@@ -94,6 +94,10 @@ pub struct LXMRouter {
 
 	pub outbound_propagation_node: Option<Vec<u8>>,
 	pub outbound_propagation_link: Option<LinkHandle>,
+	/// Wall-clock time (seconds since epoch) at which `outbound_propagation_link`
+	/// was created. Used to detect stuck-pending links and force a teardown so
+	/// the next sync request can establish a fresh link.
+	pub outbound_propagation_link_created_at: Option<f64>,
 
 	pub message_storage_limit: Option<u64>,
 	pub information_storage_limit: Option<u64>,
@@ -203,6 +207,10 @@ impl LXMRouter {
 	pub const DELIVERY_LIMIT: f64 = 1000.0;
 
 	pub const PR_PATH_TIMEOUT: f64 = 10.0;
+	/// Maximum time (seconds) a propagation-sync link may remain in
+	/// `STATE_PENDING` before it is considered stuck and forcibly torn down so
+	/// the next sync request can establish a fresh link.
+	pub const PR_LINK_PENDING_TIMEOUT: f64 = 30.0;
 	pub const PN_STAMP_THROTTLE: f64 = 180.0;
 
 	pub const JOB_OUTBOUND_INTERVAL: u64 = 1;
@@ -302,6 +310,7 @@ impl LXMRouter {
 			messagepath: None,
 			outbound_propagation_node: None,
 			outbound_propagation_link: None,
+			outbound_propagation_link_created_at: None,
 			message_storage_limit: None,
 			information_storage_limit: None,
 			propagation_per_transfer_limit: propagation_limit,
@@ -822,6 +831,7 @@ impl LXMRouter {
 			link.teardown();
 		}
 		self.outbound_propagation_link = None;
+		self.outbound_propagation_link_created_at = None;
 		self.acknowledge_sync_completion(None);
 	}
 
@@ -1852,6 +1862,7 @@ impl LXMRouter {
 		};
 		if should_clear {
 			self.outbound_propagation_link = None;
+			self.outbound_propagation_link_created_at = None;
 			if self.propagation_transfer_state == Self::PR_COMPLETE {
 				self.acknowledge_sync_completion(None);
 			} else if self.propagation_transfer_state < Self::PR_LINK_ESTABLISHED {
@@ -2458,6 +2469,7 @@ impl LXMRouter {
 					link.teardown();
 				}
 				self.outbound_propagation_link = None;
+				self.outbound_propagation_link_created_at = None;
 			}
 		}
 
@@ -2771,6 +2783,21 @@ impl LXMRouter {
 		}
 	}
 
+	/// Get a clone of the LinkHandle for an app-link destination, if one is
+	/// currently available (direct or backchannel-identified).  Returns `None`
+	/// if no link exists yet.  The caller is responsible for verifying the
+	/// link's status before sending requests on it.
+	///
+	/// Used by the FFI `lxmf_app_link_request` to multiplex multiple requests
+	/// over a single persistent app-link rather than opening fresh links per
+	/// request.
+	pub fn app_link_get_handle(&self, dest_hash: &[u8]) -> Option<LinkHandle> {
+		self.direct_links
+			.get(dest_hash)
+			.cloned()
+			.or_else(|| self.backchannel_links.get(dest_hash).cloned())
+	}
+
 	/// Create and initiate a link for an app_links destination.
 	///
 	/// Assumes path exists.  The link-established callback wakes the outbound
@@ -2812,9 +2839,31 @@ impl LXMRouter {
 			Ok(link) => {
 				let link_handle = LinkHandle::spawn(link);
 				let wake_tx = self.outbound_wake_tx.clone();
+				// Track whether the link ever became ACTIVE so the closed callback
+				// can distinguish a clean teardown from a failed establishment.
+				let was_established = Arc::new(std::sync::atomic::AtomicBool::new(false));
+				let was_established_closed = was_established.clone();
+				let dest_for_closed = dest_hash.to_vec();
 				link_handle.set_link_established_callback(Some(Arc::new(move |_| {
 					log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
+					was_established.store(true, std::sync::atomic::Ordering::Relaxed);
 					let _ = wake_tx.send(());
+				})));
+				// If the link closes without ever reaching ACTIVE the cached path is
+				// stale (route died but TTL hasn't expired).  Expire it now and
+				// request a fresh one so the next app_link_open attempt goes through
+				// the normal path-discovery flow instead of waiting up to 6 hours for
+				// the next server announce.
+				link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
+					if !was_established_closed.load(std::sync::atomic::Ordering::Relaxed) {
+						log(
+							&format!("[APP_LINK] Link closed before ACTIVE — expiring stale path for {}",
+								hexrep(&dest_for_closed, false)),
+							LOG_NOTICE, false, false,
+						);
+						Transport::expire_path(&dest_for_closed);
+						Transport::request_path(&dest_for_closed, None, None, None, None);
+					}
 				})));
 				if let Err(e) = link_handle.initiate() {
 					log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
@@ -3591,9 +3640,25 @@ impl LXMRouter {
 			log(&format!("[PSYNC] existing link status={}", link_status), LOG_NOTICE, false, false);
 			// If a link is already pending (being established), don't create another one —
 			// replacing the Arc here would drop the first link before its PROOF arrives.
+			// However, if the link has been pending for too long it's stuck (e.g. PROOF
+			// lost on a long path). Tear it down so the next call can establish a fresh
+			// link instead of suppressing retries forever.
 			if link_status == reticulum_rust::link::STATE_PENDING {
-				log("[PSYNC] link pending, skipping duplicate sync request", LOG_NOTICE, false, false);
-				return;
+				let age = self
+					.outbound_propagation_link_created_at
+					.map(|t| now() - t)
+					.unwrap_or(0.0);
+				if age >= Self::PR_LINK_PENDING_TIMEOUT {
+					log(&format!("[PSYNC] link pending too long ({:.1}s) → tearing down for fresh attempt", age), LOG_NOTICE, false, false);
+					link_arc.teardown();
+					self.outbound_propagation_link = None;
+					self.outbound_propagation_link_created_at = None;
+					self.propagation_transfer_state = Self::PR_LINK_FAILED;
+					// Fall through to the path/establishment logic below.
+				} else {
+					log(&format!("[PSYNC] link pending ({:.1}s), skipping duplicate sync request", age), LOG_NOTICE, false, false);
+					return;
+				}
 			}
 			let link_is_active = link_status == reticulum_rust::link::STATE_ACTIVE;
 			if link_is_active {
@@ -3680,6 +3745,7 @@ impl LXMRouter {
 						} else {
 							register_runtime_link_handle(handle.clone());
 							self.outbound_propagation_link = Some(handle);
+							self.outbound_propagation_link_created_at = Some(now());
 						}
 					}
 				}
