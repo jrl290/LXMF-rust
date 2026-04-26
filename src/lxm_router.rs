@@ -207,10 +207,15 @@ impl LXMRouter {
 	pub const DELIVERY_LIMIT: f64 = 1000.0;
 
 	pub const PR_PATH_TIMEOUT: f64 = 10.0;
-	/// Maximum time (seconds) a propagation-sync link may remain in
-	/// `STATE_PENDING` before it is considered stuck and forcibly torn down so
-	/// the next sync request can establish a fresh link.
-	pub const PR_LINK_PENDING_TIMEOUT: f64 = 30.0;
+	/// Safety ceiling (seconds) on how long a propagation-sync link may remain
+	/// in `STATE_PENDING` before LXMF forcibly tears it down. Normally we trust
+	/// the underlying Reticulum link's own establishment_timeout
+	/// (`first_hop + ESTABLISHMENT_TIMEOUT_PER_HOP * hops`) to close stuck
+	/// links. This cap only fires if the link's own timer somehow fails to
+	/// progress the link out of PENDING. Must safely exceed the worst-case
+	/// link-establishment timeout (e.g. ~66s for hops=10) so we don't kill
+	/// legitimate slow long-path establishments mid-flight.
+	pub const PR_LINK_PENDING_TIMEOUT: f64 = 120.0;
 	pub const PN_STAMP_THROTTLE: f64 = 180.0;
 
 	pub const JOB_OUTBOUND_INTERVAL: u64 = 1;
