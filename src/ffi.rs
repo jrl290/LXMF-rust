@@ -496,14 +496,24 @@ pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u
 ///
 /// Returns immediately.  The link is established asynchronously via the
 /// announce handler (push, no polling).
-pub fn router_app_link_open(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+///
+/// `app_name` and `aspects` describe the destination (e.g. `"lxmf"` +
+/// `["delivery"]`, or `"rfed"` + `["channel"]`). Without these the router
+/// cannot resolve the right identity when re-establishing the link after a
+/// teardown.
+pub fn router_app_link_open(
+    router_handle: u64,
+    dest_hash: &[u8],
+    app_name: &str,
+    aspects: &[&str],
+) -> Result<(), String> {
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;
 
     router
         .lock()
         .map_err(|e| e.to_string())?
-        .app_link_open(dest_hash);
+        .app_link_open(dest_hash, app_name, aspects);
     Ok(())
 }
 
@@ -561,6 +571,23 @@ pub fn router_register_app_link_reconnect_handler(
         .ok_or_else(|| "invalid router handle".to_string())?;
     let handler = crate::handlers::app_link_reconnect_handler(router, aspect_filter.to_string());
     reticulum_rust::transport::Transport::register_announce_handler(handler);
+    Ok(())
+}
+
+/// Notify the router that the host's network reachability state has
+/// changed (interface up/down, Wi-Fi ↔ cellular, VPN flipped, etc.).
+///
+/// Triggers ONE fresh app-link establishment attempt for every registered
+/// app-link that is not currently active or already establishing.  This is
+/// the only way the router will retry an offline destination — it does not
+/// poll on its own.
+pub fn router_app_link_network_changed(router_handle: u64) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_network_changed();
     Ok(())
 }
 

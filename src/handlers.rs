@@ -66,7 +66,7 @@ pub fn delivery_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHandl
 
 			// App links: if this destination is in app_links and no active
 			// link exists, establish one now that the path is available.
-			if router.app_links.contains(destination_hash)
+			if router.app_links.contains_key(destination_hash)
 				&& router.peer_link_status(destination_hash) == 0
 			{
 				router.establish_app_link(destination_hash);
@@ -174,18 +174,35 @@ pub fn app_link_reconnect_handler(
 	aspect_filter: String,
 ) -> AnnounceHandler {
 	let callback: AnnounceCallback = Arc::new(move |destination_hash, _identity, _app_data, _announce_hash, _is_path_response| {
-		if let Ok(mut router) = router.lock() {
-			// Only reconnect when the link is truly DISCONNECTED (was established
-			// before, now gone).  Using peer_link_status == 0 was wrong for
-			// non-LXMF destinations (e.g. rfed.channel) because peer_link_status
-			// always returns 0 for them — triggering a new link request on every
-			// single announce even while a link was already establishing.
-			if router.app_links.contains(destination_hash)
-				&& router.app_link_status(destination_hash) == LXMRouter::APP_LINK_DISCONNECTED
-			{
-				router.establish_app_link(destination_hash);
+		// Decide under the lock, then drop the guard BEFORE calling
+		// establish_app_link.  establish_app_link calls LinkHandle::initiate(),
+		// which blocks on the link actor's response and can take seconds
+		// while Transport::outbound paces packets.  Holding the router mutex
+		// across that round-trip serialised every other router caller — most
+		// visibly freezing the UI thread inside `app_link_status()` — and
+		// deadlocked when multiple back-to-back announces fired the handler.
+		let should_reconnect = match router.lock() {
+			Ok(router) => {
+				router.app_links.contains_key(destination_hash)
+					&& router.app_link_status(destination_hash) == LXMRouter::APP_LINK_DISCONNECTED
 			}
+			Err(_) => false,
+		};
+		if !should_reconnect {
+			return;
 		}
+		// Hand the blocking work to a background thread so the announce
+		// handler returns immediately.  Cloning the Arc is cheap.
+		let router_for_thread = router.clone();
+		let dest = destination_hash.to_vec();
+		std::thread::spawn(move || {
+			if let Ok(mut router) = router_for_thread.lock() {
+				// Route through the announce-trigger entry point: it re-checks
+				// under the lock and consults the per-spec `attempt_in_flight`
+				// gate so duplicate announces collapse to a single LR.
+				router.app_link_announce_received(&dest);
+			}
+		});
 	});
 
 	AnnounceHandler {

@@ -552,6 +552,37 @@ pub extern "C" fn lxmf_client_announce(client: u64) -> i32 {
     })
 }
 
+/// Opt this client's delivery destination into Transport's auto-announce
+/// daemon. After this call, Transport automatically re-announces:
+///   * once on every interface false→true `online` transition, and
+///   * every `refresh_secs` seconds (pass 0.0 to disable periodic
+///     refresh and only re-announce on interface up-edges).
+///
+/// Idempotent: calling again with a different `refresh_secs` updates
+/// the existing entry without re-announcing. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn lxmf_client_publish(client: u64, refresh_secs: f64) -> i32 {
+    with_client!(client, c, {
+        match c.publish(refresh_secs) {
+            Ok(()) => 0,
+            Err(e) => { set_error(e); -1 }
+        }
+    })
+}
+
+/// Remove this client's delivery destination from the announce daemon's
+/// published set. Does not send a "goodbye" announce; the destination
+/// simply stops being auto-announced. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn lxmf_client_unpublish(client: u64) -> i32 {
+    with_client!(client, c, {
+        match c.unpublish() {
+            Ok(()) => 0,
+            Err(e) => { set_error(e); -1 }
+        }
+    })
+}
+
 /// Watch for announces from a destination hash.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -613,12 +644,22 @@ pub extern "C" fn lxmf_peer_link_status(
 /// direct link when the path becomes available — all push-driven, no polling.
 /// The link is kept alive automatically and exempt from inactivity cleanup.
 ///
+/// `app_name` and `aspects_csv` describe the destination identity that the
+/// router must resolve when (re)establishing the link. Examples:
+///   `app_name="lxmf"`, `aspects_csv="delivery"` — peer chat link.
+///   `app_name="rfed"`, `aspects_csv="channel"` — rfed channel link.
+///   `app_name="rfed"`, `aspects_csv="notify"`  — rfed notify link.
+/// `aspects_csv` is a `.`-separated list (matches Destination naming convention)
+/// — pass `"foo.bar"` for app aspects `["foo","bar"]`. Empty string is allowed.
+///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn lxmf_app_link_open(
     client: u64,
     dest_hash: *const u8,
     dest_len: u32,
+    app_name: *const std::os::raw::c_char,
+    aspects_csv: *const std::os::raw::c_char,
 ) -> i32 {
     with_client!(client, c, {
         let hash = if dest_hash.is_null() || dest_len == 0 {
@@ -627,7 +668,29 @@ pub extern "C" fn lxmf_app_link_open(
         } else {
             unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
         };
-        match c.app_link_open(hash) {
+        let app = if app_name.is_null() {
+            set_error("null app_name");
+            return -1;
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(app_name) }.to_str() {
+                Ok(s) => s,
+                Err(_) => { set_error("app_name not utf-8"); return -1; }
+            }
+        };
+        let aspects_str = if aspects_csv.is_null() {
+            ""
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(aspects_csv) }.to_str() {
+                Ok(s) => s,
+                Err(_) => { set_error("aspects_csv not utf-8"); return -1; }
+            }
+        };
+        let aspects: Vec<&str> = if aspects_str.is_empty() {
+            Vec::new()
+        } else {
+            aspects_str.split('.').collect()
+        };
+        match c.app_link_open(hash, app, &aspects) {
             Ok(()) => 0,
             Err(e) => {
                 set_error(e);
@@ -895,6 +958,27 @@ pub extern "C" fn lxmf_app_link_register_reconnect(
             }
         };
         match lxmf::router_register_app_link_reconnect_handler(c.router_handle, &aspect) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Notify the router that the host's network reachability state has
+/// changed (interface up/down, Wi-Fi ↔ cellular, etc.).
+///
+/// Triggers ONE fresh app-link establishment attempt for every registered
+/// app-link that is not currently active or establishing. The router does
+/// not retry on its own — call this from a network-state observer.
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_network_changed(client: u64) -> i32 {
+    with_client!(client, c, {
+        match lxmf::router_app_link_network_changed(c.router_handle) {
             Ok(()) => 0,
             Err(e) => {
                 set_error(e);

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL, ALLOW_LIST, PROVE_ALL};
 use reticulum_rust::identity::{Identity, HASHLENGTH, TRUNCATED_HASHLENGTH};
-use reticulum_rust::link::{Link, LinkHandle, register_runtime_link_handle};
+use reticulum_rust::link::{Link, LinkHandle};
 use reticulum_rust::packet::Packet;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::resource::{Resource, ResourceStatus};
@@ -63,6 +63,52 @@ pub struct AvailableTickets {
 	pub last_deliveries: HashMap<Vec<u8>, f64>,
 }
 
+/// Per-destination spec for an app-link the host has asked the router to keep
+/// open. Carries the app/aspects tuple so re-establishment after teardown can
+/// resolve the destination identity correctly (this used to be hardcoded to
+/// `lxmf.delivery`, which silently broke rfed.channel and rfed.notify links).
+///
+/// Reconnect policy (deliberately quiet — we never speculatively retry an
+/// offline destination):
+///   * `app_link_open`  — one attempt at registration.
+///   * Link closes after never having reached ACTIVE   → no immediate retry.
+///   * Link closes after having been ACTIVE            → no immediate retry.
+///   * Announce arrives for the destination            → one attempt.
+///   * Host signals a network-state change             → one attempt.
+///
+/// `attempt_in_flight` is the only gate: set when an `establish_app_link`
+/// attempt starts, cleared by the link-established callback (success) or the
+/// link-closed callback (failure / teardown). External triggers consult this
+/// flag and skip the spawn if an attempt is already underway, so duplicate
+/// triggers (e.g. announce + network-change in the same second) collapse to a
+/// single LR.
+#[derive(Clone, Debug)]
+pub struct AppLinkSpec {
+	pub app_name: String,
+	pub aspects: Vec<String>,
+	/// True from the moment `establish_app_link` decides to attempt until the
+	/// link callback fires (either established or closed). Wrapped in Arc so
+	/// the callbacks can clear it without holding the router mutex.
+	pub attempt_in_flight: Arc<std::sync::atomic::AtomicBool>,
+	/// True once this link has reached ACTIVE at least once since open. Used
+	/// only for log clarity — does not gate retries (we never auto-retry).
+	pub ever_established: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AppLinkSpec {
+	pub fn new(app_name: impl Into<String>, aspects: Vec<String>) -> Self {
+		Self {
+			app_name: app_name.into(),
+			aspects,
+			attempt_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+			ever_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		}
+	}
+	pub fn aspect_strs(&self) -> Vec<&str> {
+		self.aspects.iter().map(|s| s.as_str()).collect()
+	}
+}
+
 pub struct LXMRouter {
 	pub pending_inbound: Vec<Vec<u8>>,
 	pub pending_outbound: Vec<Arc<Mutex<LXMessage>>>,
@@ -98,6 +144,10 @@ pub struct LXMRouter {
 	/// was created. Used to detect stuck-pending links and force a teardown so
 	/// the next sync request can establish a fresh link.
 	pub outbound_propagation_link_created_at: Option<f64>,
+	/// link_id of the propagation link on which we have already issued an
+	/// `identify`. Used to avoid sending a fresh `identify` packet on every
+	/// poll cycle when the link is already up.
+	pub outbound_propagation_link_identified_id: Option<Vec<u8>>,
 
 	pub message_storage_limit: Option<u64>,
 	pub information_storage_limit: Option<u64>,
@@ -161,8 +211,12 @@ pub struct LXMRouter {
 	pub watched_destinations: HashSet<Vec<u8>>,
 	/// Destinations the app has opened for pre-connection (chat screen visible).
 	/// Links for these destinations are established proactively and exempt from
-	/// inactivity cleanup.  No automatic re-establishment on failure.
-	pub app_links: HashSet<Vec<u8>>,
+	/// inactivity cleanup. The value carries the app/aspects tuple needed to
+	/// resolve the destination identity when (re)establishing the link — without
+	/// this, every app-link would be opened against `lxmf.delivery` regardless of
+	/// the actual destination aspect (rfed.channel, rfed.notify, etc.) and the
+	/// link request would never reach ACTIVE on a non-LXMF target.
+	pub app_links: HashMap<Vec<u8>, AppLinkSpec>,
 	pub self_handle: Option<Weak<Mutex<LXMRouter>>>,
 	/// Fires when an outbound message changes delivery state.
 	/// Args: message hash bytes, new state byte (LXMessage::DELIVERED etc.).
@@ -311,6 +365,7 @@ impl LXMRouter {
 			outbound_propagation_node: None,
 			outbound_propagation_link: None,
 			outbound_propagation_link_created_at: None,
+			outbound_propagation_link_identified_id: None,
 			message_storage_limit: None,
 			information_storage_limit: None,
 			propagation_per_transfer_limit: propagation_limit,
@@ -363,7 +418,7 @@ impl LXMRouter {
 			announce_callback: None,
 			sync_complete_callback: None,
 			watched_destinations: HashSet::new(),
-			app_links: HashSet::new(),
+			app_links: HashMap::new(),
 			self_handle: None,
 			message_state_callback: None,
 			outbound_wake_tx,
@@ -832,6 +887,7 @@ impl LXMRouter {
 		}
 		self.outbound_propagation_link = None;
 		self.outbound_propagation_link_created_at = None;
+		self.outbound_propagation_link_identified_id = None;
 		self.acknowledge_sync_completion(None);
 	}
 
@@ -1204,12 +1260,22 @@ impl LXMRouter {
 														log("[POB] Direct delivery link ESTABLISHED", LOG_NOTICE, false, false);
 														let _ = wake_tx.send(());
 													})));
-													if let Err(e) = handle.initiate() {
-														log(&format!("[POB][{}] DIRECT link initiate failed: {}", message_label, e), LOG_ERROR, false, false);
-														continue;
-													}
-													register_runtime_link_handle(handle.clone());
-													self.direct_links.insert(dest_hash.clone(), handle);
+													// Initiate runs on a background thread so we don't
+													// hold the router mutex across the link-actor
+													// round-trip + Transport::outbound. Runtime
+													// registration now happens INSIDE the actor's
+													// LinkMsg::Initiate handler (after the real
+													// link_id is derived) so callers must not
+													// pre-register the handle here — doing so would
+													// register under the placeholder id and break
+													// LINKPROOF dispatch.
+													self.direct_links.insert(dest_hash.clone(), handle.clone());
+													let label_for_thread = message_label.to_string();
+													std::thread::spawn(move || {
+														if let Err(e) = handle.initiate() {
+															log(&format!("[POB][{}] DIRECT link initiate failed: {}", label_for_thread, e), LOG_ERROR, false, false);
+														}
+													});
 													lxm.progress = 0.03;
 												}
 												Err(e) => {
@@ -1325,9 +1391,15 @@ impl LXMRouter {
 																}
 															}
 														})));
-														let _ = link_handle.initiate();
-														reticulum_rust::link::register_runtime_link_handle(link_handle.clone());
-														self.outbound_propagation_link = Some(link_handle);
+														// Initiate runs on a background thread.
+														// The link actor registers the runtime handle
+														// itself (after deriving the real link_id);
+														// caller must not pre-register or LINKPROOF
+														// dispatch will be keyed off the placeholder.
+																self.outbound_propagation_link = Some(link_handle.clone());
+																std::thread::spawn(move || {
+																	let _ = link_handle.initiate();
+																});
 													} else {
 														log("Could not establish propagation link", LOG_ERROR, false, false);
 													}
@@ -1825,7 +1897,7 @@ impl LXMRouter {
 		for (link_hash, link_arc) in self.direct_links.iter() {
 			// Skip inactivity cleanup for app_links — their lifetime is
 			// managed explicitly by app_link_open / app_link_close.
-			if self.app_links.contains(link_hash.as_slice()) {
+			if self.app_links.contains_key(link_hash.as_slice()) {
 				continue;
 			}
 			if link_arc.no_data_for().map(|n| n as f64 > Self::LINK_MAX_INACTIVITY).unwrap_or(false) {
@@ -1863,6 +1935,7 @@ impl LXMRouter {
 		if should_clear {
 			self.outbound_propagation_link = None;
 			self.outbound_propagation_link_created_at = None;
+			self.outbound_propagation_link_identified_id = None;
 			if self.propagation_transfer_state == Self::PR_COMPLETE {
 				self.acknowledge_sync_completion(None);
 			} else if self.propagation_transfer_state < Self::PR_LINK_ESTABLISHED {
@@ -2470,10 +2543,18 @@ impl LXMRouter {
 				}
 				self.outbound_propagation_link = None;
 				self.outbound_propagation_link_created_at = None;
+				self.outbound_propagation_link_identified_id = None;
 			}
 		}
 
-		// Proactively request the path so it is available before the first sync attempt
+		// Proactively request the path so it is available before the first sync attempt.
+		//
+		// `Transport::request_path` calls `Packet::send` → `Transport::outbound`,
+		// which spinwait/sleeps for transport-job pacing.  We are still holding
+		// the router `&mut self` lock here — performing the blocking request
+		// inline freezes every other router caller (most visibly the UI
+		// thread polling `app_link_status()`).  Defer to a background thread
+		// so the router lock is released as soon as state is updated.
 		if !Transport::has_path(&destination_hash) {
 			log(
 				&format!(
@@ -2484,7 +2565,10 @@ impl LXMRouter {
 				false,
 				false,
 			);
-			Transport::request_path(&destination_hash, None, None, None, None);
+			let dh = destination_hash.clone();
+			std::thread::spawn(move || {
+				Transport::request_path(&dh, None, None, None, None);
+			});
 		}
 
 		Ok(())
@@ -2684,9 +2768,10 @@ impl LXMRouter {
 
 	/// Open an app link for a destination.
 	///
-	/// Adds the destination to the `app_links` set, ensures it is watched at
-	/// both LXMF and transport levels, and kicks off path request / link
-	/// establishment as far as current state allows.  Returns immediately.
+	/// Adds the destination to the `app_links` map (with its app/aspects so we
+	/// can resolve the right identity on every (re)establishment), ensures it
+	/// is watched at both LXMF and transport levels, and kicks off path request
+	/// / link establishment as far as current state allows.  Returns immediately.
 	///
 	/// If a path is already known, the link is initiated inline.  If not,
 	/// a path request is sent; the announce handler will establish the link
@@ -2696,8 +2781,14 @@ impl LXMRouter {
 	/// becomes `APP_LINK_DISCONNECTED`; it will be re-established automatically
 	/// when the next announce arrives from the destination (push-driven via
 	/// `watched_destinations`).
-	pub fn app_link_open(&mut self, dest_hash: &[u8]) {
-		self.app_links.insert(dest_hash.to_vec());
+	pub fn app_link_open(&mut self, dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
+		let spec = AppLinkSpec::new(
+			app_name,
+			aspects.iter().map(|s| (*s).to_string()).collect(),
+		);
+		// Insert/replace spec — re-opening with new aspects is allowed and
+		// resets the backoff state since the host explicitly asked for it.
+		self.app_links.insert(dest_hash.to_vec(), spec);
 		self.watched_destinations.insert(dest_hash.to_vec());
 		Transport::watch_announce(dest_hash.to_vec());
 
@@ -2766,7 +2857,7 @@ impl LXMRouter {
 	///   3 = link active (ready to send),
 	///   4 = disconnected (will reconnect on next announce).
 	pub fn app_link_status(&self, dest_hash: &[u8]) -> u8 {
-		if !self.app_links.contains(dest_hash) {
+		if !self.app_links.contains_key(dest_hash) {
 			return Self::APP_LINK_NONE;
 		}
 
@@ -2814,7 +2905,20 @@ impl LXMRouter {
 	///
 	/// Assumes path exists.  The link-established callback wakes the outbound
 	/// processing thread so any queued messages are sent immediately.
+	///
+	/// Single-attempt policy: if a previous attempt is still in flight (LR
+	/// sent, no callback yet), this is a no-op so duplicate triggers
+	/// (announce + network-change in the same second, etc.) do not stack
+	/// multiple LRs at the same destination.
 	pub fn establish_app_link(&mut self, dest_hash: &[u8]) {
+		// Already in flight from a recent trigger? Skip.
+		if let Some(spec) = self.app_links.get(dest_hash) {
+			if spec.attempt_in_flight.load(std::sync::atomic::Ordering::Relaxed) {
+				log(&format!("[APP_LINK] establish skipped for {} — attempt already in flight",
+					hexrep(dest_hash, false)), LOG_NOTICE, false, false);
+				return;
+			}
+		}
 		// Check if an existing link is still alive — if so, leave it alone.
 		// Must also check STATE_HANDSHAKE: a link transitions PENDING→HANDSHAKE
 		// during crypto setup before becoming ACTIVE.  Without this check a
@@ -2847,10 +2951,24 @@ impl LXMRouter {
 			&format!("[APP_LINK] Establishing link to {}", hexrep(dest_hash, false)),
 			LOG_NOTICE, false, false,
 		);
-		let destination = match Destination::from_destination_hash(dest_hash, "lxmf", &["delivery"]) {
+		// Look up the spec we recorded in app_link_open. Without this we'd
+		// fall back to ("lxmf","delivery") for every destination, which is
+		// wrong for rfed.channel / rfed.notify / any non-LXMF aspect and
+		// causes the LR to fail silently → 18s teardown loop.
+		let (app_name, aspect_strs): (String, Vec<String>) = match self.app_links.get(dest_hash) {
+			Some(spec) => (spec.app_name.clone(), spec.aspects.clone()),
+			None => {
+				log(&format!("[APP_LINK] establish_app_link called for unknown dest {}",
+					hexrep(dest_hash, false)), LOG_ERROR, false, false);
+				return;
+			}
+		};
+		let aspect_refs: Vec<&str> = aspect_strs.iter().map(|s| s.as_str()).collect();
+		let destination = match Destination::from_destination_hash(dest_hash, &app_name, &aspect_refs) {
 			Ok(d) => d,
 			Err(e) => {
-				log(&format!("[APP_LINK] Destination resolve failed: {}", e), LOG_ERROR, false, false);
+				log(&format!("[APP_LINK] Destination resolve failed ({}/{}): {}",
+					app_name, aspect_strs.join("."), e), LOG_ERROR, false, false);
 				return;
 			}
 		};
@@ -2858,10 +2976,23 @@ impl LXMRouter {
 			Ok(link) => {
 				let link_handle = LinkHandle::spawn(link);
 				let wake_tx = self.outbound_wake_tx.clone();
+				// Pull shared flags from the spec so the callbacks can flip them
+				// without ever touching the router mutex (callbacks run on the
+				// link actor thread).
+				let (in_flight, ever_established) = self
+					.app_links
+					.get(dest_hash)
+					.map(|s| (s.attempt_in_flight.clone(), s.ever_established.clone()))
+					.expect("app_links entry exists — checked above");
+				// Mark attempt as in flight. Cleared on either callback.
+				in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
 				// Track whether the link ever became ACTIVE so the closed callback
 				// can distinguish a clean teardown from a failed establishment.
 				let was_established = Arc::new(std::sync::atomic::AtomicBool::new(false));
 				let was_established_closed = was_established.clone();
+				let in_flight_estab = in_flight.clone();
+				let in_flight_closed = in_flight.clone();
+				let ever_established_estab = ever_established.clone();
 				// Defence-in-depth: Link::teardown() in Reticulum-rust is
 				// idempotent in *state* but NOT in callback firing — every call
 				// re-invokes link_closed() even when the link is already CLOSED.
@@ -2872,14 +3003,27 @@ impl LXMRouter {
 				link_handle.set_link_established_callback(Some(Arc::new(move |_| {
 					log("[APP_LINK] Direct link ESTABLISHED", LOG_NOTICE, false, false);
 					was_established.store(true, std::sync::atomic::Ordering::Relaxed);
+					ever_established_estab.store(true, std::sync::atomic::Ordering::Relaxed);
+					in_flight_estab.store(false, std::sync::atomic::Ordering::Relaxed);
 					let _ = wake_tx.send(());
 				})));
+				// Capture a weak router handle so the post-active retry path can
+				// reach back into the router without holding any lock here.
+				let router_weak_closed = self.self_handle.clone();
 				// If the link closes without ever reaching ACTIVE the cached path is
 				// stale (route died but TTL hasn't expired).  Expire it now and
-				// request a fresh one so the next app_link_open attempt goes through
-				// the normal path-discovery flow instead of waiting up to 6 hours for
-				// the next server announce.
+				// request a fresh one so the next *trigger* (announce / network
+				// change) can attempt one fresh LR — we deliberately do NOT
+				// re-establish here ourselves on a never-active link.
+				//
+				// If the link was ACTIVE and then dropped, fire ONE automatic
+				// re-establishment attempt per the policy "single try after a
+				// successful link fails".  Further retries require an external
+				// trigger (announce / network change / explicit open).
 				link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
+					// Always release the in-flight flag so the next external
+					// trigger is allowed to attempt one new LR.
+					in_flight_closed.store(false, std::sync::atomic::Ordering::Relaxed);
 					if closed_fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
 						return; // already handled — ignore subsequent fires
 					}
@@ -2891,18 +3035,125 @@ impl LXMRouter {
 						);
 						Transport::expire_path(&dest_for_closed);
 						Transport::request_path(&dest_for_closed, None, None, None, None);
+					} else {
+						log(
+							&format!("[APP_LINK] Link torn down after being ACTIVE for {} — single auto-retry",
+								hexrep(&dest_for_closed, false)),
+							LOG_NOTICE, false, false,
+						);
+						// Spawn so we don't lock the router on the link-actor thread.
+						let dest_retry = dest_for_closed.clone();
+						let router_weak_retry = router_weak_closed.clone();
+						std::thread::spawn(move || {
+							if let Some(arc) = router_weak_retry.and_then(|w| w.upgrade()) {
+								if let Ok(mut router) = arc.lock() {
+									router.establish_app_link(&dest_retry);
+								}
+							}
+						});
 					}
 				})));
-				if let Err(e) = link_handle.initiate() {
-					log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
-					return;
-				}
-				register_runtime_link_handle(link_handle.clone());
-				self.direct_links.insert(dest_hash.to_vec(), link_handle);
+				// Initiate on a background thread so we don't hold the router
+				// mutex across the link-actor round-trip + Transport::outbound.
+				// The actor itself registers the runtime handle once the real
+				// link_id is derived; we MUST NOT pre-register here or the
+				// registry entry would be keyed by the placeholder link_id and
+				// the LINKPROOF would never find this handle.
+				self.direct_links.insert(dest_hash.to_vec(), link_handle.clone());
+				let in_flight_spawn = in_flight.clone();
+				std::thread::spawn(move || {
+					if let Err(e) = link_handle.initiate() {
+						log(&format!("[APP_LINK] Link initiate failed: {}", e), LOG_ERROR, false, false);
+						// initiate() failed before the link reached the actor's
+						// callback path — release the gate so the next trigger
+						// can attempt one fresh LR.
+						in_flight_spawn.store(false, std::sync::atomic::Ordering::Relaxed);
+					}
+				});
 			}
 			Err(e) => {
 				log(&format!("[APP_LINK] Link::new_outbound failed: {}", e), LOG_ERROR, false, false);
+				// Match-arm error: clear the gate we set above (only set when
+				// new_outbound succeeded, so this is a no-op otherwise but kept
+				// here as defensive cleanup if future changes flip the order).
+				if let Some(spec) = self.app_links.get(dest_hash) {
+					spec.attempt_in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
+				}
 			}
+		}
+	}
+
+	// ─── App-link external triggers ────────────────────────────────────────
+	//
+	// The router NEVER speculatively retries an offline destination.  A new
+	// `establish_app_link` attempt only happens when one of these triggers
+	// fires:
+	//
+	//   * `app_link_open(...)`           — host explicitly opens / re-opens.
+	//   * `app_link_announce_received`   — destination announced (push).
+	//   * `app_link_network_changed`     — host signalled network state flip.
+	//   * post-ACTIVE drop               — exactly ONE automatic retry fired
+	//                                      from the link_closed callback when
+	//                                      a link that previously reached
+	//                                      ACTIVE goes down.  Further attempts
+	//                                      require one of the triggers above.
+	//
+	// The `attempt_in_flight` flag in `AppLinkSpec` collapses overlapping
+	// triggers to a single LR.
+
+	/// Trigger one fresh app-link attempt for `dest_hash` on the strength of
+	/// a fresh announce. No-op if no entry exists, link is already
+	/// active/establishing, or an attempt is already in flight.
+	pub fn app_link_announce_received(&mut self, dest_hash: &[u8]) {
+		if !self.app_links.contains_key(dest_hash) {
+			return;
+		}
+		match self.app_link_status(dest_hash) {
+			Self::APP_LINK_ACTIVE | Self::APP_LINK_ESTABLISHING => return,
+			_ => {}
+		}
+		log(&format!("[APP_LINK] announce trigger → attempting {}",
+			hexrep(dest_hash, false)), LOG_NOTICE, false, false);
+		self.establish_app_link(dest_hash);
+	}
+
+	/// Trigger one fresh attempt for every app-link that is not currently
+	/// active/establishing. Call from the host when network reachability
+	/// changes (interface up/down, Wi-Fi↔cellular, etc.).
+	///
+	/// Destinations without a known path get a path request instead of an
+	/// LR — issuing an LR with no path entry sends the request into the void
+	/// and consumes the trigger for nothing. The watch_announce installed by
+	/// `app_link_open` will automatically fire `app_link_announce_received`
+	/// when the path resolves, so establishment still happens — just driven
+	/// by the announce rather than by this trigger.
+	pub fn app_link_network_changed(&mut self) {
+		let candidates: Vec<Vec<u8>> = self
+			.app_links
+			.keys()
+			.filter(|h| {
+				let s = self.app_link_status(h);
+				s != Self::APP_LINK_ACTIVE && s != Self::APP_LINK_ESTABLISHING
+			})
+			.cloned()
+			.collect();
+		if candidates.is_empty() {
+			return;
+		}
+		let (with_path, without_path): (Vec<_>, Vec<_>) = candidates
+			.into_iter()
+			.partition(|d| Transport::has_path(d));
+		if !with_path.is_empty() {
+			log(&format!("[APP_LINK] network-change trigger → attempting {} link(s)",
+				with_path.len()), LOG_NOTICE, false, false);
+			for dest in with_path {
+				self.establish_app_link(&dest);
+			}
+		}
+		for dest in without_path {
+			log(&format!("[APP_LINK] network-change: no path → requesting for {}",
+				hexrep(&dest, false)), LOG_NOTICE, false, false);
+			Transport::request_path(&dest, None, None, None, None);
 		}
 	}
 
@@ -3321,7 +3572,7 @@ impl LXMRouter {
 		// app-link control plane and (b) risk firing expire_path on a healthy
 		// path if the link had not yet reached ACTIVE.  Leave it alone — the
 		// backchannel will still be recorded below for use as an alternate path.
-		if !self.app_links.contains(destination_hash.as_slice()) {
+		if !self.app_links.contains_key(destination_hash.as_slice()) {
 			if let Some(old_link) = self.direct_links.remove(&destination_hash) {
 				log(
 					&format!(
@@ -3671,6 +3922,18 @@ impl LXMRouter {
 			self.propagation_transfer_state,
 		), LOG_NOTICE, false, false);
 
+		// If a sync is already in flight on the existing link, don't issue
+		// another `message_list` request — wait for the in-flight one to
+		// complete (or its callbacks to time out) before re-entering.
+		if matches!(
+			self.propagation_transfer_state,
+			Self::PR_REQUEST_SENT | Self::PR_RECEIVING
+		) {
+			log(&format!("[PSYNC] sync already in flight (state=0x{:02x}), skipping",
+				self.propagation_transfer_state), LOG_NOTICE, false, false);
+			return;
+		}
+
 		if let Some(link_arc) = self.outbound_propagation_link.clone() {
 			let link_status = link_arc.status();
 			log(&format!("[PSYNC] existing link status={}", link_status), LOG_NOTICE, false, false);
@@ -3700,12 +3963,26 @@ impl LXMRouter {
 			if link_is_active {
 				self.propagation_transfer_state = Self::PR_LINK_ESTABLISHED;
 
-				// Identify ourselves on the link before requesting messages
-				log(&format!("[PSYNC] identify: link_id={}",
-					reticulum_rust::hexrep(&link_arc.link_id(), false)), LOG_NOTICE, false, false);
-				match link_arc.identify(&identity) {
-					Ok(_) => log("[PSYNC] identify sent OK", LOG_NOTICE, false, false),
-					Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
+				// Identify ourselves on the link before requesting messages —
+				// but only once per link. Re-identifying on every poll cycle
+				// produces redundant network traffic and log spam (the
+				// remote already knows who we are after the first identify).
+				let current_link_id = link_arc.link_id();
+				let already_identified = self
+					.outbound_propagation_link_identified_id
+					.as_ref()
+					.map(|id| id == &current_link_id)
+					.unwrap_or(false);
+				if !already_identified {
+					log(&format!("[PSYNC] identify: link_id={}",
+						reticulum_rust::hexrep(&current_link_id, false)), LOG_NOTICE, false, false);
+					match link_arc.identify(&identity) {
+						Ok(_) => {
+							log("[PSYNC] identify sent OK", LOG_NOTICE, false, false);
+							self.outbound_propagation_link_identified_id = Some(current_link_id);
+						}
+						Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
+					}
 				}
 
 				link_arc.set_packet_callback(Some(Arc::new({
@@ -3776,13 +4053,18 @@ impl LXMRouter {
 								}
 							}
 						})));
-						if let Err(e) = handle.initiate() {
-							log(&format!("Failed to initiate propagation link: {}", e), LOG_ERROR, false, false);
-						} else {
-							register_runtime_link_handle(handle.clone());
-							self.outbound_propagation_link = Some(handle);
-							self.outbound_propagation_link_created_at = Some(now());
-						}
+						// Run the (potentially blocking) initiate on a background
+						// thread so we don't hold `&mut self` across the link-actor
+						// round-trip. The actor registers the runtime handle
+						// itself after deriving the real link_id; pre-registering
+						// here would key the registry off the placeholder id.
+						self.outbound_propagation_link = Some(handle.clone());
+						self.outbound_propagation_link_created_at = Some(now());
+						std::thread::spawn(move || {
+							if let Err(e) = handle.initiate() {
+								log(&format!("Failed to initiate propagation link: {}", e), LOG_ERROR, false, false);
+							}
+						});
 					}
 				}
 			}

@@ -168,8 +168,13 @@ impl LxmfClient {
     // App links
     // -------------------------------------------------------------------
 
-    pub fn app_link_open(&self, dest_hash: &[u8]) -> Result<(), String> {
-        lxmf::router_app_link_open(self.router_handle, dest_hash)
+    pub fn app_link_open(
+        &self,
+        dest_hash: &[u8],
+        app_name: &str,
+        aspects: &[&str],
+    ) -> Result<(), String> {
+        lxmf::router_app_link_open(self.router_handle, dest_hash, app_name, aspects)
     }
 
     pub fn app_link_close(&self, dest_hash: &[u8]) -> Result<(), String> {
@@ -189,12 +194,44 @@ impl LxmfClient {
         lxmf::router_app_link_get_handle(self.router_handle, dest_hash)
     }
 
+    /// Notify the router that the host's network reachability state has
+    /// changed (interface up/down, Wi-Fi ↔ cellular, etc.). Triggers one
+    /// fresh app-link establishment attempt for every registered link not
+    /// currently active or establishing. Safe to call repeatedly.
+    pub fn app_link_network_changed(&self) -> Result<(), String> {
+        lxmf::router_app_link_network_changed(self.router_handle)
+    }
+
     // -------------------------------------------------------------------
     // Announce
     // -------------------------------------------------------------------
 
     pub fn announce(&self) -> Result<(), String> {
         lxmf::router_announce(self.router_handle, &self.dest_hash)
+    }
+
+    /// Opt this client's delivery destination into Transport's announce
+    /// daemon. Once published, Transport automatically re-announces:
+    ///   * on every false→true `online` transition of any interface, and
+    ///   * every `refresh_secs` seconds (pass `0.0` to disable periodic
+    ///     refresh and only re-announce on interface up-edges).
+    ///
+    /// This replaces the per-app pattern of running a 30-min Timer +
+    /// announce-on-network-reconnect + announce-on-foreground.
+    pub fn publish(&self, refresh_secs: f64) -> Result<(), String> {
+        reticulum_rust::ffi::transport_publish_destination(
+            &self.dest_hash,
+            refresh_secs,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Remove this client's delivery destination from the announce
+    /// daemon's published set.
+    pub fn unpublish(&self) -> Result<(), String> {
+        reticulum_rust::ffi::transport_unpublish_destination(&self.dest_hash);
+        Ok(())
     }
 
     pub fn watch_destination(&self, dest_hash: &[u8]) -> Result<(), String> {
