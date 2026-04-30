@@ -1118,16 +1118,43 @@ pub extern "C" fn lxmf_app_link_request_async(
             cb(ctx_fail.0, std::ptr::null(), 0, 2);
         });
 
-    if let Err(e) = link_handle.request(
-        path_str,
-        payload_vec,
-        Some(response_cb),
-        Some(failed_cb),
-        None,
-    ) {
-        set_error(format!("link.request failed: {:?}", e));
-        return -1;
-    }
+    // Spawn the synchronous `link_handle.request(...)` onto a worker
+    // thread so this FFI never blocks the caller. `LinkHandle::request`
+    // does an actor RPC (oneshot recv) to ack that the request packet
+    // was queued — fast in steady state, but on a busy/slow link it can
+    // park for hundreds of ms. If the caller is at User-interactive QoS
+    // (e.g. Swift main actor) and the link actor is at Default QoS, the
+    // wait becomes a priority inversion (Thread Performance Checker
+    // flagged this in production logs).
+    // // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    //
+    // The host callback is fired on whichever thread the response/failed
+    // callback runs on (the link actor); spawning here only off-loads
+    // the *send* path, not the response path.
+    let fired_send_err = fired.clone();
+    let ctx_send_err = ctx.clone();
+    let link_for_send = link_handle.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = link_for_send.request(
+            path_str,
+            payload_vec,
+            Some(response_cb),
+            Some(failed_cb),
+            None,
+        ) {
+            // Send failed before the request was queued — fire the
+            // callback with status=2 (failed) so the caller resumes.
+            // Single-fire latch shared with response/failed/timeout.
+            if !fired_send_err.swap(true, Ordering::SeqCst) {
+                cb(ctx_send_err.0, std::ptr::null(), 0, 2);
+            }
+            // Also stash the error for diagnostics — note: set_error
+            // uses thread-local storage so it's only visible to a
+            // subsequent call from this same worker, not the caller.
+            // The status=2 callback is the authoritative signal.
+            set_error(format!("link.request failed: {:?}", e));
+        }
+    });
 
     // Detached timeout watcher — fires the callback with status=1 if the
     // request hasn't completed by the deadline. The single-fire latch
