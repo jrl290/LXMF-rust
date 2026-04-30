@@ -129,6 +129,24 @@ pub type LxmfAppLinkStatusCallback = extern "C" fn(
     status: u8,
 );
 
+/// APP_LINK request completion callback (async variant).
+///
+/// Fires exactly once per `lxmf_app_link_request_async` invocation.
+///
+/// `status` is one of:
+///   * 0 = success — `bytes`/`bytes_len` describe the response payload.
+///         The pointer is only valid for the duration of the callback;
+///         copy before returning.
+///   * 1 = timeout
+///   * 2 = failed (peer rejected / link torn down before response)
+///   * 3 = error (link not active, invalid args; check `lxmf_last_error`)
+pub type LxmfAppLinkRequestCallback = extern "C" fn(
+    context: *mut std::ffi::c_void,
+    bytes: *const u8,
+    bytes_len: u32,
+    status: i32,
+);
+
 // =========================================================================
 // Library-level
 // =========================================================================
@@ -972,6 +990,159 @@ pub extern "C" fn lxmf_app_link_request(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Non-blocking variant of `lxmf_app_link_request`.
+///
+/// Issues a request on the existing app-link to `dest_hash` and fires
+/// `callback(context, bytes, bytes_len, status)` exactly once when the
+/// response arrives, the request fails, or `timeout_secs` elapses.
+///
+/// Returns 0 on success (callback will fire), -1 on immediate error
+/// (invalid args, no link, link not active — callback will NOT fire;
+/// check `lxmf_last_error`).
+///
+/// This is the preferred entry point for Swift/Kotlin callers that want
+/// to await the response from a structured-concurrency context without
+/// parking a cooperative-pool thread on a synchronous mpmc receive.
+/// See DESIGN_PRINCIPLES.md §1: synchronous blocking from cooperative
+/// threads is a priority-inversion hazard.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_request_async(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    path: *const c_char,
+    payload: *const u8,
+    payload_len: u32,
+    timeout_secs: f64,
+    callback: LxmfAppLinkRequestCallback,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let hash = if dest_hash.is_null() || dest_len == 0 {
+        set_error("null dest hash");
+        return -1;
+    } else {
+        unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+    };
+    let path_str = if path.is_null() {
+        set_error("null path");
+        return -1;
+    } else {
+        unsafe {
+            match std::ffi::CStr::from_ptr(path).to_str() {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    set_error("path is not valid UTF-8");
+                    return -1;
+                }
+            }
+        }
+    };
+    let payload_vec: Vec<u8> = if payload.is_null() || payload_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(payload, payload_len as usize) }.to_vec()
+    };
+
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return -1;
+        }
+    };
+    let link_handle = {
+        let guard = arc.lock().unwrap();
+        match guard.app_link_get_handle(hash) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                set_error("no app-link to destination — call lxmf_app_link_open first");
+                return -1;
+            }
+            Err(e) => {
+                set_error(e);
+                return -1;
+            }
+        }
+    };
+    if link_handle.status() != reticulum_rust::link::STATE_ACTIVE {
+        set_error(format!(
+            "app-link not active (status={}) — wait for APP_LINK_ACTIVE before requesting",
+            link_handle.status()
+        ));
+        return -1;
+    }
+
+    // The C callback context is opaque to us; wrap it in a Send/Sync
+    // newtype so we can move it into the request callbacks AND a timeout
+    // thread without the compiler complaining about raw-pointer Send.
+    // We hand it out behind Arc so the closure captures the whole wrapper
+    // (whose auto traits we control), not the bare *mut c_void field —
+    // disjoint-capture would otherwise pick up only `ctx.0` and fail
+    // Send/Sync inference.
+    struct CtxPtr(*mut std::ffi::c_void);
+    unsafe impl Send for CtxPtr {}
+    unsafe impl Sync for CtxPtr {}
+    let ctx = Arc::new(CtxPtr(context));
+    let cb = callback;
+
+    // Single-fire latch: the request might complete twice (response then
+    // failed, or failed then timeout) and the host callback must fire
+    // exactly once.
+    let fired = Arc::new(AtomicBool::new(false));
+
+    let fired_ok = fired.clone();
+    let ctx_ok = ctx.clone();
+    let response_cb: Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync> =
+        Arc::new(move |receipt: reticulum_rust::link::RequestReceipt| {
+            if fired_ok.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            match receipt.response {
+                Some(ref data) => cb(ctx_ok.0, data.as_ptr(), data.len() as u32, 0),
+                None => cb(ctx_ok.0, std::ptr::null(), 0, 2),
+            }
+        });
+
+    let fired_fail = fired.clone();
+    let ctx_fail = ctx.clone();
+    let failed_cb: Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync> =
+        Arc::new(move |_receipt| {
+            if fired_fail.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            cb(ctx_fail.0, std::ptr::null(), 0, 2);
+        });
+
+    if let Err(e) = link_handle.request(
+        path_str,
+        payload_vec,
+        Some(response_cb),
+        Some(failed_cb),
+        None,
+    ) {
+        set_error(format!("link.request failed: {:?}", e));
+        return -1;
+    }
+
+    // Detached timeout watcher — fires the callback with status=1 if the
+    // request hasn't completed by the deadline. The single-fire latch
+    // makes this safe to race with response/failed callbacks.
+    let fired_to = fired.clone();
+    let ctx_to = ctx.clone();
+    let to_secs = timeout_secs.max(0.0);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs_f64(to_secs));
+        if !fired_to.swap(true, Ordering::SeqCst) {
+            cb(ctx_to.0, std::ptr::null(), 0, 1);
+        }
+    });
+
+    0
 }
 
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.

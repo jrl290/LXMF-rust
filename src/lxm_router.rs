@@ -230,7 +230,17 @@ impl LXMRouter {
 	pub const SYNC_LIMIT: f64 = Self::PROPAGATION_LIMIT * 40.0;
 	pub const DELIVERY_LIMIT: f64 = 1000.0;
 
-	pub const PR_PATH_TIMEOUT: f64 = 10.0;
+	/// Hard cap on the propagation-node path-request job. Aligned with
+	/// DESIGN_PRINCIPLES.md §1 send-latency budget: if Transport can't
+	/// produce a path in 5 s the propagation node is unreachable and we
+	/// abandon the sync attempt rather than spinning forever (observed
+	/// in retichat.log Apr 2026 as a 10 s [PSYNC] stall).
+	///
+	/// TODO(unify): the propagation link should eventually go through the
+	/// Reticulum-rust `AppLinks` registry so this special-cased path job
+	/// disappears entirely and the link reconnects via the same announce-
+	/// driven plumbing as every other app link.
+	pub const PR_PATH_TIMEOUT: f64 = 5.0;
 	/// Maximum time (seconds) a propagation-sync link may remain in
 	/// `STATE_PENDING` before it is considered stuck and forcibly torn down so
 	/// the next sync request can establish a fresh link with a fresh path.
