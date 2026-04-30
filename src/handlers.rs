@@ -64,13 +64,9 @@ pub fn delivery_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHandl
 				router.process_outbound();
 			}
 
-			// App links: if this destination is in app_links and no active
-			// link exists, establish one now that the path is available.
-			if router.app_links.contains_key(destination_hash)
-				&& router.peer_link_status(destination_hash) == 0
-			{
-				router.establish_app_link(destination_hash);
-			}
+			// App-link establishment on announce is handled by the
+			// reticulum_rust app_links registry's own announce hook
+			// (Phase 3), so nothing to do here.
 		}
 	});
 
@@ -181,12 +177,10 @@ pub fn app_link_reconnect_handler(
 		// across that round-trip serialised every other router caller — most
 		// visibly freezing the UI thread inside `app_link_status()` — and
 		// deadlocked when multiple back-to-back announces fired the handler.
-		let should_reconnect = match router.lock() {
-			Ok(router) => {
-				router.app_links.contains_key(destination_hash)
-					&& router.app_link_status(destination_hash) == LXMRouter::APP_LINK_DISCONNECTED
-			}
-			Err(_) => false,
+		let should_reconnect = {
+			use reticulum_rust::app_links::AppLinks;
+			AppLinks::contains(destination_hash)
+				&& AppLinks::status(destination_hash) == LXMRouter::APP_LINK_DISCONNECTED
 		};
 		if !should_reconnect {
 			return;

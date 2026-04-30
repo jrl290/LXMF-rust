@@ -118,6 +118,17 @@ pub type LxmfMessageStateCallback = extern "C" fn(
     state: u8,
 );
 
+/// APP_LINK status callback: fires whenever an APP_LINK transitions state.
+/// `dest_hash` is a pointer to the 16-byte destination hash; `hash_len` is 16.
+/// `status` is one of: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING,
+///   3=ACTIVE, 4=DISCONNECTED.
+pub type LxmfAppLinkStatusCallback = extern "C" fn(
+    context: *mut std::ffi::c_void,
+    dest_hash: *const u8,
+    hash_len: u32,
+    status: u8,
+);
+
 // =========================================================================
 // Library-level
 // =========================================================================
@@ -398,6 +409,43 @@ pub extern "C" fn lxmf_client_set_message_state_callback(
     });
 
     match guard.set_message_state_callback(adapter) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Register an APP_LINK status callback on the global registry.
+///
+/// The callback fires whenever an APP_LINK transitions state.  Multiple
+/// callbacks may be registered (each call appends one).  The callback is
+/// invoked from the link-actor thread and MUST NOT block — copy any data
+/// you need and dispatch off-thread.
+///
+/// Returns 0 on success, -1 on error (call `lxmf_last_error` for details).
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_register_status_callback(
+    client: u64,
+    callback: LxmfAppLinkStatusCallback,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return -1;
+        }
+    };
+    let guard = arc.lock().unwrap();
+
+    let ctx = SendPtr(context);
+    let adapter = Arc::new(move |hash: &[u8], status: u8| {
+        callback(ctx.ptr(), hash.as_ptr(), hash.len() as u32, status);
+    });
+
+    match guard.register_app_link_status_callback(adapter) {
         Ok(()) => 0,
         Err(e) => {
             set_error(e);
@@ -986,6 +1034,49 @@ pub extern "C" fn lxmf_app_link_network_changed(client: u64) -> i32 {
             }
         }
     })
+}
+
+/// Set the host lifecycle policy on the global app-link registry.
+///
+/// `policy`:
+///   * `0` = Foreground (default; full triggers active)
+///   * `1` = Background (hold links; suppress network-change retries and
+///     post-ACTIVE auto-retries; announces still establish)
+///   * `2` = Suspended (tear down all tracked links; suppress all triggers)
+///
+/// Returns 0 on success, -1 on error (invalid client handle or unknown policy).
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_set_policy(client: u64, policy: u8) -> i32 {
+    with_client!(client, c, {
+        match lxmf::router_app_link_set_policy(c.router_handle, policy) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Read the current host lifecycle policy. Returns the encoding documented
+/// for `lxmf_app_link_set_policy`, or `0xFF` on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_policy(client: u64) -> u8 {
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return 0xFF;
+        }
+    };
+    let c = arc.lock().unwrap();
+    match lxmf::router_app_link_policy(c.router_handle) {
+        Ok(p) => p,
+        Err(e) => {
+            set_error(e);
+            0xFF
+        }
+    }
 }
 
 /// Look up the cached display name for a destination hash.

@@ -591,6 +591,47 @@ pub fn router_app_link_network_changed(router_handle: u64) -> Result<(), String>
     Ok(())
 }
 
+/// Set the host lifecycle policy on the global app-link registry.
+///
+/// `policy` is one of:
+///   * `0` — Foreground (default; full triggers active)
+///   * `1` — Background (hold links; suppress network-change retries and
+///     post-ACTIVE auto-retries; announces still drive establishment)
+///   * `2` — Suspended (tear down all tracked links; suppress all triggers)
+///
+/// Returns `Err` on an unknown policy value.
+pub fn router_app_link_set_policy(router_handle: u64, policy: u8) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let p = match policy {
+        0 => reticulum_rust::app_links::LinkPolicy::Foreground,
+        1 => reticulum_rust::app_links::LinkPolicy::Background,
+        2 => reticulum_rust::app_links::LinkPolicy::Suspended,
+        other => return Err(format!("unknown link policy {}", other)),
+    };
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_set_policy(p);
+    Ok(())
+}
+
+/// Read the current host lifecycle policy.  Returns the same encoding as
+/// [`router_app_link_set_policy`].
+pub fn router_app_link_policy(router_handle: u64) -> Result<u8, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let p = router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_policy();
+    Ok(match p {
+        reticulum_rust::app_links::LinkPolicy::Foreground => 0,
+        reticulum_rust::app_links::LinkPolicy::Background => 1,
+        reticulum_rust::app_links::LinkPolicy::Suspended => 2,
+    })
+}
+
 /// Register a callback that fires when an outbound message changes delivery state.
 ///
 /// The callback receives the 16-byte message hash and the new state byte:
@@ -608,6 +649,28 @@ pub fn router_set_message_state_callback(
         .map_err(|e| e.to_string())?
         .register_message_state_callback(callback);
 
+    Ok(())
+}
+
+/// Register a callback that fires when an APP_LINK changes status.
+///
+/// The callback receives the destination hash and the new status byte:
+///   0 = NONE, 1 = PATH_REQUESTED, 2 = ESTABLISHING,
+///   3 = ACTIVE, 4 = DISCONNECTED.
+///
+/// Multiple callbacks may be registered.  Callbacks fire on whichever
+/// thread the underlying link callback runs on (link actor thread) and
+/// MUST NOT block.
+pub fn router_register_app_link_status_callback(
+    router_handle: u64,
+    callback: reticulum_rust::app_links::AppLinkStatusCallback,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .register_app_link_status_callback(callback);
     Ok(())
 }
 

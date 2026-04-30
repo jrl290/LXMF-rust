@@ -278,6 +278,24 @@ impl LxmfClient {
         lxmf::router_set_message_state_callback(self.router_handle, cb)
     }
 
+    /// Register a callback fired whenever an APP_LINK transitions status.
+    /// The callback is `(dest_hash, status)` where status is one of
+    /// `APP_LINK_NONE` (0), `APP_LINK_PATH_REQUESTED` (1),
+    /// `APP_LINK_ESTABLISHING` (2), `APP_LINK_ACTIVE` (3),
+    /// `APP_LINK_DISCONNECTED` (4).  Multiple callbacks may be registered.
+    pub fn register_app_link_status_callback(
+        &self,
+        cb: Arc<dyn Fn(&[u8], u8) + Send + Sync>,
+    ) -> Result<(), String> {
+        // Adapt the (hash, status, _link) registry callback to (hash, status).
+        let cb_outer = cb.clone();
+        let adapter: reticulum_rust::app_links::AppLinkStatusCallback =
+            std::sync::Arc::new(move |hash: &[u8], status: u8, _link| {
+                cb_outer(hash, status);
+            });
+        lxmf::router_register_app_link_status_callback(self.router_handle, adapter)
+    }
+
     // -------------------------------------------------------------------
     // Messages
     // -------------------------------------------------------------------
