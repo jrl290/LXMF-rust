@@ -2786,22 +2786,32 @@ impl LXMRouter {
 			app_name,
 			aspects.iter().map(|s| (*s).to_string()).collect(),
 		);
+
+		// Capture state BEFORE the spec insertion so we can distinguish
+		// "first-ever open" (status NONE — must kick off path request) from
+		// "subsequent piled-up open" (status PATH_REQUESTED — already in
+		// flight, must be a no-op). Without this, the three iOS startup
+		// callers (requestEssentialPaths, RfedNotify, APNsRegistrar) each
+		// fired their own Transport::request_path within the same second,
+		// producing the triple "[APP_LINK] No path → requesting" log
+		// clusters and 3× the path-request traffic.
+		let als_before = self.app_link_status(dest_hash);
+
 		// Insert/replace spec — re-opening with new aspects is allowed and
 		// resets the backoff state since the host explicitly asked for it.
 		self.app_links.insert(dest_hash.to_vec(), spec);
 		self.watched_destinations.insert(dest_hash.to_vec());
 		Transport::watch_announce(dest_hash.to_vec());
 
-		// If the link is already active or in the process of being established
-		// (PENDING, HANDSHAKE, or any other pre-ACTIVE state), leave it alone.
-		// Use app_link_status rather than peer_link_status: the latter returns 0
-		// for STATE_HANDSHAKE, which would incorrectly tear down a link that is
-		// mid-handshake and replace it with a fresh one on every announce.
+		// If the link is already active, mid-establishment, or a path
+		// request is already pending, leave it alone. PATH_REQUESTED
+		// naturally clears as soon as an announce arrives (which causes
+		// `establish_app_link` to fire), so this gate is self-healing.
+		if als_before == Self::APP_LINK_ACTIVE
+			|| als_before == Self::APP_LINK_ESTABLISHING
+			|| als_before == Self::APP_LINK_PATH_REQUESTED
 		{
-			let als = self.app_link_status(dest_hash);
-			if als == Self::APP_LINK_ACTIVE || als == Self::APP_LINK_ESTABLISHING {
-				return;
-			}
+			return;
 		}
 
 		// Clean any stale/closed link entry before trying fresh.
