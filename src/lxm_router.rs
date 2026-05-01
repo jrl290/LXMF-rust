@@ -1448,8 +1448,26 @@ impl LXMRouter {
 								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
 									lxm.delivery_attempts += 1;
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-									if lxm.delivery_attempts < Self::MAX_DELIVERY_ATTEMPTS {
-										if Transport::has_path(&node_hash) {
+									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+									//
+									// Do NOT re-introduce an inner
+									// `delivery_attempts < MAX_DELIVERY_ATTEMPTS`
+									// guard here. The OUTER guard
+									// (`<= MAX_DELIVERY_ATTEMPTS`) already
+									// caps total tries; an inner `<` check
+									// is off-by-one and means we *increment*
+									// attempts to N then refuse to actually
+									// try with that N, so the very try that
+									// would have used the just-arrived path
+									// is silently skipped and the message
+									// then fails with state=255.
+									// Reproducer: cold PROPAGATED send to
+									// the RFed-derived prop node — path
+									// arrives during the 7 s
+									// PATH_REQUEST_WAIT, but next POB tick
+									// bumps attempts to MAX, skips the
+									// link-establish branch, and §1 fires.
+									if Transport::has_path(&node_hash) {
 											// Identity presence check is implicit in the next line's recall
 											if let Some(identity) = Identity::recall(&node_hash) {
 												if let Ok(destination) = Destination::new_outbound(
@@ -1493,9 +1511,18 @@ impl LXMRouter {
 											}
 										} else {
 											Transport::request_path(&node_hash, None, None, None, None);
-											lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+											// Do NOT defer the next POB tick by
+											// PATH_REQUEST_WAIT (7 s) here.  Path
+											// resolution typically completes within
+											// 1-3 s; sleeping 7 s blows the §1 5 s
+											// budget and means we miss the
+											// just-arrived path on the next tick.
+											// 2 s (DELIVERY_RETRY_WAIT) lets the
+											// next POB pass re-check has_path and
+											// progress immediately.
+											lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 										}
-									}
 								} else {
 									// Not time to retry yet — leave in pending_outbound
 									log(
