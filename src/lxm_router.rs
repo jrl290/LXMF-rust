@@ -1032,14 +1032,32 @@ impl LXMRouter {
 
 				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 				//
-				// 5-second hard cap on the entire outbound pipeline.  If a
-				// message is still pending after 5 s, the transport layer is
-				// not making progress — fail loudly instead of spinning
-				// `delivery_attempts` for a minute behind the scenes while
-				// the user sees nothing.  A late "success" here is not a
-				// success; it is an upstream readiness/ordering bug that
-				// must be fixed (no path? no link? no propagation node? all
-				// caller errors per DESIGN_PRINCIPLES §1-§3).
+				// §1 is a DEVELOPER ASSERTION, not a production fallback.
+				//
+				// If a message sits in the outbound pipeline longer than
+				// SEND_LATENCY_LIMIT_SECS (5 s), some upstream component
+				// is broken — wrong ordering, missing readiness signal,
+				// silent retry loop, etc. The correct response is to
+				// FIX THE CODE, not to "gracefully" fail the message at
+				// runtime (which would just hide the bug).
+				//
+				// Therefore:
+				//   * debug builds  → panic. The crash report names the
+				//                     exact site that needs fixing.
+				//   * release builds → log loudly but DO NOT mutate
+				//                     state. The message remains stuck,
+				//                     the user sees the bug, the log
+				//                     surfaces it, and we fix the
+				//                     upstream cause in the next
+				//                     iteration. Do NOT call
+				//                     fail_message / remove here — that
+				//                     would launder a §1 violation into
+				//                     a normal failed-send and let the
+				//                     bug ship to the next release.
+				//
+				// Do not add any "graceful" handling. Do not add a retry.
+				// Do not silently downgrade method. If §1 fires we
+				// change the code, not the behavior.
 				if !LXMessage::is_success_state(lxm.state)
 					&& lxm.state != LXMessage::CANCELLED
 					&& lxm.state != LXMessage::REJECTED
@@ -1051,7 +1069,7 @@ impl LXMRouter {
 							let msg = format!(
 								"DESIGN_PRINCIPLES §1 VIOLATION: POB message [{}] \
 								 stuck for {:.2}s (limit {:.1}s) — method={} \
-								 attempts={} state={} — failing.",
+								 attempts={} state={} — FIX THE CODE.",
 								message_label, elapsed,
 								reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS,
 								lxm.method, lxm.delivery_attempts, lxm.state,
@@ -1065,9 +1083,8 @@ impl LXMRouter {
 							{
 								eprintln!("[SEND-ASSERT] {}", msg);
 								log(&msg, LOG_ERROR, false, false);
-								self.fail_message(&mut lxm);
-								self.pending_outbound.remove(index);
-								continue;
+								// Intentionally no state change — see
+								// comment block above.
 							}
 						}
 					}
@@ -1528,39 +1545,53 @@ impl LXMRouter {
 		if let Ok(mut lxm) = message.lock() {
 			let destination_hash = lxm.destination_hash.clone();
 
-			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+			// (D) NO override of desired_method while APP_LINK establishes.
 			//
-			// (D) Defer outbound while an APP_LINK is establishing.
+			// History: this site previously contained a "defer-while-
+			// establishing" block that, when an APP_LINK to the
+			// destination was in PATH_REQUESTED (1) or ESTABLISHING (2),
+			// overrode a caller-supplied PROPAGATED desired_method to
+			// DIRECT so the message could "ride the link instead of
+			// being committed to a propagation node."
 			//
-			// If an APP_LINK to this destination is currently being
-			// brought up (status PATH_REQUESTED=1 or ESTABLISHING=2),
-			// override a PROPAGATED desired_method to DIRECT so the
-			// message rides the link instead of being committed to a
-			// propagation node.  This avoids the pathology where a
-			// caller (e.g. the iOS app's 5 s budget on
-			// `awaitDeliveryMethod`) chose PROPAGATED at the moment
-			// the link was still establishing — the link then
-			// completed shortly after and was orphaned, while the
-			// PROPAGATED send rode a path that didn't exist either.
+			// That override was a hard violation of DESIGN_PRINCIPLES.md
+			// §1 (5 s send budget) and §3 (no timeouts as readiness
+			// signals):
 			//
-			// The §1 5-second cap at the top of process_outbound will
-			// fail the message loudly if the APP_LINK does not reach
-			// ACTIVE in time, so this override never silently delays.
-			let app_link_status = AppLinks::status(&destination_hash);
-			if (app_link_status == 1 || app_link_status == 2)
-				&& lxm.desired_method == Some(LXMessage::PROPAGATED)
-				&& lxm.packed.is_none()
-			{
-				log(
-					&format!(
-						"[POB] {} APP_LINK status={} → overriding PROPAGATED → DIRECT (defer-while-establishing)",
-						prettyhexrep(&destination_hash), app_link_status,
-					),
-					LOG_NOTICE, false, false,
-				);
-				lxm.desired_method = Some(LXMessage::DIRECT);
-				lxm.method = LXMessage::DIRECT;
-			}
+			//   * The caller (e.g. the iOS app) ALREADY ran its own
+			//     readiness budget — `awaitDeliveryMethod` waits up to
+			//     5 s for the APP_LINK to reach ACTIVE, then commits to
+			//     either DIRECT or PROPAGATED. By the time we see
+			//     `desired_method == PROPAGATED`, the caller has
+			//     already concluded the link will not be ready in
+			//     time. Re-overriding to DIRECT here just re-runs the
+			//     same wait the caller already gave up on, and burns
+			//     the §1 budget on a second guess.
+			//
+			//   * The override clobbered BOTH `desired_method` AND
+			//     `method`, erasing the caller's intent. If DIRECT
+			//     then failed to establish before §1's 5 s deadline,
+			//     the message was hard-failed with no record that
+			//     PROPAGATED was the original ask, so no fall-back
+			//     was possible. Observed in retichat.log on
+			//     2026-04-30: user sent at 21:12:16, override fired,
+			//     spun on `DIRECT link PENDING (status=0)` for 6.67 s,
+			//     then SEND-ASSERT §1 VIOLATION → FAILED. The
+			//     PROPAGATED path was never tried.
+			//
+			//   * The "orphaned link" pathology cited as motivation
+			//     (a freshly-established link sitting unused) is not
+			//     a §1 issue. KEEPALIVE expires the link in ~45 s
+			//     with no traffic. That's the link layer's job.
+			//
+			// Resolution: honor `desired_method` as the caller's
+			// committed decision. The link, if it eventually
+			// establishes, will be available for the NEXT message.
+			//
+			// NEVER REMOVE EVER. Do not re-introduce the override
+			// without first reading DESIGN_PRINCIPLES.md §1-§3 and
+			// the regression log entry above.
+			let _ = AppLinks::status; // keep symbol referenced for future use
 
 			if lxm.stamp_cost.is_none() {
 				if let Some((_, stamp_cost)) = self.outbound_stamp_costs.get(&destination_hash) {
