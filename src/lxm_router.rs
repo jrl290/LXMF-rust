@@ -1429,7 +1429,12 @@ impl LXMRouter {
 										LOG_NOTICE, false, false,
 									);
 									Transport::request_path(&dest_hash, None, None, None, None);
-									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3:
+									// PATH_REQUEST_WAIT not DELIVERY_RETRY_WAIT: path requests
+									// trigger announces in Reticulum.  The relay needs time to
+									// re-broadcast the destination's announce so that attempt 2
+									// can establish the link on a refreshed path.
+									lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
 								} else {
 									// Link is PENDING/HANDSHAKE — just wait for it to become active.
 									log(
@@ -1445,6 +1450,13 @@ impl LXMRouter {
 
 									if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 										if Transport::has_path(&dest_hash) {
+											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1:
+											// Send PATH_REQ concurrently with the LRREQ.  The relay's
+											// routing table for this dest may have aged out even if our
+											// local path entry is still valid.  PATH_REQ triggers a
+											// fresh announce so the relay refreshes while the LRREQ is
+											// in flight.  If LRREQ succeeds, PATH_REQ is a cheap extra.
+											Transport::request_path(&dest_hash, None, None, None, None);
 											log(&format!("[POB][{}] DIRECT no link → establishing link (attempt {})", message_label, lxm.delivery_attempts), LOG_NOTICE, false, false);
 											let destination = match Destination::from_destination_hash(&dest_hash, "lxmf", &["delivery"]) {
 												Ok(d) => d,
