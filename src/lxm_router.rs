@@ -1564,7 +1564,17 @@ impl LXMRouter {
 										);
 									}
 								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
-									lxm.delivery_attempts += 1;
+									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3:
+									// Do NOT increment delivery_attempts here.  The link slot
+									// is populated by AppLinks (PersistentLink mode); we are
+									// simply waiting for it to reach STATE_ACTIVE.  Counting
+									// "link not yet ready" as a delivery failure causes the
+									// message to be failed via MAX_DELIVERY_ATTEMPTS after
+									// just 3 × 2 s = 6 s — well before the link can establish
+									// on a cold-start or after a path expiry.  delivery_attempts
+									// must only increment on actual send failures (send_packet
+									// error / propagation_packed missing), not on transport
+									// readiness waits.
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
 									// Link establishment is owned by AppLinks
 									// (PersistentLink mode). When set_outbound_propagation_node
