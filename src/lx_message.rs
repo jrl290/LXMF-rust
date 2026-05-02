@@ -1337,7 +1337,14 @@ impl LXMessage {
 				log(&format!("link_packet_timed_out tearing down link={}", hexrep(&link.link_id(), false)), LOG_NOTICE, false, false);
 				link.teardown();
 			}
-			self.state = Self::OUTBOUND;
+			// NEVER REMOVE EVER — §1,§3: do NOT revert a fire-and-forget SENT message.
+			// After the DIRECT PACKET fix, state=SENT when this fires because
+			// send_with_handle sets SENT immediately after packet.send() succeeds.
+			// Reverting SENT→OUTBOUND would be a §3 application-level retry.
+			// Receipt timeout on an already-SENT message is informational only.
+			if !Self::is_success_state(self.state) {
+				self.state = Self::OUTBOUND;
+			}
 		}
 	}
 

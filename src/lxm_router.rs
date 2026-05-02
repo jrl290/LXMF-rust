@@ -1242,6 +1242,26 @@ impl LXMRouter {
 					}
 
 					remove = true;
+				} else if lxm.method == LXMessage::DIRECT && lxm.state == LXMessage::SENT {
+					// NEVER REMOVE EVER — §1,§3: DIRECT fire-and-forget terminal.
+					// Bytes were transmitted over an active link; SENT was set immediately
+					// in send_with_handle DIRECT PACKET branch. No retry (§3). §1 satisfied.
+					// Note: if DELIVERED fired first (fast LRPROOF, e.g. Retichat↔Retichat)
+					// the DELIVERED branch above this one wins — SENT is never reached.
+					if let Some(hash) = lxm.hash.as_ref() {
+						self.fire_message_state(hash, LXMessage::SENT);
+					}
+					remove = true;
+				} else if lxm.method == LXMessage::DIRECT && lxm.state == LXMessage::SENT {
+					// NEVER REMOVE EVER — §1,§3: DIRECT fire-and-forget terminal.
+					// Bytes were transmitted over an active link; SENT was set immediately
+					// in send_with_handle DIRECT PACKET branch. No retry (§3). §1 satisfied.
+					// Note: if DELIVERED fired first (fast LRPROOF, e.g. Retichat↔Retichat)
+					// the DELIVERED branch above this one wins — this branch is never reached.
+					if let Some(hash) = lxm.hash.as_ref() {
+						self.fire_message_state(hash, LXMessage::SENT);
+					}
+					remove = true;
 				} else if lxm.method == LXMessage::PROPAGATED && lxm.state == LXMessage::SENT {
 					if let Some(hash) = lxm.hash.as_ref() {
 						self.fire_message_state(hash, LXMessage::SENT);
