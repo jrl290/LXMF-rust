@@ -12,8 +12,10 @@ use rmpv::decode::read_value;
 use rmp_serde;
 use serde::{Deserialize, Serialize};
 
+use once_cell::sync::Lazy;
+
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL, ALLOW_LIST, PROVE_ALL};
-use reticulum_rust::app_links::{self as rns_app_links, AppLinks};
+use reticulum_rust::app_links::{self as rns_app_links, AppLinks, Sendable};
 use reticulum_rust::identity::{Identity, HASHLENGTH, TRUNCATED_HASHLENGTH};
 use reticulum_rust::link::{Link, LinkHandle};
 use reticulum_rust::packet::Packet;
@@ -38,6 +40,26 @@ fn now() -> f64 {
 // decode_hex moved to reticulum_rust::decode_hex
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
 	reticulum_rust::decode_hex(hex)
+}
+
+/// Process-wide weak ref to the most recently constructed `LXMRouter`.
+/// Set by `LXMRouter::new`. Used by the [`Sendable`] impl for
+/// `Arc<Mutex<LXMessage>>` so apps can call `AppLinks::send(message)`
+/// without threading a router reference through every layer.
+///
+/// Multi-router processes (rare; typically test harnesses) get
+/// last-router-wins semantics. Production binaries (lxmf_send/lxmf_recv,
+/// retichat, rfed-channel) construct exactly one router.
+static GLOBAL_ROUTER: Lazy<Mutex<Option<Weak<Mutex<LXMRouter>>>>> =
+	Lazy::new(|| Mutex::new(None));
+
+/// Returns the current global router if one has been registered and is
+/// still alive.
+pub fn global_router() -> Option<Arc<Mutex<LXMRouter>>> {
+	GLOBAL_ROUTER
+		.lock()
+		.ok()
+		.and_then(|g| g.as_ref().and_then(|w| w.upgrade()))
 }
 
 #[derive(Clone)]
@@ -412,43 +434,119 @@ impl LXMRouter {
 		let propagation_handler = propagation_announce_handler(router_clone_for_handlers.clone());
 		Transport::register_announce_handler(propagation_handler);
 
-		// Phase 3: register a status callback with the global app_links
-		// registry so LXMF mirrors the active outbound LinkHandle into its
-		// own `direct_links` map (used by the existing DIRECT-send picker,
-		// dual-link sweep, and clean_links skip), and so a successful
-		// establishment wakes the outbound thread to flush queued messages.
+		// Phase 6 (path-race AppLinks): the registry no longer hands us
+		// a `LinkHandle` (the `link` parameter is always `None`); the
+		// callback's only job here is to wake the outbound thread when a
+		// destination becomes Ready (path arrived) so any queued LXMs
+		// flush via the normal DIRECT picker. `direct_links` is now
+		// owned exclusively by `handle_outbound`, which builds short-
+		// lived links itself.
 		//
-		// Callbacks fire on the link-actor thread; do not lock the router
-		// here — spawn a worker that takes the lock.
+		// Callbacks fire on the path-race worker thread; do not lock the
+		// router here — spawn a worker that takes the lock.
 		let router_for_status_cb = Arc::downgrade(&router);
 		AppLinks::register_status_callback(Arc::new(move |dest_hash, status, link| {
-			let dh = dest_hash.to_vec();
-			let lk = link.clone();
+			// 1. Mirror PersistentLink state for the propagation node
+			//    into `outbound_propagation_link`. This is the ONE place
+			//    that writes the slot — eliminating the historical
+			//    "orphan link" race where a 2nd `Link::new_outbound`
+			//    overwrote the slot mid-handshake and orphan LRPROOFs
+			//    were silently dropped.
+			//
+			//    AppLinks::open_persistent (called from
+			//    `set_outbound_propagation_node`) guarantees at most one
+			//    in-flight `LinkHandle` per destination via its
+			//    `attempt_in_flight` CAS gate, so the mirrored slot is
+			//    likewise single-writer single-owner.
+			{
+				let weak = router_for_status_cb.clone();
+				let dest_owned = dest_hash.to_vec();
+				let link_for_mirror = link.clone();
+				std::thread::spawn(move || {
+					let arc = match weak.upgrade() { Some(a) => a, None => return };
+					let mut router = match arc.lock() { Ok(g) => g, Err(_) => return };
+					if router.outbound_propagation_node.as_deref() != Some(&dest_owned) {
+						return;
+					}
+					match status {
+						rns_app_links::APP_LINK_ACTIVE => {
+							if let Some(handle) = link_for_mirror {
+								// Reset the per-link identify marker
+								// when the link rotates so the next
+								// PSYNC re-identifies on the new
+								// link_id.
+								let new_id = handle.link_id();
+								let same = router
+									.outbound_propagation_link
+									.as_ref()
+									.and_then(|h| h.destination_hash().ok().map(|_| h.link_id()))
+									.map(|id| id == new_id)
+									.unwrap_or(false);
+								if !same {
+									router.outbound_propagation_link_identified_id = None;
+								}
+								// Install the propagation signalling
+								// packet callback on the AppLinks-owned
+								// link. Previously this was installed
+								// per-link in the deleted PSYNC
+								// `Link::new_outbound` site; with
+								// AppLinks owning the link we install
+								// it once here on every (re)establish.
+								let weak_for_pkt = router.self_handle.clone();
+								handle.set_packet_callback(Some(Arc::new(move |data, packet| {
+									if let Some(router_arc) = weak_for_pkt.as_ref().and_then(|w| w.upgrade()) {
+										if let Ok(mut router) = router_arc.lock() {
+											router.propagation_transfer_signalling_packet(data, packet);
+										}
+									}
+								})));
+								router.outbound_propagation_link = Some(handle);
+								router.outbound_propagation_link_created_at = Some(now());
+								// Re-enter PSYNC now that the link is live.
+								// In the old code this was done from the
+								// link_established callback; here we do it
+								// in the status callback which fires on the
+								// same event (APP_LINK_ACTIVE after
+								// STATE_ACTIVE).
+								let identity = router.identity.clone();
+								let max_messages = router.propagation_transfer_max_messages;
+								router.request_messages_from_propagation_node(identity, max_messages);
+							}
+						}
+						rns_app_links::APP_LINK_DISCONNECTED
+						| rns_app_links::APP_LINK_NONE => {
+							router.outbound_propagation_link = None;
+							router.outbound_propagation_link_created_at = None;
+							router.outbound_propagation_link_identified_id = None;
+						}
+						_ => {}
+					}
+				});
+			}
+
+			// 2. Path-race ACTIVE wake (covers DIRECT destinations).
+			if status != rns_app_links::APP_LINK_ACTIVE {
+				return;
+			}
 			let weak = router_for_status_cb.clone();
 			std::thread::spawn(move || {
 				let arc = match weak.upgrade() { Some(a) => a, None => return };
-				let mut router = match arc.lock() { Ok(g) => g, Err(_) => return };
-				match status {
-					rns_app_links::APP_LINK_ESTABLISHING
-					| rns_app_links::APP_LINK_ACTIVE => {
-						if let Some(handle) = lk {
-							router.direct_links.insert(dh.clone(), handle);
-						}
-						let _ = router.outbound_wake_tx.send(());
-					}
-					_ => {
-						if let Some(old) = router.direct_links.remove(&dh) {
-							router.validated_peer_links.remove(&old.link_id());
-						}
-						router.backchannel_identified_links.remove(&dh);
-					}
-				}
+				let router = match arc.lock() { Ok(g) => g, Err(_) => return };
+				let _ = router.outbound_wake_tx.send(());
 			});
 		}));
 
 		if let Ok(mut router_guard) = router.lock() {
 			router_guard.self_handle = Some(Arc::downgrade(&router));
 			router_guard.load_cached_state();
+		}
+
+		// Register as the process-wide global router so
+		// `AppLinks::send(message)` can route via this instance without
+		// callers threading a router reference through every layer. See
+		// the `Sendable for Arc<Mutex<LXMessage>>` impl below.
+		if let Ok(mut g) = GLOBAL_ROUTER.lock() {
+			*g = Some(Arc::downgrade(&router));
 		}
 
 		let job_router = Arc::downgrade(&router);
@@ -1448,81 +1546,34 @@ impl LXMRouter {
 								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
 									lxm.delivery_attempts += 1;
 									lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+									// Link establishment is owned by AppLinks
+									// (PersistentLink mode). When set_outbound_propagation_node
+									// was called, AppLinks::open_persistent
+									// began racing a path and (on a winning
+									// iface) building a single Link::new_outbound
+									// under a single-attempt CAS gate. The
+									// router's `outbound_propagation_link` slot
+									// is mirrored from the AppLinks status
+									// callback. There is nothing to do here
+									// except wait — the next POB tick will see
+									// the slot populated once the link reaches
+									// STATE_ACTIVE.
 									//
-									// Do NOT re-introduce an inner
-									// `delivery_attempts < MAX_DELIVERY_ATTEMPTS`
-									// guard here. The OUTER guard
-									// (`<= MAX_DELIVERY_ATTEMPTS`) already
-									// caps total tries; an inner `<` check
-									// is off-by-one and means we *increment*
-									// attempts to N then refuse to actually
-									// try with that N, so the very try that
-									// would have used the just-arrived path
-									// is silently skipped and the message
-									// then fails with state=255.
-									// Reproducer: cold PROPAGATED send to
-									// the RFed-derived prop node — path
-									// arrives during the 7 s
-									// PATH_REQUEST_WAIT, but next POB tick
-									// bumps attempts to MAX, skips the
-									// link-establish branch, and §1 fires.
-									if Transport::has_path(&node_hash) {
-											// Identity presence check is implicit in the next line's recall
-											if let Some(identity) = Identity::recall(&node_hash) {
-												if let Ok(destination) = Destination::new_outbound(
-													Some(identity.clone()),
-													DestinationType::Single,
-													APP_NAME.to_string(),
-													vec!["propagation".to_string()],
-												) {
-													if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
-														let link_handle = LinkHandle::spawn(link);
-														let wake_tx = self.outbound_wake_tx.clone();
-														let router_weak_packet = self.self_handle.clone();
-														let message_id = lxm.message_id.clone();
-														link_handle.set_link_established_callback(Some(Arc::new(move |_| {
-															let _ = wake_tx.send(());
-														})));
-														link_handle.set_packet_callback(Some(Arc::new(move |data, _packet| {
-															if let Some(router_arc) = router_weak_packet.as_ref().and_then(|w| w.upgrade()) {
-																if let Ok(mut router) = router_arc.lock() {
-																	if let Some(message_id) = message_id.clone() {
-																		router.handle_propagation_transfer_signal(&message_id, data);
-																	}
-																}
-															}
-														})));
-														// Initiate runs on a background thread.
-														// The link actor registers the runtime handle
-														// itself (after deriving the real link_id);
-														// caller must not pre-register or LINKPROOF
-														// dispatch will be keyed off the placeholder.
-																self.outbound_propagation_link = Some(link_handle.clone());
-																std::thread::spawn(move || {
-																	let _ = link_handle.initiate();
-																});
-													} else {
-														log("Could not establish propagation link", LOG_ERROR, false, false);
-													}
-												}
-											} else {
-												log("Propagation node identity not known", LOG_ERROR, false, false);
-											}
-										} else {
-											Transport::request_path(&node_hash, None, None, None, None);
-											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-											// Do NOT defer the next POB tick by
-											// PATH_REQUEST_WAIT (7 s) here.  Path
-											// resolution typically completes within
-											// 1-3 s; sleeping 7 s blows the §1 5 s
-											// budget and means we miss the
-											// just-arrived path on the next tick.
-											// 2 s (DELIVERY_RETRY_WAIT) lets the
-											// next POB pass re-check has_path and
-											// progress immediately.
-											lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-										}
+									// Historical note: this branch USED TO call
+									// `Link::new_outbound` per attempt, which
+									// raced the PSYNC code path's own
+									// `Link::new_outbound` and left orphan
+									// LinkHandles whose LRPROOFs were silently
+									// dropped (see MICRORETICULUM_BUGS.md /
+									// LINK_REQUEST_PROTOCOL_FIX.md). Removed.
+									if !Transport::has_path(&node_hash) {
+										// Nudge a path request — AppLinks's own
+										// path-race will also be running, but
+										// belt-and-braces: if the dest hasn't
+										// been announced recently, this is the
+										// fastest way to populate the table.
+										Transport::request_path(&node_hash, None, None, None, None);
+									}
 								} else {
 									// Not time to retry yet — leave in pending_outbound
 									log(
@@ -2763,6 +2814,7 @@ impl LXMRouter {
 			return Err("Invalid destination hash for outbound propagation node".to_string());
 		}
 		if self.outbound_propagation_node.as_ref() != Some(&destination_hash) {
+			let old_node = self.outbound_propagation_node.take();
 			self.outbound_propagation_node = Some(destination_hash.clone());
 			let should_teardown = if let Some(link) = self.outbound_propagation_link.as_ref() {
 				link.destination_hash()
@@ -2779,6 +2831,18 @@ impl LXMRouter {
 				self.outbound_propagation_link_created_at = None;
 				self.outbound_propagation_link_identified_id = None;
 			}
+			// Hand the propagation node to AppLinks in PersistentLink
+			// mode so the registry owns establishment/re-establishment
+			// under a single-attempt CAS gate (orphan-link prevention).
+			// The status callback installed in `Self::new` mirrors the
+			// resulting `LinkHandle` into `outbound_propagation_link` on
+			// ACTIVE and clears it on DISCONNECTED.
+			if let Some(prev) = old_node {
+				if prev != destination_hash {
+					AppLinks::close(&prev);
+				}
+			}
+			AppLinks::open_persistent(&destination_hash, APP_NAME, &["propagation"]);
 		}
 
 		// Proactively request the path so it is available before the first sync attempt.
@@ -3950,42 +4014,28 @@ impl LXMRouter {
 		}
 
 		if Transport::has_path(&outbound_node) {
-			log("[PSYNC] has path → establishing new link", LOG_NOTICE, false, false);
+			log("[PSYNC] has path → waiting for AppLinks PersistentLink", LOG_NOTICE, false, false);
 			self.propagation_transfer_state = Self::PR_LINK_ESTABLISHING;
-			if let Some(prop_identity) = Identity::recall(&outbound_node) {
-				if let Ok(destination) = Destination::new_outbound(
-					Some(prop_identity),
-					DestinationType::Single,
-					APP_NAME.to_string(),
-					vec!["propagation".to_string()],
-				) {
-					if let Ok(link) = Link::new_outbound(destination, reticulum_rust::link::MODE_AES256_CBC) {
-						let handle = LinkHandle::spawn(link);
-						let router_weak = self.self_handle.clone();
-						handle.set_link_established_callback(Some(Arc::new(move |_| {
-							log("[PSYNC] propagation link ESTABLISHED", LOG_NOTICE, false, false);
-							if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-								if let Ok(mut router) = router_arc.lock() {
-									let max_messages = router.propagation_transfer_max_messages;
-									router.request_messages_from_propagation_node(identity.clone(), max_messages);
-								}
-							}
-						})));
-						// Run the (potentially blocking) initiate on a background
-						// thread so we don't hold `&mut self` across the link-actor
-						// round-trip. The actor registers the runtime handle
-						// itself after deriving the real link_id; pre-registering
-						// here would key the registry off the placeholder id.
-						self.outbound_propagation_link = Some(handle.clone());
-						self.outbound_propagation_link_created_at = Some(now());
-						std::thread::spawn(move || {
-							if let Err(e) = handle.initiate() {
-								log(&format!("Failed to initiate propagation link: {}", e), LOG_ERROR, false, false);
-							}
-						});
-					}
-				}
-			}
+			// Link establishment is owned by AppLinks (PersistentLink
+			// mode). The router's `outbound_propagation_link` slot is
+			// mirrored from the AppLinks status callback installed in
+			// `Self::new`. When ACTIVE fires we re-enter
+			// `request_messages_from_propagation_node` via the
+			// outbound_wake_tx kicked from that callback, and the
+			// `link_arc.status() == STATE_ACTIVE` branch above sends
+			// the message_list request.
+			//
+			// Historical note: this branch USED TO call
+			// `Link::new_outbound` per call, racing the PROPAGATED
+			// branch's own `Link::new_outbound` and producing orphan
+			// LinkHandles (see MICRORETICULUM_BUGS.md). Removed.
+			//
+			// AppLinks should already be tracking this node from
+			// `set_outbound_propagation_node`; the call below is
+			// idempotent (no-op if already in flight or ACTIVE) and
+			// covers the cold-start path where PSYNC fires before the
+			// node was registered.
+			AppLinks::open_persistent(&outbound_node, APP_NAME, &["propagation"]);
 		} else {
 			log(&format!("[PSYNC] no path to {} → requesting path, starting path job", reticulum_rust::hexrep(&outbound_node, false)), LOG_NOTICE, false, false);
 			Transport::request_path(&outbound_node, None, None, None, None);
@@ -5042,5 +5092,43 @@ mod tests {
 			 it prevents the same link being queued for delivery_link_established \
 			 more than once per process_outbound cycle"
 		);
+	}
+}
+
+// ─── Sendable impl: bridges LXMessage into the AppLinks::send pipeline ──
+//
+// Apps build an `Arc<Mutex<LXMessage>>` (same shape they pass to
+// `LXMRouter::handle_outbound` today) and wrap it in [`OutboundLxm`] to
+// route via the top-level abstraction:
+//
+//     AppLinks::send(OutboundLxm(message))?;
+//
+// The newtype wrapper exists purely to satisfy Rust's orphan rules
+// (`Sendable` lives in Reticulum-rust, `Arc` is std). It carries no extra
+// state.
+//
+// `AppLinks::send` runs the liveness race / cache lookup, then calls
+// `dispatch(self)` here, which forwards to `handle_outbound` on the
+// process-wide global router. This keeps the wire-format / sealed-message
+// path-promotion logic unchanged — AppLinks just guarantees a path exists
+// before LXMF goes to write.
+pub struct OutboundLxm(pub Arc<Mutex<LXMessage>>);
+
+impl Sendable for OutboundLxm {
+	fn destination_hash(&self) -> Vec<u8> {
+		self.0
+			.lock()
+			.map(|m| m.destination_hash.clone())
+			.unwrap_or_default()
+	}
+
+	fn dispatch(self) -> Result<(), String> {
+		let router = global_router()
+			.ok_or_else(|| "no LXMRouter registered (construct one before AppLinks::send)".to_string())?;
+		let mut router = router
+			.lock()
+			.map_err(|_| "LXMRouter mutex poisoned".to_string())?;
+		router.handle_outbound(self.0);
+		Ok(())
 	}
 }
