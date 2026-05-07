@@ -60,6 +60,12 @@ pub struct LXMessage {
 	pub representation: u8,
 	pub desired_method: Option<u8>,
 	pub delivery_attempts: u32,
+	/// Set by link_packet_timed_out when a receipt timeout fires.  Causes the
+	/// POB loop to fail the message immediately rather than waiting ~18 s for
+	/// the next LRREQ cycle.  Prevents the DISCONNECTED callback from double-
+	/// counting the same failure (receipt-timeout teardown vs. LRREQ timeout).
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) receipt_timed_out: bool,
 	pub transport_encrypted: bool,
 	pub transport_encryption: Option<String>,
 	pub packet_representation: Option<Packet>,
@@ -220,6 +226,7 @@ impl LXMessage {
 			representation: Self::UNKNOWN,
 			desired_method,
 			delivery_attempts: 0,
+			receipt_timed_out: false,
 			transport_encrypted: false,
 			transport_encryption: None,
 			packet_representation: None,
@@ -747,6 +754,54 @@ impl LXMessage {
 			_ => {}
 		}
 
+		Ok(())
+	}
+
+	/// Build `propagation_packed` from an already-packed DIRECT message that has been
+	/// downgraded to PROPAGATED at runtime (e.g. when a direct link never establishes
+	/// and `process_outbound` flips `lxm.method = PROPAGATED`).
+	///
+	/// After `pack(desired_method=DIRECT)`, `self.packed` holds the raw LXMF bytes but
+	/// `self.propagation_packed` is `None`.  When `process_outbound` processes the
+	/// message as PROPAGATED it finds `None` and previously had no way to recover.
+	/// This method computes the propagation wire format from the already-present
+	/// `self.packed` and `self.destination`, mirroring the PROPAGATED branch of `pack()`.
+	///
+	/// Idempotent: if `propagation_packed` is already `Some(_)` this is a no-op.
+	///
+	/// # Errors
+	/// Returns `Err` if `self.packed` is `None` (message was never packed) or if
+	/// the destination encrypt call fails.
+	// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub fn make_propagation_packed(&mut self) -> Result<(), String> {
+		if self.propagation_packed.is_some() {
+			return Ok(());
+		}
+		let packed = self
+			.packed
+			.clone()
+			.ok_or("make_propagation_packed: message has not been packed yet")?;
+		let destination = self
+			.destination
+			.as_mut()
+			.ok_or("make_propagation_packed: missing destination")?;
+		if self.pn_encrypted_data.is_none() {
+			self.pn_encrypted_data =
+				Some(destination.encrypt(&packed[Self::DESTINATION_LENGTH..])?);
+			self.ratchet_id = destination.latest_ratchet_id.clone();
+		}
+		let mut lxmf_data = packed[..Self::DESTINATION_LENGTH].to_vec();
+		lxmf_data.extend_from_slice(self.pn_encrypted_data.as_ref().unwrap());
+		let transient_id = identity::full_hash(&lxmf_data);
+		self.transient_id = Some(transient_id);
+		if let Some(stamp) = self.propagation_stamp.as_ref() {
+			lxmf_data.extend_from_slice(stamp);
+		}
+		let propagation_payload = Value::Array(vec![
+			Value::F64(now_seconds()),
+			Value::Array(vec![Value::Binary(lxmf_data)]),
+		]);
+		self.propagation_packed = Some(encode_value(propagation_payload)?);
 		Ok(())
 	}
 
@@ -1343,6 +1398,14 @@ impl LXMessage {
 			// Reverting SENT→OUTBOUND would be a §3 application-level retry.
 			// Receipt timeout on an already-SENT message is informational only.
 			if !Self::is_success_state(self.state) {
+				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+				// A receipt timeout is a confirmed delivery failure for this attempt.
+				// Set receipt_timed_out so that:
+				//   (a) POB fails the message on the very next cycle (no 18 s LRREQ wait),
+				//   (b) the DISCONNECTED callback does NOT double-count this same cycle.
+				// delivery_attempts is also incremented here so the failure log is correct.
+				self.receipt_timed_out = true;
+				self.delivery_attempts += 1;
 				self.state = Self::OUTBOUND;
 			}
 		}
@@ -1421,7 +1484,7 @@ fn recall_identity(hash: &[u8]) -> Option<Identity> {
 	Identity::recall(hash)
 }
 
-fn mark_delivered_shared(handle: &Arc<Mutex<LXMessage>>) {
+pub(crate) fn mark_delivered_shared(handle: &Arc<Mutex<LXMessage>>) {
 	if let Ok(mut message) = handle.lock() {
 		message.mark_delivered();
 	}
@@ -1433,7 +1496,7 @@ fn mark_propagated_shared(handle: &Arc<Mutex<LXMessage>>) {
 	}
 }
 
-fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
+pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
 	if let Ok(mut message) = handle.lock() {
 		message.link_packet_timed_out();
 	}

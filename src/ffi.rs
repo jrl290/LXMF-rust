@@ -378,6 +378,37 @@ pub fn message_send(router_handle: u64, msg_handle: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Submit a message via the top-level `AppLinks::send` pipeline.
+///
+/// Differences from [`message_send`]:
+///   * No router handle is required — the message is dispatched on the
+///     process-wide global router registered by `LXMRouter::new`.
+///   * Runs the [`reticulum_rust::app_links::liveness::race_path`] race
+///     before dispatch to pick the fastest interface (cached for 2 s).
+///   * Returns `Err` if the 5 s liveness budget elapses with no winner,
+///     or if no usable (online, non-LoRa) interface is available.
+///
+/// Intended as the new default send API for hosts that want
+/// iface-selection abstracted away. Existing callers using
+/// [`message_send`] continue to work unchanged.
+pub fn message_send_via_app_links(msg_handle: u64) -> Result<(), String> {
+    use reticulum_rust::app_links::AppLinks;
+    use crate::lxm_router::OutboundLxm;
+    let msg: Arc<Mutex<LXMessage>> =
+        get_handle(msg_handle).ok_or_else(|| "invalid message handle".to_string())?;
+    AppLinks::send(OutboundLxm(msg)).map_err(|e| e.to_string())
+}
+
+/// Forget the cached liveness winner for `dest_hash` so the next
+/// [`message_send_via_app_links`] re-races interfaces.
+///
+/// Hosts call this on known network-state changes (iOS WiFi→cellular,
+/// Android `ConnectivityManager` callbacks) where the cached iface may
+/// have just gone offline.
+pub fn app_links_invalidate_liveness(dest_hash: &[u8]) {
+    reticulum_rust::app_links::AppLinks::invalidate_liveness(dest_hash);
+}
+
 /// Query the current state of a message.
 ///
 /// Returns the state constant (e.g. `LXMessage::DELIVERED`).

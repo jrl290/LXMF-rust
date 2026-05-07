@@ -25,7 +25,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, prettyhexrep, prettytime, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 
 use crate::handlers::{delivery_announce_handler, propagation_announce_handler};
-use crate::lx_message::LXMessage;
+use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared};
 use crate::lx_stamper;
 use crate::lxmf::{pn_announce_data_is_valid, APP_NAME, FIELD_TICKET};
 use crate::lxm_peer::LXMPeer;
@@ -91,15 +91,15 @@ pub struct AvailableTickets {
 ///
 /// The spec, registry and lifecycle live in `reticulum_rust::app_links`
 /// (Phase 3 promotion). LXMF only mirrors the active outbound `LinkHandle`
-/// into its own `direct_links` map for the existing DIRECT-send picker.
+/// into its own `outbound_links` map for the existing DIRECT-send picker.
 pub use reticulum_rust::app_links::AppLinkSpec;
 
 pub struct LXMRouter {
 	pub pending_inbound: Vec<Vec<u8>>,
 	pub pending_outbound: Vec<Arc<Mutex<LXMessage>>>,
 	pub failed_outbound: Vec<Arc<Mutex<LXMessage>>>,
-	pub direct_links: HashMap<Vec<u8>, LinkHandle>,
-	pub backchannel_links: HashMap<Vec<u8>, LinkHandle>,
+	pub outbound_links: HashMap<Vec<u8>, LinkHandle>,
+	// inbound_links moved to AppLinks::inbound_links — see AppLinks::register_inbound
 	pub backchannel_identified_links: HashMap<Vec<u8>, bool>,
 	pub delivery_destinations: HashMap<Vec<u8>, Destination>,
 	pub delivery_stamp_costs: HashMap<Vec<u8>, u32>,
@@ -196,7 +196,7 @@ pub struct LXMRouter {
 	pub watched_destinations: HashSet<Vec<u8>>,
 	/// Phase 3: app_links spec/lifecycle moved to
 	/// `reticulum_rust::app_links::AppLinks`. LXMF mirrors the active outbound
-	/// `LinkHandle` for each app-link destination into `direct_links` via a
+	/// `LinkHandle` for each app-link destination into `outbound_links` via a
 	/// status callback registered in `LXMRouter::new`, so the existing
 	/// DIRECT-send picker, dual-link sweep, and clean_links skip continue to
 	/// work without changes.
@@ -221,15 +221,6 @@ impl LXMRouter {
 	pub const DIRECT_LINK_TIMEOUT: f64 = 8.0;
 	pub const LINK_MAX_INACTIVITY: f64 = 10.0 * 60.0;
 	pub const P_LINK_MAX_INACTIVITY: f64 = 3.0 * 60.0;
-
-	/// Settling window for app_link dual-link disambiguation.
-	/// When both an outbound (`direct_links`) and inbound (`backchannel_links`)
-	/// link exist for the same app_link destination, the link whose most-recent
-	/// inbound packet (any type) is older than this many seconds AND is older
-	/// than the other side's most-recent inbound is torn down. Set to
-	/// 2 × KEEPALIVE_MAX (= 360s) so a healthy link with regular keepalives
-	/// will never be tagged as the loser.
-	pub const APP_LINK_DUAL_LINK_SETTLING_SECS: u64 = 720;
 
 	pub const MESSAGE_EXPIRY: f64 = 30.0 * 24.0 * 60.0 * 60.0;
 	pub const STAMP_COST_EXPIRY: f64 = 45.0 * 24.0 * 60.0 * 60.0;
@@ -343,8 +334,8 @@ impl LXMRouter {
 			pending_inbound: Vec::new(),
 			pending_outbound: Vec::new(),
 			failed_outbound: Vec::new(),
-			direct_links: HashMap::new(),
-			backchannel_links: HashMap::new(),
+			outbound_links: HashMap::new(),
+			// inbound_links lives in AppLinks::REGISTRY.inbound_links
 			backchannel_identified_links: HashMap::new(),
 			delivery_destinations: HashMap::new(),
 			delivery_stamp_costs: HashMap::new(),
@@ -438,7 +429,7 @@ impl LXMRouter {
 		// a `LinkHandle` (the `link` parameter is always `None`); the
 		// callback's only job here is to wake the outbound thread when a
 		// destination becomes Ready (path arrived) so any queued LXMs
-		// flush via the normal DIRECT picker. `direct_links` is now
+		// flush via the normal DIRECT picker. `outbound_links` is now
 		// owned exclusively by `handle_outbound`, which builds short-
 		// lived links itself.
 		//
@@ -524,16 +515,100 @@ impl LXMRouter {
 				});
 			}
 
-			// 2. Path-race ACTIVE wake (covers DIRECT destinations).
-			if status != rns_app_links::APP_LINK_ACTIVE {
-				return;
+			// 2. Non-propagation PersistentLink: mirror the live handle into
+			//    `outbound_links` and wake the outbound thread.
+			//
+			//    AppLinks::open now always uses PersistentLink, so every
+			//    app-link ACTIVE event carries Some(LinkHandle). Inserting it
+			//    here means `process_outbound` DIRECT branch finds it in
+			//    outbound_links without needing to create its own Link.
+			//
+			//    DISCONNECTED / NONE removes the mirrored entry so process_outbound
+			//    sees no link and waits for the next ACTIVE event rather than
+			//    creating a duplicate.
+			{
+				let weak = router_for_status_cb.clone();
+				let dest_owned = dest_hash.to_vec();
+				let link_handle = link.clone();
+				std::thread::spawn(move || {
+					let arc = match weak.upgrade() { Some(a) => a, None => return };
+					let mut router = match arc.lock() { Ok(g) => g, Err(_) => return };
+					// Propagation node is handled by block 1 above.
+					if router.outbound_propagation_node.as_deref() == Some(dest_owned.as_slice()) {
+						return;
+					}
+					match status {
+						rns_app_links::APP_LINK_ACTIVE => {
+							if let Some(handle) = link_handle {
+								router.outbound_links.insert(dest_owned, handle);
+							}
+							let _ = router.outbound_wake_tx.send(());
+						}
+						rns_app_links::APP_LINK_DISCONNECTED => {
+							router.outbound_links.remove(&dest_owned);
+							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+							// Count each link-cycle failure for DIRECT messages to this
+							// destination.  DISCONNECTED fires once per link closure —
+							// whether from a receipt-timeout-caused teardown (1.5 s) or
+							// an 18 s LRREQ timeout.  Counting here is more reliable than
+							// reading AppLinks::status() in the POB loop because the
+							// DISCONNECTED window is only microseconds wide; the 2 s POB
+							// tick almost always misses it.
+							//
+							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+							// Count each link-cycle failure for DIRECT messages to this
+							// destination.  DISCONNECTED fires once per link closure —
+							// whether from a receipt-timeout-caused teardown (1.5 s) or
+							// an 18 s LRREQ timeout.
+							//
+							// When a receipt timeout fires, link_packet_timed_out sets the
+							// receipt_timed_out flag AND increments delivery_attempts.  In
+							// that case we must NOT count again here — the POB loop will see
+							// the flag and fail the message immediately on the next tick,
+							// avoiding the full 18 s LRREQ wait and the §1 violations that
+							// come with it.
+							//
+							// When receipt_timed_out is NOT set (i.e. an 18 s LRREQ timeout
+							// fired without us ever getting to send), we ARE the sole counter
+							// for that failure cycle and must increment.
+							//
+							// try_lock is used to avoid blocking the callback thread if the
+							// receipt-timeout handler happens to still be running.
+							for msg_arc in &router.pending_outbound {
+								if let Ok(mut lxm) = msg_arc.try_lock() {
+									if lxm.method == LXMessage::DIRECT
+										&& lxm.destination_hash == dest_owned
+										&& !LXMessage::is_success_state(lxm.state)
+										&& lxm.state != LXMessage::CANCELLED
+										&& lxm.state != LXMessage::FAILED
+									{
+										if lxm.receipt_timed_out {
+											// receipt_timed_out is already counted by
+											// link_packet_timed_out; POB will fail the message
+											// on its next tick.  Do not double-count.
+											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+										} else {
+											lxm.delivery_attempts += 1;
+											log(
+												&format!(
+													"[APP_LINK] DIRECT link-cycle fail for {} attempts={}",
+													hexrep(&dest_owned, false),
+													lxm.delivery_attempts,
+												),
+												LOG_NOTICE, false, false,
+											);
+										}
+									}
+								}
+							}
+						}
+						rns_app_links::APP_LINK_NONE => {
+							router.outbound_links.remove(&dest_owned);
+						}
+						_ => {}
+					}
+				});
 			}
-			let weak = router_for_status_cb.clone();
-			std::thread::spawn(move || {
-				let arc = match weak.upgrade() { Some(a) => a, None => return };
-				let router = match arc.lock() { Ok(g) => g, Err(_) => return };
-				let _ = router.outbound_wake_tx.send(());
-			});
 		}));
 
 		if let Ok(mut router_guard) = router.lock() {
@@ -1068,8 +1143,8 @@ impl LXMRouter {
 	}
 
 	pub fn delivery_link_available(&self, destination_hash: &[u8]) -> bool {
-		self.direct_links.contains_key(destination_hash)
-			|| self.backchannel_links.contains_key(destination_hash)
+		self.outbound_links.contains_key(destination_hash)
+			|| AppLinks::has_inbound(destination_hash)
 	}
 
 	pub fn set_active_propagation_node(&mut self, destination_hash: Vec<u8>) -> Result<(), String> {
@@ -1160,6 +1235,13 @@ impl LXMRouter {
 					&& lxm.state != LXMessage::CANCELLED
 					&& lxm.state != LXMessage::REJECTED
 					&& lxm.state != LXMessage::FAILED
+					// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+					// PROPAGATED messages wait for a propagation-node link to reach
+					// STATE_ACTIVE (up to 18 s per link-establishment cycle) before
+					// uploading.  The 5 s §1 wall-clock threshold does not apply here;
+					// the correct guardrail is MAX_DELIVERY_ATTEMPTS (link-cycle count),
+					// which is enforced below in the PROPAGATED branch.
+					&& lxm.method != LXMessage::PROPAGATED
 				{
 					if let Some(ts) = lxm.timestamp {
 						let elapsed = now() - ts;
@@ -1206,7 +1288,7 @@ impl LXMRouter {
 					// so the remote peer can send messages BACK to us on the same link.
 					if lxm.method == LXMessage::DIRECT {
 						let dest_hash = lxm.destination_hash.clone();
-						if let Some(direct_link) = self.direct_links.get(&dest_hash).cloned() {
+						if let Some(direct_link) = self.outbound_links.get(&dest_hash).cloned() {
 							let is_initiator = direct_link.initiator;
 							if is_initiator {
 								// Step 1: Identify if not already done
@@ -1343,105 +1425,166 @@ impl LXMRouter {
 						LXMessage::DIRECT => {
 							let dest_hash = lxm.destination_hash.clone();
 
-							// Select the best available link.
-							//
-							// For app_links destinations both an outbound (`direct_links`)
-							// and an inbound (`backchannel_links`) link can be ACTIVE
-							// concurrently (Phase 2 dual-link). Prefer whichever link saw
-							// inbound traffic (DATA, KEEPALIVE, or any control frame) most
-							// recently — that's the one the peer is actually servicing.
-							// Falls back to `activated_at` ordering when neither has yet
-							// received any inbound packet (race window after handshake).
-							let mut direct_link = self.direct_links.get(&dest_hash).cloned();
-							if direct_link.is_none() {
-								direct_link = self.backchannel_links.get(&dest_hash).cloned();
-							} else if let Some(bl) = self.backchannel_links.get(&dest_hash).cloned() {
-								let dl_snap = direct_link.as_ref().and_then(|d| d.snapshot().ok());
-								let bl_snap = bl.snapshot().ok();
-								let dl_score = dl_snap
-									.as_ref()
-									.map(|s| (s.last_inbound, s.activated_at.unwrap_or(0)))
-									.unwrap_or((0, 0));
-								let bl_score = bl_snap
-									.as_ref()
-									.map(|s| (s.last_inbound, s.activated_at.or(s.established_at).unwrap_or(0)))
-									.unwrap_or((0, 0));
-								if bl_score > dl_score {
-									log(&format!("[POB][{}] Preferring backchannel link (last_inbound={} > {})",
-										message_label, bl_score.0, dl_score.0), LOG_NOTICE, false, false);
-									direct_link = Some(bl);
-								}
-							}
+						// Select the best available link via AppLinks.
+						//
+						// AppLinks::best_link_for compares the AppLinks-held outbound
+						// link and any peer-initiated inbound link registered via
+						// AppLinks::register_inbound, returning the one with the most
+						// recent last_inbound traffic. Returns None when no ACTIVE link
+						// exists for this destination (either link is still establishing
+						// or neither has been created yet).
+						let direct_link = AppLinks::best_link_for(&dest_hash)
+							// Fall back to the router's own outbound_links for non-AppLinks
+							// destinations (e.g. manually-created links from the non-AppLinks
+							// branch below).
+							.or_else(|| self.outbound_links.get(&dest_hash).cloned());
 
 							if let Some(link_arc) = direct_link {
 								let status = link_arc.status();
 								log(&format!("[POB][{}] DIRECT has-link status={}", message_label, status), LOG_NOTICE, false, false);
-								if status == reticulum_rust::link::STATE_ACTIVE {
-									// Happy path: link is up — send now.
-									if lxm.progress < 0.05 { lxm.progress = 0.05; }
-									if lxm.state != LXMessage::SENDING {
-										log(&format!("[POB][{}] DIRECT ACTIVE sending", message_label), LOG_NOTICE, false, false);
-										let snap = link_arc.snapshot().ok();
-										if let Some(ref snap) = snap {
-											if snap.initiator && !self.backchannel_identified_links.contains_key(&dest_hash) {
-												let source_identity = lxm.source().and_then(|s| s.identity.clone());
-												if let Some(identity) = source_identity {
-													log(&format!("[POB][{}] Pre-send identify on link {}", message_label, hexrep(&snap.link_id, false)), LOG_NOTICE, false, false);
-													if let Err(e) = link_arc.identify(&identity) {
-														log(&format!("[POB][{}] identify error: {}", message_label, e), LOG_NOTICE, false, false);
-													} else {
-														log(&format!("[POB][{}] Pre-send identify OK", message_label), LOG_NOTICE, false, false);
-														self.backchannel_identified_links.insert(dest_hash.clone(), true);
-													}
+							if status == reticulum_rust::link::STATE_ACTIVE {
+								// Happy path: link is up — send now.
+								if lxm.progress < 0.05 { lxm.progress = 0.05; }
+								if lxm.state != LXMessage::SENDING {
+									log(&format!("[POB][{}] DIRECT ACTIVE sending", message_label), LOG_NOTICE, false, false);
+									let snap = link_arc.snapshot().ok();
+									if let Some(ref snap) = snap {
+										if snap.initiator && !self.backchannel_identified_links.contains_key(&dest_hash) {
+											let source_identity = lxm.source().and_then(|s| s.identity.clone());
+											if let Some(identity) = source_identity {
+												log(&format!("[POB][{}] Pre-send identify on link {}", message_label, hexrep(&snap.link_id, false)), LOG_NOTICE, false, false);
+												if let Err(e) = link_arc.identify(&identity) {
+													log(&format!("[POB][{}] identify error: {}", message_label, e), LOG_NOTICE, false, false);
+												} else {
+													log(&format!("[POB][{}] Pre-send identify OK", message_label), LOG_NOTICE, false, false);
+													self.backchannel_identified_links.insert(dest_hash.clone(), true);
 												}
 											}
 										}
-										if let Ok(link_destination) = link_arc.build_link_destination() {
-											lxm.set_delivery_destination(link_destination);
-										}
-										lxm.set_delivery_link(link_arc.clone());
-										if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
-											log(&format!("[POB][{}] DIRECT send FAILED: {}", message_label, err), LOG_NOTICE, false, false);
-											// Send failed — clear state and fall through to propagation next cycle.
-											lxm.state = LXMessage::OUTBOUND;
-											lxm.clear_delivery_link();
+									}
+									if let Ok(link_destination) = link_arc.build_link_destination() {
+										lxm.set_delivery_destination(link_destination);
+									}
+									lxm.set_delivery_link(link_arc.clone());
+									if let Err(err) = lxm.send_with_handle(Some(message.clone())) {
+										log(&format!("[POB][{}] DIRECT send FAILED: {}", message_label, err), LOG_NOTICE, false, false);
+										lxm.state = LXMessage::OUTBOUND;
+										lxm.clear_delivery_link();
+										// Before falling to PROPAGATED try the alt link (Happy-Eyeballs
+										// sequential fallback — same tick, no stagger delay, no copy).
+										if let Some(alt_arc) = AppLinks::alt_link_for(&dest_hash, &link_arc) {
+											log(&format!("[POB][{}] DIRECT tier-1 failed → retrying on alt link", message_label), LOG_NOTICE, false, false);
+											if let Ok(alt_dest) = alt_arc.build_link_destination() {
+												lxm.set_delivery_destination(alt_dest);
+											}
+											lxm.set_delivery_link(alt_arc.clone());
+											if let Err(err2) = lxm.send_with_handle(Some(message.clone())) {
+												log(&format!("[POB][{}] DIRECT alt-link send FAILED: {} → PROPAGATED", message_label, err2), LOG_NOTICE, false, false);
+												lxm.state = LXMessage::OUTBOUND;
+												lxm.clear_delivery_link();
+												lxm.method = LXMessage::PROPAGATED;
+											} else {
+												log(&format!("[POB][{}] DIRECT alt-link send OK", message_label), LOG_NOTICE, false, false);
+												if !backchannel_setup_links.iter().any(|(l, _)| l.same_link(&alt_arc)) {
+													backchannel_setup_links.push((alt_arc.clone(), dest_hash.clone()));
+												}
+											}
+										} else {
 											log(&format!("[POB][{}] DIRECT send error → downgrading to PROPAGATED", message_label), LOG_NOTICE, false, false);
 											lxm.method = LXMessage::PROPAGATED;
-										} else {
-											log(&format!("[POB][{}] DIRECT send OK", message_label), LOG_NOTICE, false, false);
-											if !backchannel_setup_links.iter().any(|(l, _)| l.same_link(&link_arc)) {
-												backchannel_setup_links.push((link_arc.clone(), dest_hash.clone()));
+										}
+									} else {
+										log(&format!("[POB][{}] DIRECT send OK", message_label), LOG_NOTICE, false, false);
+										if !backchannel_setup_links.iter().any(|(l, _)| l.same_link(&link_arc)) {
+											backchannel_setup_links.push((link_arc.clone(), dest_hash.clone()));
+										}
+										// Happy-Eyeballs tier-2: AppLinks schedules a duplicate PACKET
+										// on the alt link after DIRECT_STAGGER_WAIT (1 s). Both
+										// callbacks are idempotent — first LRPROOF wins. Receiver
+										// deduplicates by LXMF message hash.
+										// // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+										if lxm.representation == LXMessage::PACKET {
+											if let Some(packed) = lxm.packed.clone() {
+												let h_del = message.clone();
+												let h_tout = message.clone();
+												AppLinks::schedule_alt_packet_fire(
+													&dest_hash,
+													&link_arc,
+													packed,
+													Arc::new(move || { mark_delivered_shared(&h_del); }),
+													Arc::new(move || { link_packet_timed_out_shared(&h_tout); }),
+													rns_app_links::DIRECT_STAGGER_WAIT,
+												);
 											}
 										}
 									}
-								} else if status == reticulum_rust::link::STATE_CLOSED {
-									// Link is CLOSED — clean up and retry with fresh link.
-									if lxm.state == LXMessage::SENDING {
-										lxm.state = LXMessage::OUTBOUND;
-										lxm.resource_representation = None;
-									}
-									lxm.clear_delivery_link();
-									self.direct_links.remove(&dest_hash);
-									self.backchannel_links.remove(&dest_hash);
-									self.backchannel_identified_links.remove(&dest_hash);
-									log(
-										&format!("[POB][{}] DIRECT link CLOSED → requesting new path", message_label),
-										LOG_NOTICE, false, false,
-									);
-									Transport::request_path(&dest_hash, None, None, None, None);
-									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3:
-									// PATH_REQUEST_WAIT not DELIVERY_RETRY_WAIT: path requests
-									// trigger announces in Reticulum.  The relay needs time to
-									// re-broadcast the destination's announce so that attempt 2
-									// can establish the link on a refreshed path.
-									lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
-								} else {
-									// Link is PENDING/HANDSHAKE — just wait for it to become active.
-									log(
-										&format!("[POB][{}] DIRECT link PENDING (status={}), waiting", message_label, status),
-										LOG_NOTICE, false, false,
-									);
 								}
+							} else if status == reticulum_rust::link::STATE_CLOSED {
+								// Link closed after we grabbed it — clean up and re-establish.
+								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3
+								if lxm.state == LXMessage::SENDING {
+									lxm.state = LXMessage::OUTBOUND;
+									lxm.resource_representation = None;
+								}
+								lxm.clear_delivery_link();
+								self.outbound_links.remove(&dest_hash);
+								// inbound link removal handled by AppLinks closed-callback
+								self.backchannel_identified_links.remove(&dest_hash);
+								log(
+									&format!("[POB][{}] DIRECT link CLOSED → requesting new path", message_label),
+									LOG_NOTICE, false, false,
+								);
+								Transport::request_path(&dest_hash, None, None, None, None);
+								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3:
+								// PATH_REQUEST_WAIT not DELIVERY_RETRY_WAIT: path requests
+								// trigger announces in Reticulum.  The relay needs time to
+								// re-broadcast the destination's announce so that attempt 2
+								// can establish the link on a refreshed path.
+								lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+							} else {
+								// Link is PENDING/HANDSHAKE — just wait for it to become active.
+								log(
+									&format!("[POB][{}] DIRECT link PENDING (status={}), waiting", message_label, status),
+									LOG_NOTICE, false, false,
+								);
+							}
+						} else if AppLinks::contains(&dest_hash) {
+							// AppLinks owns this destination's link lifecycle.  The APP_LINK_ACTIVE
+							// callback inserts the handle into outbound_links and wakes this thread.
+							// All we do here is yield until that event fires.
+							//
+							// NEVER ADD A PROPAGATED DOWNGRADE HERE.
+							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+							//
+							// receipt_timed_out is set by link_packet_timed_out when a
+							// receipt timeout fires (confirmed delivery failure).  Fail
+							// immediately — do NOT wait up to 18 s for the next LRREQ
+							// cycle.  The DISCONNECTED callback will NOT double-count when
+							// this flag is set.
+							//
+							// delivery_attempts is incremented by link_packet_timed_out on
+							// each receipt timeout and by the DISCONNECTED callback on each
+							// pure LRREQ timeout (never-sent cycle).  Once delivery_attempts
+							// reaches MAX_DELIVERY_ATTEMPTS the message is failed here so it
+							// does not loop forever.  >= (not >) trims one wasted extra cycle.
+							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+							if lxm.receipt_timed_out || lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
+								log(
+									&format!("[POB][{}] DIRECT AppLinks max receipt timeouts ({}) exceeded — failing",
+										message_label, lxm.delivery_attempts),
+									LOG_NOTICE, false, false,
+								);
+								self.fail_message(&mut lxm);
+								remove = true;
+							} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
+								let al_status = rns_app_links::AppLinks::status(&dest_hash);
+								log(
+									&format!("[POB][{}] AppLinks status={} — waiting for ACTIVE (attempt {}/{})",
+										message_label, al_status, lxm.delivery_attempts, Self::MAX_DELIVERY_ATTEMPTS),
+									LOG_NOTICE, false, false,
+								);
+								lxm.next_delivery_attempt = Some(now() + rns_app_links::DIRECT_STAGGER_WAIT);
+							}
 							} else {
 								// No link exists — establish one (matching Python LXMRouter behavior).
 								if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
@@ -1483,7 +1626,7 @@ impl LXMRouter {
 													// pre-register the handle here — doing so would
 													// register under the placeholder id and break
 													// LINKPROOF dispatch.
-													self.direct_links.insert(dest_hash.clone(), handle.clone());
+													self.outbound_links.insert(dest_hash.clone(), handle.clone());
 													let label_for_thread = message_label.to_string();
 													std::thread::spawn(move || {
 														if let Err(e) = handle.initiate() {
@@ -1553,10 +1696,23 @@ impl LXMRouter {
 													}
 												}
 											} else {
-												log(&format!("[POB][{}] PROPAGATED propagation_packed is None — re-packing not supported", message_label), LOG_NOTICE, false, false);
-												lxm.state = LXMessage::OUTBOUND;
-												lxm.delivery_attempts += 1;
-												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+												// Message was packed as DIRECT then downgraded to PROPAGATED at
+												// runtime (link never established). Build propagation_packed now
+												// from the already-present packed bytes and retry this tick.
+												// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+												match lxm.make_propagation_packed() {
+													Ok(()) => {
+														log(&format!("[POB][{}] PROPAGATED re-packed from DIRECT — retrying", message_label), LOG_NOTICE, false, false);
+														// propagation_packed is now Some; the next POB tick will send it.
+														lxm.state = LXMessage::OUTBOUND;
+														lxm.next_delivery_attempt = None;
+													}
+													Err(e) => {
+														log(&format!("[POB][{}] PROPAGATED make_propagation_packed failed: {} — failing message", message_label, e), LOG_ERROR, false, false);
+														self.fail_message(&mut lxm);
+														remove = true;
+													}
+												}
 											}
 										}
 									} else if status == reticulum_rust::link::STATE_CLOSED {
@@ -1608,14 +1764,89 @@ impl LXMRouter {
 									// LinkHandles whose LRPROOFs were silently
 									// dropped (see MICRORETICULUM_BUGS.md /
 									// LINK_REQUEST_PROTOCOL_FIX.md). Removed.
-									if !Transport::has_path(&node_hash) {
-										// Nudge a path request — AppLinks's own
-										// path-race will also be running, but
-										// belt-and-braces: if the dest hasn't
-										// been announced recently, this is the
-										// fastest way to populate the table.
-										Transport::request_path(&node_hash, None, None, None, None);
+									// Re-trigger AppLinks when the propagation link has
+								// closed but the entry is now DISCONNECTED.
+								//
+								// AppLinks::open_with_mode skips re-establishment for
+								// ACTIVE / ESTABLISHING / PATH_REQUESTED, but fires
+								// AppLinks::establish for DISCONNECTED — exactly what
+								// we need after a link teardown where no new announce
+								// has arrived to act as the external trigger.
+								//
+								// Without this, a PROPAGATED message queued while the
+								// propagation-node link is DISCONNECTED (e.g. right
+								// after a PSYNC failure tears the link down) stays
+								// stuck indefinitely: process_outbound sees no link,
+								// sets a retry timer, but nobody ever re-opens AppLinks,
+								// so the timer fires again with the same result.
+								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+								let al_status = rns_app_links::AppLinks::status(&node_hash);
+								if al_status == rns_app_links::APP_LINK_DISCONNECTED
+									|| al_status == rns_app_links::APP_LINK_NONE
+								{
+									// DISCONNECTED means a previous link attempt completed
+									// and failed (the link request timed out at 18 s).
+									// Count each such cycle so we eventually give up rather
+									// than retrying forever when the node is unreachable.
+									//
+									// NONE is the fresh cold-start state — do NOT count it
+									// as a failure: the first attempt hasn't happened yet.
+									//
+									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§2:
+									// This is event-based failure counting (link-establishment
+									// cycle failures), not a sleep/timeout.  We give up after
+									// MAX_DELIVERY_ATTEMPTS failed cycles (~2 × 18 s = ~36 s
+									// total), which is the correct signal that the prop node
+									// is unreachable for this message.
+									if al_status == rns_app_links::APP_LINK_DISCONNECTED {
+										lxm.delivery_attempts += 1;
+										log(
+											&format!(
+												"[POB][{}] PROPAGATED prop-node DISCONNECTED (link cycle {}/{})",
+												message_label, lxm.delivery_attempts, Self::MAX_DELIVERY_ATTEMPTS
+											),
+											LOG_NOTICE,
+											false,
+											false,
+										);
+										if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
+											log(
+												&format!(
+													"[POB][{}] PROPAGATED max link cycles reached — failing message",
+													message_label
+												),
+												LOG_ERROR,
+												false,
+												false,
+											);
+											self.fail_message(&mut lxm);
+											remove = true;
+										}
 									}
+									if !remove {
+										log(
+											&format!(
+												"[POB][{}] PROPAGATED prop-node AppLink={} → re-triggering open_persistent",
+												message_label, al_status
+											),
+											LOG_NOTICE,
+											false,
+											false,
+										);
+										rns_app_links::AppLinks::open_persistent(
+											&node_hash,
+											APP_NAME,
+											&["propagation"],
+										);
+									}
+								} else if !Transport::has_path(&node_hash) {
+									// Nudge a path request — AppLinks's own
+									// path-race will also be running, but
+									// belt-and-braces: if the dest hasn't
+									// been announced recently, this is the
+									// fastest way to populate the table.
+									Transport::request_path(&node_hash, None, None, None, None);
+								}
 								} else {
 									// Not time to retry yet — leave in pending_outbound
 									log(
@@ -2048,7 +2279,7 @@ impl LXMRouter {
 
 		if self.processing_count % Self::JOB_LINKS_INTERVAL == 0 {
 			self.clean_links();
-			self.tick_app_link_dual_link();
+			AppLinks::tick_dual_link_settling();
 		}
 
 		if self.processing_count % Self::JOB_TRANSIENT_INTERVAL == 0 {
@@ -2148,7 +2379,7 @@ impl LXMRouter {
 
 	fn clean_links(&mut self) {
 		let mut closed_links = Vec::new();
-		for (link_hash, link_arc) in self.direct_links.iter() {
+		for (link_hash, link_arc) in self.outbound_links.iter() {
 			// Skip inactivity cleanup for app_links — their lifetime is
 			// managed explicitly by app_link_open / app_link_close.
 			if AppLinks::contains(link_hash.as_slice()) {
@@ -2160,11 +2391,11 @@ impl LXMRouter {
 		}
 
 		for link_hash in closed_links.iter() {
-			if let Some(link_arc) = self.direct_links.get(link_hash) {
+			if let Some(link_arc) = self.outbound_links.get(link_hash) {
 				self.validated_peer_links.remove(&link_arc.link_id());
 				link_arc.teardown();
 			}
-			self.direct_links.remove(link_hash);
+			self.outbound_links.remove(link_hash);
 			self.backchannel_identified_links.remove(link_hash);
 			log("Cleaned inactive direct link", LOG_DEBUG, false, false);
 		}
@@ -2200,79 +2431,6 @@ impl LXMRouter {
 				self.acknowledge_sync_completion(None);
 			}
 			log("Cleaned outbound propagation link", LOG_DEBUG, false, false);
-		}
-	}
-
-	/// Phase 2 dual-link disambiguation for app_links.
-	///
-	/// For each destination registered as an `app_link`, when both an outbound
-	/// (`direct_links`) and inbound (`backchannel_links`) link are tracked,
-	/// tear down whichever has been silent (no inbound packet of any type)
-	/// for longer than `APP_LINK_DUAL_LINK_SETTLING_SECS` AND is older than
-	/// the other side's most-recent inbound. The fresher link is left intact
-	/// so the active conversation continues uninterrupted.
-	///
-	/// Pre-condition for teardown: both links must be ACTIVE — we never tear
-	/// down a link still establishing, and a CLOSED link is already handled
-	/// by `clean_links` / direct-send error paths.
-	fn tick_app_link_dual_link(&mut self) {
-		let dest_hashes: Vec<Vec<u8>> = AppLinks::destinations();
-		if dest_hashes.is_empty() {
-			return;
-		}
-		let now_secs = now() as u64;
-		let settling = Self::APP_LINK_DUAL_LINK_SETTLING_SECS;
-
-		for dest_hash in dest_hashes {
-			let out_link = self.direct_links.get(&dest_hash).cloned();
-			let in_link = self.backchannel_links.get(&dest_hash).cloned();
-			let (out_link, in_link) = match (out_link, in_link) {
-				(Some(o), Some(i)) => (o, i),
-				_ => continue,
-			};
-			if out_link.status() != reticulum_rust::link::STATE_ACTIVE
-				|| in_link.status() != reticulum_rust::link::STATE_ACTIVE
-			{
-				continue;
-			}
-			let out_last = out_link.snapshot().ok().map(|s| s.last_inbound).unwrap_or(0);
-			let in_last = in_link.snapshot().ok().map(|s| s.last_inbound).unwrap_or(0);
-
-			let out_silent = now_secs.saturating_sub(out_last);
-			let in_silent = now_secs.saturating_sub(in_last);
-
-			// Both fresh? leave them alone — active conversation could be on either.
-			if out_silent <= settling && in_silent <= settling {
-				continue;
-			}
-
-			if out_silent > settling && in_last > out_last {
-				log(
-					&format!(
-						"[APP_LINK] dual-link settling: tearing down outbound to {} (silent {}s, peer-side {}s)",
-						hexrep(&dest_hash, false), out_silent, in_silent
-					),
-					LOG_NOTICE, false, false,
-				);
-				out_link.teardown();
-				self.direct_links.remove(&dest_hash);
-				self.backchannel_identified_links.remove(&dest_hash);
-			} else if in_silent > settling && out_last > in_last {
-				log(
-					&format!(
-						"[APP_LINK] dual-link settling: tearing down inbound from {} (silent {}s, peer-side {}s)",
-						hexrep(&dest_hash, false), in_silent, out_silent
-					),
-					LOG_NOTICE, false, false,
-				);
-				in_link.teardown();
-				self.backchannel_links.remove(&dest_hash);
-			}
-			// If both silent past the settling window we leave them — the
-			// next clean_links / link-watchdog will time them out via the
-			// normal LINK_MAX_INACTIVITY path (app_links are exempted from
-			// that sweep, but a link with no inbound at all eventually fails
-			// keepalive and tears itself down).
 		}
 	}
 
@@ -3078,8 +3236,9 @@ impl LXMRouter {
 	/// Return the current state of a direct link to a peer.
 	/// 0 = no link / closed, 1 = pending (establishing), 2 = active.
 	pub fn peer_link_status(&self, dest_hash: &[u8]) -> u8 {
-		let link_arc = self.direct_links.get(dest_hash)
-			.or_else(|| self.backchannel_links.get(dest_hash));
+		let inbound = AppLinks::get_inbound_handle(dest_hash);
+		let link_arc = self.outbound_links.get(dest_hash)
+			.or_else(|| inbound.as_ref());
 		match link_arc {
 			None => 0,
 			Some(arc) => {
@@ -3110,7 +3269,7 @@ impl LXMRouter {
 	///
 	/// Forwards to `reticulum_rust::app_links::AppLinks::open` (the registry
 	/// owns spec + lifecycle; LXMF mirrors the resulting outbound LinkHandle
-	/// into `direct_links` via the status callback installed in `new`).
+	/// into `outbound_links` via the status callback installed in `new`).
 	/// Watches the destination at the LXMF level so announces drive the
 	/// existing fast-path delivery code.
 	pub fn app_link_open(&mut self, dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
@@ -3119,12 +3278,12 @@ impl LXMRouter {
 	}
 
 	/// Close an app link.  Forwards to the registry; the status callback
-	/// drops the mirror entry from `direct_links`.
+	/// drops the mirror entry from `outbound_links`.
 	pub fn app_link_close(&mut self, dest_hash: &[u8]) {
 		AppLinks::close(dest_hash);
 		// Defensive: also clear LXMF-side bookkeeping in case the status
 		// callback hasn't run yet.
-		if let Some(link_arc) = self.direct_links.remove(dest_hash) {
+		if let Some(link_arc) = self.outbound_links.remove(dest_hash) {
 			self.validated_peer_links.remove(&link_arc.link_id());
 		}
 		self.backchannel_identified_links.remove(dest_hash);
@@ -3136,11 +3295,11 @@ impl LXMRouter {
 	}
 
 	/// Get a clone of the LinkHandle for an app-link destination, if any.
-	/// Prefers the registry's outbound link, falls back to LXMF's
-	/// `backchannel_links` for peer-initiated links.
+	/// Prefers the registry's outbound link, falls back to the inbound link
+	/// registered via `AppLinks::register_inbound`.
 	pub fn app_link_get_handle(&self, dest_hash: &[u8]) -> Option<LinkHandle> {
 		AppLinks::get_handle(dest_hash)
-			.or_else(|| self.backchannel_links.get(dest_hash).cloned())
+			.or_else(|| AppLinks::get_inbound_handle(dest_hash))
 	}
 
 	/// Trigger one fresh app-link attempt for `dest_hash`.  Forwards to the
@@ -3591,13 +3750,13 @@ impl LXMRouter {
 		// Keeping the old link causes delivery failures: we'd send on a link the
 		// peer no longer services, the proof never arrives, and we time out.
 		//
-		// EXCEPTION: app_links own their direct_links entry explicitly via
+		// EXCEPTION: app_links own their outbound_links entry explicitly via
 		// app_link_open/close.  Tearing one down here would (a) break the user's
 		// app-link control plane and (b) risk firing expire_path on a healthy
 		// path if the link had not yet reached ACTIVE.  Leave it alone — the
 		// backchannel will still be recorded below for use as an alternate path.
 		if !AppLinks::contains(destination_hash.as_slice()) {
-			if let Some(old_link) = self.direct_links.remove(&destination_hash) {
+			if let Some(old_link) = self.outbound_links.remove(&destination_hash) {
 				log(
 					&format!(
 						"Peer {} established backchannel; tearing down old direct link",
@@ -3612,7 +3771,7 @@ impl LXMRouter {
 			}
 		}
 
-		self.backchannel_links.insert(destination_hash.clone(), link.clone());
+		AppLinks::register_inbound(&destination_hash, link.clone());
 
 		log(
 			&format!(

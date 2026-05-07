@@ -823,8 +823,8 @@ pub extern "C" fn lxmf_app_link_status(
 
 /// Send a blocking request on an existing app-link.
 ///
-/// Looks up the LinkHandle for `dest_hash` from the router's `direct_links`
-/// table (or `backchannel_links`), checks that the link is `STATE_ACTIVE`,
+/// Looks up the LinkHandle for `dest_hash` from the router's `outbound_links`
+/// table (or `inbound_links`), checks that the link is `STATE_ACTIVE`,
 /// then issues `path` with `payload` and waits up to `timeout_secs` for a
 /// response.
 ///
@@ -1445,6 +1445,48 @@ pub extern "C" fn lxmf_message_send(client: u64, msg: u64) -> i32 {
             }
         }
     })
+}
+
+/// Submit a message via the top-level `AppLinks::send` pipeline.
+///
+/// Same as [`lxmf_message_send`] but routes through
+/// `reticulum_rust::AppLinks::send` so the iface-race + 2 s liveness
+/// cache pick the best interface before LXMF dispatches. No client/router
+/// handle is needed — the global router registered by `lxmf_router_create`
+/// is used automatically.
+///
+/// Returns 0 on success, -1 on error (see `lxmf_last_error()`).
+#[no_mangle]
+pub extern "C" fn lxmf_message_send_via_app_links(msg: u64) -> i32 {
+    match lxmf::message_send_via_app_links(msg) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Forget the cached liveness winner for the given destination hash so
+/// the next `lxmf_message_send_via_app_links` re-races interfaces.
+///
+/// `dest_hash` must point to a `dest_len`-byte hash (typically 16). Hosts
+/// call this on known network-state changes (iOS WiFi→cellular, Android
+/// connectivity flips) where the cached iface may have gone offline.
+///
+/// Returns 0 on success, -1 if `dest_hash` is null.
+#[no_mangle]
+pub extern "C" fn lxmf_app_links_invalidate_liveness(
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    if dest_hash.is_null() || dest_len == 0 {
+        set_error("null or empty dest_hash".to_string());
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) };
+    lxmf::app_links_invalidate_liveness(slice);
+    0
 }
 
 /// Get message delivery state.

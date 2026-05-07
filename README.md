@@ -1,3 +1,7 @@
+> **⚠ WIP — API is unstable.** This crate is being actively refactored. App-specific
+> conveniences (send-strategy layer, inbound/outbound link management) will be extracted
+> to a higher-level crate. The public API will break. Not yet recommended for external use.
+
 # LXMF-rust
 
 A Rust implementation of the [LXMF](https://github.com/markqvist/LXMF) (Lightweight Extensible Message Format) protocol for [Reticulum](https://reticulum.network/) networks. LXMF provides reliable, encrypted, store-and-forward messaging over any transport that Reticulum supports — from LoRa and packet radio to TCP and I2P.
