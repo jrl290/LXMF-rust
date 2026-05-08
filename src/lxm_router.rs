@@ -1447,13 +1447,14 @@ impl LXMRouter {
 							// Terminal states.
 							if lxm.state == LXMessage::SENT || lxm.state == LXMessage::DELIVERED {
 								remove = true;
-								continue;
 							}
 
-							// SENDING: AppLinks::send is in flight — wait for its callback.
-							if lxm.state == LXMessage::SENDING {
-								continue;
-							}
+							// SENDING: AppLinks::send is in flight — nothing to do this tick.
+							// index increments at end of loop body so the next job tick re-checks.
+							// NEVER REMOVE EVER — do NOT add `continue` here; it skips the
+							// `if remove { pending_outbound.remove(index) }` cleanup at the end
+							// of the while loop body (which is outside this if-let block).
+							if !remove && lxm.state != LXMessage::SENDING {
 
 							// Failure: on_all_tiers_failed fired (receipt_timed_out)
 							// or too many attempts.
@@ -1468,12 +1469,13 @@ impl LXMRouter {
 								if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
 									self.fail_message(&mut lxm);
 									remove = true;
-									continue;
+									// NEVER REMOVE EVER — do NOT use `continue` or early-return here.
+									// Fall through; state=FAILED so the OUTBOUND block below won't fire.
 								}
 							}
 
 							// OUTBOUND: kick off the tier chain.
-							if lxm.state == LXMessage::OUTBOUND {
+							if lxm.state == LXMessage::OUTBOUND && !remove {
 								// Pack the message if not already packed.
 								// pack(true) stores bytes in lxm.packed and returns Result<(), String>.
 								let packed = if let Some(p) = lxm.packed.clone() {
@@ -1486,14 +1488,14 @@ impl LXMRouter {
 												log(&format!("[POB][{}] DIRECT pack succeeded but packed is None — failing", message_label), LOG_ERROR, false, false);
 												self.fail_message(&mut lxm);
 												remove = true;
-												continue;
+												Vec::new()
 											}
 										},
 										Err(e) => {
 											log(&format!("[POB][{}] DIRECT pack failed: {} — failing", message_label, e), LOG_ERROR, false, false);
 											self.fail_message(&mut lxm);
 											remove = true;
-											continue;
+											Vec::new()
 										}
 									}
 								};
@@ -1501,29 +1503,32 @@ impl LXMRouter {
 									log(&format!("[POB][{}] DIRECT empty packed bytes — failing", message_label), LOG_ERROR, false, false);
 									self.fail_message(&mut lxm);
 									remove = true;
-									continue;
 								}
 
-								lxm.state = LXMessage::SENDING;
-								lxm.violation_reported = false; // reset for this new send attempt — NEVER REMOVE EVER §1
-								lxm.progress = 0.05;
-								log(&format!("[POB][{}] DIRECT AppLinks::send starting", message_label), LOG_NOTICE, false, false);
+								if !remove {
+									lxm.state = LXMessage::SENDING;
+									lxm.violation_reported = false; // reset for this new send attempt — NEVER REMOVE EVER §1
+									lxm.progress = 0.05;
+									log(&format!("[POB][{}] DIRECT AppLinks::send starting", message_label), LOG_NOTICE, false, false);
 
-								let msg_del = message.clone();
-								let msg_fail = message.clone();
-								AppLinks::send(
-									&dest_hash,
-									packed,
-									Arc::new(move || {
-										// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-										mark_delivered_shared(&msg_del);
-									}),
-									Arc::new(move || {
-										// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-										link_packet_timed_out_shared(&msg_fail);
-									}),
-								);
+									let msg_del = message.clone();
+									let msg_fail = message.clone();
+									AppLinks::send(
+										&dest_hash,
+										packed,
+										Arc::new(move || {
+											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+											mark_delivered_shared(&msg_del);
+										}),
+										Arc::new(move || {
+											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+											link_packet_timed_out_shared(&msg_fail);
+										}),
+									);
+								}
 							}
+
+							} // end !remove && state != SENDING guard
 						} else {
 							// ── Non-AppLinks DIRECT: manual link management ─────────
 							// (legacy path for destinations opened without AppLinks::open)
