@@ -1857,7 +1857,7 @@ impl LXMRouter {
 											false,
 											false,
 										);
-										rns_app_links::AppLinks::open_persistent(
+										rns_app_links::AppLinks::open(
 											&node_hash,
 											APP_NAME,
 											&["propagation"],
@@ -3066,7 +3066,7 @@ impl LXMRouter {
 					AppLinks::close(&prev);
 				}
 			}
-			AppLinks::open_persistent(&destination_hash, APP_NAME, &["propagation"]);
+			AppLinks::open(&destination_hash, APP_NAME, &["propagation"]);
 		}
 
 		// Proactively request the path so it is available before the first sync attempt.
@@ -4260,7 +4260,7 @@ impl LXMRouter {
 			// idempotent (no-op if already in flight or ACTIVE) and
 			// covers the cold-start path where PSYNC fires before the
 			// node was registered.
-			AppLinks::open_persistent(&outbound_node, APP_NAME, &["propagation"]);
+			AppLinks::open(&outbound_node, APP_NAME, &["propagation"]);
 		} else {
 			log(&format!("[PSYNC] no path to {} → requesting path, starting path job", reticulum_rust::hexrep(&outbound_node, false)), LOG_NOTICE, false, false);
 			Transport::request_path(&outbound_node, None, None, None, None);
