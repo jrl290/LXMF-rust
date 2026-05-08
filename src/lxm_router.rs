@@ -1242,6 +1242,16 @@ impl LXMRouter {
 					// the correct guardrail is MAX_DELIVERY_ATTEMPTS (link-cycle count),
 					// which is enforced below in the PROPAGATED branch.
 					&& lxm.method != LXMessage::PROPAGATED
+					// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+					// AppLinks DIRECT tier-3 link establishment is bounded by the
+					// transport's per-hop timer (6 s × hops, up to ~78 s for 12-hop
+					// paths).  While state=SENDING and AppLinks owns the send, the
+					// deterministic completion event is the link's established/closed
+					// callback — not our 5 s wall clock.  Suppress §1 here; the real
+					// guard is app-links waiting for recv() on the establishment channel.
+					&& !(lxm.method == LXMessage::DIRECT
+						&& lxm.state == LXMessage::SENDING
+						&& AppLinks::contains(&lxm.destination_hash))
 				{
 					if let Some(ts) = lxm.timestamp {
 						let elapsed = now() - ts;
@@ -1457,21 +1467,35 @@ impl LXMRouter {
 							if !remove && lxm.state != LXMessage::SENDING {
 
 							// Failure: on_all_tiers_failed fired (receipt_timed_out)
-							// or too many attempts.
-							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-							if lxm.receipt_timed_out || lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
+							// or too many link-cycle attempts.
+							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3
+							//
+							// receipt_timed_out means AppLinks exhausted all 3 tiers (tier-1
+							// inbound link, tier-2 cached link, tier-3 expire+race+new link).
+							// §3: no retries — fail immediately regardless of attempt count.
+							//
+							// delivery_attempts >= MAX is a separate guard for non-AppLinks link
+							// cycle failures (DISCONNECTED callback increments without setting
+							// receipt_timed_out).
+							if lxm.receipt_timed_out {
 								log(
-									&format!("[POB][{}] DIRECT AppLinks all tiers failed (attempts={}, receipt_timed_out={})",
-										message_label, lxm.delivery_attempts, lxm.receipt_timed_out),
+									&format!("[POB][{}] DIRECT AppLinks on_all_tiers_failed — failing (attempts={})",
+										message_label, lxm.delivery_attempts),
 									LOG_NOTICE, false, false,
 								);
 								lxm.receipt_timed_out = false;
-								if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
-									self.fail_message(&mut lxm);
-									remove = true;
-									// NEVER REMOVE EVER — do NOT use `continue` or early-return here.
-									// Fall through; state=FAILED so the OUTBOUND block below won't fire.
-								}
+								self.fail_message(&mut lxm);
+								remove = true;
+								// NEVER REMOVE EVER — do NOT use `continue` or early-return here.
+								// Fall through; state=FAILED so the OUTBOUND block below won't fire.
+							} else if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
+								log(
+									&format!("[POB][{}] DIRECT max link-cycle attempts ({}) — failing",
+										message_label, lxm.delivery_attempts),
+									LOG_NOTICE, false, false,
+								);
+								self.fail_message(&mut lxm);
+								remove = true;
 							}
 
 							// OUTBOUND: kick off the tier chain.
