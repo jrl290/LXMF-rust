@@ -380,23 +380,23 @@ pub fn message_send(router_handle: u64, msg_handle: u64) -> Result<(), String> {
 
 /// Submit a message via the top-level `AppLinks::send` pipeline.
 ///
-/// Differences from [`message_send`]:
-///   * No router handle is required — the message is dispatched on the
-///     process-wide global router registered by `LXMRouter::new`.
-///   * Runs the [`reticulum_rust::app_links::liveness::race_path`] race
-///     before dispatch to pick the fastest interface (cached for 2 s).
-///   * Returns `Err` if the 5 s liveness budget elapses with no winner,
-///     or if no usable (online, non-LoRa) interface is available.
+/// Queues `msg_handle` on the process-wide global router.  The
+/// `process_outbound` loop drives the three-tier send hierarchy via
+/// [`app_links::AppLinks::send`] once the message reaches the DIRECT
+/// branch.
 ///
-/// Intended as the new default send API for hosts that want
-/// iface-selection abstracted away. Existing callers using
-/// [`message_send`] continue to work unchanged.
+/// Returns immediately; delivery outcome arrives via the message-state
+/// callback registered with [`router_set_message_state_callback`].
 pub fn message_send_via_app_links(msg_handle: u64) -> Result<(), String> {
-    use reticulum_rust::app_links::AppLinks;
-    use crate::lxm_router::OutboundLxm;
     let msg: Arc<Mutex<LXMessage>> =
         get_handle(msg_handle).ok_or_else(|| "invalid message handle".to_string())?;
-    AppLinks::send(OutboundLxm(msg)).map_err(|e| e.to_string())
+    let router = crate::lxm_router::global_router()
+        .ok_or_else(|| "no LXMRouter registered".to_string())?;
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .handle_outbound(msg);
+    Ok(())
 }
 
 /// Forget the cached liveness winner for `dest_hash` so the next
@@ -406,7 +406,7 @@ pub fn message_send_via_app_links(msg_handle: u64) -> Result<(), String> {
 /// Android `ConnectivityManager` callbacks) where the cached iface may
 /// have just gone offline.
 pub fn app_links_invalidate_liveness(dest_hash: &[u8]) {
-    reticulum_rust::app_links::AppLinks::invalidate_liveness(dest_hash);
+    app_links::AppLinks::invalidate_liveness(dest_hash);
 }
 
 /// Query the current state of a message.
@@ -635,9 +635,9 @@ pub fn router_app_link_set_policy(router_handle: u64, policy: u8) -> Result<(), 
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;
     let p = match policy {
-        0 => reticulum_rust::app_links::LinkPolicy::Foreground,
-        1 => reticulum_rust::app_links::LinkPolicy::Background,
-        2 => reticulum_rust::app_links::LinkPolicy::Suspended,
+        0 => app_links::LinkPolicy::Foreground,
+        1 => app_links::LinkPolicy::Background,
+        2 => app_links::LinkPolicy::Suspended,
         other => return Err(format!("unknown link policy {}", other)),
     };
     router
@@ -657,9 +657,9 @@ pub fn router_app_link_policy(router_handle: u64) -> Result<u8, String> {
         .map_err(|e| e.to_string())?
         .app_link_policy();
     Ok(match p {
-        reticulum_rust::app_links::LinkPolicy::Foreground => 0,
-        reticulum_rust::app_links::LinkPolicy::Background => 1,
-        reticulum_rust::app_links::LinkPolicy::Suspended => 2,
+        app_links::LinkPolicy::Foreground => 0,
+        app_links::LinkPolicy::Background => 1,
+        app_links::LinkPolicy::Suspended => 2,
     })
 }
 
@@ -694,7 +694,7 @@ pub fn router_set_message_state_callback(
 /// MUST NOT block.
 pub fn router_register_app_link_status_callback(
     router_handle: u64,
-    callback: reticulum_rust::app_links::AppLinkStatusCallback,
+    callback: app_links::AppLinkStatusCallback,
 ) -> Result<(), String> {
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;

@@ -289,7 +289,7 @@ impl LxmfClient {
     ) -> Result<(), String> {
         // Adapt the (hash, status, _link) registry callback to (hash, status).
         let cb_outer = cb.clone();
-        let adapter: reticulum_rust::app_links::AppLinkStatusCallback =
+        let adapter: app_links::AppLinkStatusCallback =
             std::sync::Arc::new(move |hash: &[u8], status: u8, _link| {
                 cb_outer(hash, status);
             });

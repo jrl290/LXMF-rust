@@ -178,7 +178,7 @@ pub fn app_link_reconnect_handler(
 		// visibly freezing the UI thread inside `app_link_status()` — and
 		// deadlocked when multiple back-to-back announces fired the handler.
 		let should_reconnect = {
-			use reticulum_rust::app_links::AppLinks;
+			use app_links::AppLinks;
 			AppLinks::contains(destination_hash)
 				&& AppLinks::status(destination_hash) == LXMRouter::APP_LINK_DISCONNECTED
 		};

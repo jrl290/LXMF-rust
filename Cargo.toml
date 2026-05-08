@@ -26,6 +26,7 @@ path = "src/bin/rmp_format_test.rs"
 
 [dependencies]
 reticulum_rust = { path = "../Reticulum-rust" }
+app_links = { path = "../app-links" }
 rmp = "0.8.14"
 rmpv = "=1.0.0"
 rmp-serde = "1.1"
