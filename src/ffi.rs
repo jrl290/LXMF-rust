@@ -565,12 +565,18 @@ pub fn router_app_link_close(router_handle: u64, dest_hash: &[u8]) -> Result<(),
 /// Returns: 0 = not tracked, 1 = path requested, 2 = link establishing,
 ///          3 = link active, 4 = disconnected (reconnects on next announce).
 /// Returns `Err` on parameter error.
+///
+/// NEVER acquire the router mutex here. §6: never block the UI. §7: no
+/// synchronous waits. AppLinks::status() reads from its own registry lock
+/// which is never held while doing I/O; it does not need or use any router
+/// state. Locking the router here causes a deadlock when the job thread
+/// holds the router lock and the UI timer calls this on the main thread.
+/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §6,§7.
 pub fn router_app_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8, String> {
-    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+    // Validate the handle is live — but do NOT lock the router.
+    let _: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;
-
-    let guard = router.lock().map_err(|e| e.to_string())?;
-    Ok(guard.app_link_status(dest_hash))
+    Ok(app_links::AppLinks::status(dest_hash))
 }
 
 /// Get a clone of the LinkHandle for an app-link destination, if one is
