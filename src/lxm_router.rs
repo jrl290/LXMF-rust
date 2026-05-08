@@ -1520,9 +1520,11 @@ impl LXMRouter {
 									}
 								}
 							} else if status == reticulum_rust::link::STATE_CLOSED {
-								// Link closed after we grabbed it — clean up and re-establish.
+								// Link closed after we grabbed it.  Track whether we were mid-send
+								// (link was ACTIVE and died) vs. never-sent (establishment timeout).
 								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3
-								if lxm.state == LXMessage::SENDING {
+								let was_sending = lxm.state == LXMessage::SENDING;
+								if was_sending {
 									lxm.state = LXMessage::OUTBOUND;
 									lxm.resource_representation = None;
 								}
@@ -1534,13 +1536,35 @@ impl LXMRouter {
 									&format!("[POB][{}] DIRECT link CLOSED → requesting new path", message_label),
 									LOG_NOTICE, false, false,
 								);
-								Transport::request_path(&dest_hash, None, None, None, None);
-								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3:
-								// PATH_REQUEST_WAIT not DELIVERY_RETRY_WAIT: path requests
-								// trigger announces in Reticulum.  The relay needs time to
-								// re-broadcast the destination's announce so that attempt 2
-								// can establish the link on a refreshed path.
-								lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+
+								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1:
+								// Count every establishment failure (link died before we could
+								// send on it) as a delivery attempt.  Without this, the POB
+								// latches onto the next message's link and spins indefinitely,
+								// spamming §1 violations.  When MAX_DELIVERY_ATTEMPTS is
+								// reached, fire FAILED so the caller can fall back (e.g. the
+								// Swift layer's prop-fallback has already fired at 5 s).
+								// was_sending → link was ACTIVE; the closure is a mid-send
+								// tear-down, not an establishment failure — still count it so
+								// the message doesn't linger either.
+								lxm.delivery_attempts += 1;
+								if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
+									log(
+										&format!("[POB][{}] DIRECT max link-closure count ({}) — failing",
+											message_label, lxm.delivery_attempts),
+										LOG_NOTICE, false, false,
+									);
+									self.fail_message(&mut lxm);
+									remove = true;
+								} else {
+									Transport::request_path(&dest_hash, None, None, None, None);
+									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3:
+									// PATH_REQUEST_WAIT not DELIVERY_RETRY_WAIT: path requests
+									// trigger announces in Reticulum.  The relay needs time to
+									// re-broadcast the destination's announce so that attempt 2
+									// can establish the link on a refreshed path.
+									lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+								}
 							} else {
 								// Link is PENDING/HANDSHAKE — just wait for it to become active.
 								log(
@@ -5292,6 +5316,56 @@ mod tests {
 			"Arc::ptr_eq dedup guard must appear after 'DIRECT send OK' — \
 			 it prevents the same link being queued for delivery_link_established \
 			 more than once per process_outbound cycle"
+		);
+	}
+
+	/// REGRESSION GUARD: the DIRECT-delivery `CLOSED` branch must increment
+	/// `delivery_attempts` so that repeated link-establishment failures
+	/// (LINKREQUEST sent, no LRPROOF back → link times out → CLOSED) count
+	/// toward `MAX_DELIVERY_ATTEMPTS` and the message is eventually failed.
+	///
+	/// Before this fix the CLOSED branch never incremented the counter.  The
+	/// POB would latch onto the next message's link (inserted by another POB
+	/// thread) and spin indefinitely, firing §1 VIOLATIONS every 2 s forever.
+	///
+	/// Correct flow (MAX_DELIVERY_ATTEMPTS=2):
+	///   1. "no link" branch:  delivery_attempts → 1  → create link
+	///   2. CLOSED branch:     delivery_attempts → 2  → 2 >= 2 → fail_message
+	///
+	/// This test verifies the fix is present in the source so it is never
+	/// silently reverted.  NEVER REMOVE — see DESIGN_PRINCIPLES.md §1.
+	#[test]
+	fn direct_closed_branch_increments_delivery_attempts() {
+		let src = include_str!("lxm_router.rs");
+
+		// The CLOSED sentinel log line must still exist.
+		assert!(
+			src.contains("DIRECT link CLOSED → requesting new path"),
+			"DIRECT link CLOSED log marker must exist — \
+			 rename this test if the log line changes"
+		);
+
+		// After "DIRECT link CLOSED", delivery_attempts must be incremented.
+		let closed_pos = src.find("DIRECT link CLOSED → requesting new path").unwrap();
+		let fragment = &src[closed_pos..];
+
+		// Verify the increment appears before the next major branch keyword.
+		let next_branch = fragment.find("LXMessage::PROPAGATED")
+			.unwrap_or(fragment.len());
+		let increment_present = fragment[..next_branch].contains("delivery_attempts += 1");
+		assert!(
+			increment_present,
+			"delivery_attempts += 1 must appear in the DIRECT CLOSED branch — \
+			 without it, POB spins forever on repeated link-establishment failures \
+			 and §1 violations fire indefinitely. NEVER REMOVE — DESIGN_PRINCIPLES §1"
+		);
+
+		// The MAX_DELIVERY_ATTEMPTS guard must also appear in the same region.
+		let max_guard_present = fragment[..next_branch].contains("MAX_DELIVERY_ATTEMPTS");
+		assert!(
+			max_guard_present,
+			"MAX_DELIVERY_ATTEMPTS guard must appear after delivery_attempts += 1 \
+			 in the DIRECT CLOSED branch — prevents infinite POB loop"
 		);
 	}
 }
