@@ -1199,7 +1199,9 @@ impl LXMRouter {
 					.or(lxm.hash.as_ref())
 					.map(|id| hexrep(id, false))
 					.unwrap_or_else(|| prettyhexrep(&lxm.destination_hash));
-				log(&format!("[POB][{}] state={} method={} attempts={}", message_label, lxm.state, lxm.method, lxm.delivery_attempts), LOG_NOTICE, false, false);
+				// (unconditional per-message state log removed — generated 900k+ lines/25s
+				// because every outbound_wake wakes the job loop; individual action
+				// branches below already log their transitions)
 
 				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 				//
@@ -1243,7 +1245,10 @@ impl LXMRouter {
 				{
 					if let Some(ts) = lxm.timestamp {
 						let elapsed = now() - ts;
-						if elapsed > reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
+						if elapsed > reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS
+							&& !lxm.violation_reported  // log once per send attempt — NEVER REMOVE EVER §1
+						{
+							lxm.violation_reported = true;
 							let msg = format!(
 								"DESIGN_PRINCIPLES §1 VIOLATION: POB message [{}] \
 								 stuck for {:.2}s (limit {:.1}s) — method={} \
@@ -1500,6 +1505,7 @@ impl LXMRouter {
 								}
 
 								lxm.state = LXMessage::SENDING;
+								lxm.violation_reported = false; // reset for this new send attempt — NEVER REMOVE EVER §1
 								lxm.progress = 0.05;
 								log(&format!("[POB][{}] DIRECT AppLinks::send starting", message_label), LOG_NOTICE, false, false);
 

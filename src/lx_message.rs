@@ -66,6 +66,11 @@ pub struct LXMessage {
 	/// counting the same failure (receipt-timeout teardown vs. LRREQ timeout).
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) receipt_timed_out: bool,
+	/// Set after the first §1 violation is logged for this message so subsequent
+	/// POB iterations don't spam the same violation at thousands of lines/second.
+	/// Cleared when the message transitions to a new send attempt.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) violation_reported: bool,
 	pub transport_encrypted: bool,
 	pub transport_encryption: Option<String>,
 	pub packet_representation: Option<Packet>,
@@ -227,6 +232,7 @@ impl LXMessage {
 			desired_method,
 			delivery_attempts: 0,
 			receipt_timed_out: false,
+			violation_reported: false,
 			transport_encrypted: false,
 			transport_encryption: None,
 			packet_representation: None,
