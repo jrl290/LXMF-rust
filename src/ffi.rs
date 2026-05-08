@@ -510,13 +510,29 @@ pub fn router_cancel_propagation(router_handle: u64) -> Result<(), String> {
 }
 
 /// Return the direct-link status for a peer: 0=none, 1=pending, 2=active.
+///
+/// NEVER acquire the router mutex here. §6: never block the UI. §7: no
+/// synchronous waits. outbound_links is a mirror of the AppLinks registry;
+/// read outbound and inbound handles directly from AppLinks (lockless reads
+/// on the AppLinks registry, which is never held during I/O). Locking the
+/// router here causes a deadlock when the job thread holds the router lock
+/// and the UI timer calls this on the main thread.
+/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §6,§7.
 pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u8, String> {
-    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+    // Validate handle is live — but do NOT lock the router.
+    let _: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;
-
-    let guard = router.lock().map_err(|e| e.to_string())?;
-    let status = guard.peer_link_status(dest_hash);
-    Ok(status)
+    let handle = app_links::AppLinks::get_handle(dest_hash)
+        .or_else(|| app_links::AppLinks::get_inbound_handle(dest_hash));
+    match handle {
+        None => Ok(0),
+        Some(h) => {
+            let s = h.status();
+            if s == reticulum_rust::link::STATE_ACTIVE { Ok(2) }
+            else if s == reticulum_rust::link::STATE_PENDING { Ok(1) }
+            else { Ok(0) }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
