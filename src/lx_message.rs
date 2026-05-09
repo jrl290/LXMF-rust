@@ -9,7 +9,7 @@ use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::{self, Identity, SIGLENGTH, TRUNCATED_HASHLENGTH};
-use reticulum_rust::link::{Link, LinkHandle};
+use reticulum_rust::link::LinkHandle;
 use reticulum_rust::packet::{self, Packet};
 use reticulum_rust::resource::{Resource, ResourceData, ResourceStatus};
 use reticulum_rust::transport::Transport;
