@@ -66,6 +66,13 @@ pub struct LXMessage {
 	/// counting the same failure (receipt-timeout teardown vs. LRREQ timeout).
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) receipt_timed_out: bool,
+	/// Set by the AppLinks Timer P callback after PROP_FALLBACK_DELAY (5 s)
+	/// without delivery.  The POB loop reads this flag and fires
+	/// fire_message_state(hash, PROP_FALLBACK_REQUESTED) once, which signals
+	/// the caller (iOS/lxm_router) to start a parallel propagation send.
+	/// Cleared immediately after the signal is dispatched.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) needs_prop_fallback: bool,
 	/// Set after the first §1 violation is logged for this message so subsequent
 	/// POB iterations don't spam the same violation at thousands of lines/second.
 	/// Cleared when the message transitions to a new send attempt.
@@ -98,6 +105,11 @@ impl LXMessage {
 	pub const REJECTED: u8 = 0xFD;
 	pub const CANCELLED: u8 = 0xFE;
 	pub const FAILED: u8 = 0xFF;
+	/// Signal state: AppLinks Timer P fired — caller should start propagation
+	/// in parallel with the still-running direct send.  Never stored as
+	/// a persistent message state; used only as a fire_message_state signal.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub const PROP_FALLBACK_REQUESTED: u8 = 0x10;
 
 	pub const UNKNOWN: u8 = 0x00;
 	pub const PACKET: u8 = 0x01;
@@ -232,6 +244,7 @@ impl LXMessage {
 			desired_method,
 			delivery_attempts: 0,
 			receipt_timed_out: false,
+			needs_prop_fallback: false,
 			violation_reported: false,
 			transport_encrypted: false,
 			transport_encryption: None,

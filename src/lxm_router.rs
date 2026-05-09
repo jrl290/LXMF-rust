@@ -544,60 +544,18 @@ impl LXMRouter {
 						}
 						rns_app_links::APP_LINK_DISCONNECTED => {
 							router.outbound_links.remove(&dest_owned);
+							// Re-announce our delivery destination(s) when a direct
+							// messaging link closes.  The link closing IS the
+							// deterministic signal that the peer may need a fresh path
+							// to us in order to establish an inbound link (e.g. Meshchat
+							// cold-send after keepalive expiry).  Announcing here ensures
+							// the relay's path-table entry for us is current before the
+							// peer retries.
 							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-							// Count each link-cycle failure for DIRECT messages to this
-							// destination.  DISCONNECTED fires once per link closure —
-							// whether from a receipt-timeout-caused teardown (1.5 s) or
-							// an 18 s LRREQ timeout.  Counting here is more reliable than
-							// reading AppLinks::status() in the POB loop because the
-							// DISCONNECTED window is only microseconds wide; the 2 s POB
-							// tick almost always misses it.
-							//
-							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-							// Count each link-cycle failure for DIRECT messages to this
-							// destination.  DISCONNECTED fires once per link closure —
-							// whether from a receipt-timeout-caused teardown (1.5 s) or
-							// an 18 s LRREQ timeout.
-							//
-							// When a receipt timeout fires, link_packet_timed_out sets the
-							// receipt_timed_out flag AND increments delivery_attempts.  In
-							// that case we must NOT count again here — the POB loop will see
-							// the flag and fail the message immediately on the next tick,
-							// avoiding the full 18 s LRREQ wait and the §1 violations that
-							// come with it.
-							//
-							// When receipt_timed_out is NOT set (i.e. an 18 s LRREQ timeout
-							// fired without us ever getting to send), we ARE the sole counter
-							// for that failure cycle and must increment.
-							//
-							// try_lock is used to avoid blocking the callback thread if the
-							// receipt-timeout handler happens to still be running.
-							for msg_arc in &router.pending_outbound {
-								if let Ok(mut lxm) = msg_arc.try_lock() {
-									if lxm.method == LXMessage::DIRECT
-										&& lxm.destination_hash == dest_owned
-										&& !LXMessage::is_success_state(lxm.state)
-										&& lxm.state != LXMessage::CANCELLED
-										&& lxm.state != LXMessage::FAILED
-									{
-										if lxm.receipt_timed_out {
-											// receipt_timed_out is already counted by
-											// link_packet_timed_out; POB will fail the message
-											// on its next tick.  Do not double-count.
-											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-										} else {
-											lxm.delivery_attempts += 1;
-											log(
-												&format!(
-													"[APP_LINK] DIRECT link-cycle fail for {} attempts={}",
-													hexrep(&dest_owned, false),
-													lxm.delivery_attempts,
-												),
-												LOG_NOTICE, false, false,
-											);
-										}
-									}
-								}
+							let delivery_hashes: Vec<Vec<u8>> =
+								router.delivery_destinations.keys().cloned().collect();
+							for hash in delivery_hashes {
+								router.announce(&hash, None);
 							}
 						}
 						rns_app_links::APP_LINK_NONE => {
@@ -1456,22 +1414,34 @@ impl LXMRouter {
 							// of the while loop body (which is outside this if-let block).
 							if !remove && lxm.state != LXMessage::SENDING {
 
-							// Failure: on_all_tiers_failed fired (receipt_timed_out)
-							// or too many attempts.
+							// Timer P signal: AppLinks fired on_propagation_needed (5 s elapsed).
+							// Signal the caller to start a parallel propagation send while
+							// the direct send is still running.
 							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-							if lxm.receipt_timed_out || lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
+							if lxm.needs_prop_fallback {
+								lxm.needs_prop_fallback = false;
+								if !LXMessage::is_success_state(lxm.state) {
+									if let Some(hash) = lxm.hash.as_ref() {
+										self.fire_message_state(hash, LXMessage::PROP_FALLBACK_REQUESTED);
+									}
+								}
+							}
+
+							// Failure: on_failed fired (tier 3 exhausted all protocol timeouts).
+							// AppLinks::send is a one-shot 3-tier call; fail immediately.
+							// No retry (§3).
+							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3
+							if lxm.receipt_timed_out {
 								log(
-									&format!("[POB][{}] DIRECT AppLinks all tiers failed (attempts={}, receipt_timed_out={})",
-										message_label, lxm.delivery_attempts, lxm.receipt_timed_out),
+									&format!("[POB][{}] DIRECT AppLinks all tiers failed (receipt_timed_out)",
+										message_label),
 									LOG_NOTICE, false, false,
 								);
 								lxm.receipt_timed_out = false;
-								if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
-									self.fail_message(&mut lxm);
-									remove = true;
-									// NEVER REMOVE EVER — do NOT use `continue` or early-return here.
-									// Fall through; state=FAILED so the OUTBOUND block below won't fire.
-								}
+								self.fail_message(&mut lxm);
+								remove = true;
+								// NEVER REMOVE EVER — do NOT use `continue` or early-return here.
+								// Fall through; state=FAILED so the OUTBOUND block below won't fire.
 							}
 
 							// OUTBOUND: kick off the tier chain.
@@ -1512,7 +1482,9 @@ impl LXMRouter {
 									log(&format!("[POB][{}] DIRECT AppLinks::send starting", message_label), LOG_NOTICE, false, false);
 
 									let msg_del = message.clone();
+									let msg_prop = message.clone();
 									let msg_fail = message.clone();
+									let wake_tx_prop = self.outbound_wake_tx.clone();
 									AppLinks::send(
 										&dest_hash,
 										packed,
@@ -1521,6 +1493,17 @@ impl LXMRouter {
 											mark_delivered_shared(&msg_del);
 										}),
 										Arc::new(move || {
+											// Timer P: 5 s elapsed without delivery.
+											// Set the flag; wake POB to fire PROP_FALLBACK_REQUESTED
+											// immediately so the caller can start a parallel prop send.
+											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+											if let Ok(mut lxm) = msg_prop.try_lock() {
+												lxm.needs_prop_fallback = true;
+											}
+											let _ = wake_tx_prop.send(());
+										}),
+										Arc::new(move || {
+											// on_failed: tier 3 exhausted all protocol timeouts.
 											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 											link_packet_timed_out_shared(&msg_fail);
 										}),
@@ -1794,85 +1777,28 @@ impl LXMRouter {
 									// Re-trigger AppLinks when the propagation link has
 								// closed but the entry is now DISCONNECTED.
 								//
-								// AppLinks::open_with_mode skips re-establishment for
-								// ACTIVE / ESTABLISHING / PATH_REQUESTED, but fires
-								// AppLinks::establish for DISCONNECTED — exactly what
-								// we need after a link teardown where no new announce
-								// has arrived to act as the external trigger.
-								//
-								// Without this, a PROPAGATED message queued while the
-								// propagation-node link is DISCONNECTED (e.g. right
-								// after a PSYNC failure tears the link down) stays
-								// stuck indefinitely: process_outbound sees no link,
-								// sets a retry timer, but nobody ever re-opens AppLinks,
-								// so the timer fires again with the same result.
-								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 								let al_status = rns_app_links::AppLinks::status(&node_hash);
 								if al_status == rns_app_links::APP_LINK_DISCONNECTED
 									|| al_status == rns_app_links::APP_LINK_NONE
 								{
-									// DISCONNECTED means a previous link attempt completed
-									// and failed (the link request timed out at 18 s).
-									// Count each such cycle so we eventually give up rather
-									// than retrying forever when the node is unreachable.
-									//
-									// NONE is the fresh cold-start state — do NOT count it
-									// as a failure: the first attempt hasn't happened yet.
-									//
-									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§2:
-									// This is event-based failure counting (link-establishment
-									// cycle failures), not a sleep/timeout.  We give up after
-									// MAX_DELIVERY_ATTEMPTS failed cycles (~2 × 18 s = ~36 s
-									// total), which is the correct signal that the prop node
-									// is unreachable for this message.
-									if al_status == rns_app_links::APP_LINK_DISCONNECTED {
-										lxm.delivery_attempts += 1;
-										log(
-											&format!(
-												"[POB][{}] PROPAGATED prop-node DISCONNECTED (link cycle {}/{})",
-												message_label, lxm.delivery_attempts, Self::MAX_DELIVERY_ATTEMPTS
-											),
-											LOG_NOTICE,
-											false,
-											false,
-										);
-										if lxm.delivery_attempts >= Self::MAX_DELIVERY_ATTEMPTS {
-											log(
-												&format!(
-													"[POB][{}] PROPAGATED max link cycles reached — failing message",
-													message_label
-												),
-												LOG_ERROR,
-												false,
-												false,
-											);
-											self.fail_message(&mut lxm);
-											remove = true;
-										}
-									}
-									if !remove {
-										log(
-											&format!(
-												"[POB][{}] PROPAGATED prop-node AppLink={} → re-triggering open_persistent",
-												message_label, al_status
-											),
-											LOG_NOTICE,
-											false,
-											false,
-										);
-										rns_app_links::AppLinks::open(
-											&node_hash,
-											APP_NAME,
-											&["propagation"],
-										);
-									}
-								} else if !Transport::has_path(&node_hash) {
-									// Nudge a path request — AppLinks's own
-									// path-race will also be running, but
-									// belt-and-braces: if the dest hasn't
-									// been announced recently, this is the
-									// fastest way to populate the table.
-									Transport::request_path(&node_hash, None, None, None, None);
+									// Link closure / missing registration is a terminal event
+									// for this propagation-send attempt. Re-opening AppLinks
+									// from the message pump was an application-level retry loop
+									// (`CLOSED -> open -> LRREQ -> CLOSED -> ...`). Surface
+									// the failure instead; a future fresh announce can open a
+									// new cycle outside this failed send.
+									// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §3.
+									log(
+										&format!(
+											"[POB][{}] PROPAGATED prop-node AppLink={} — failing message",
+											message_label, al_status
+										),
+										LOG_ERROR,
+										false,
+										false,
+									);
+									self.fail_message(&mut lxm);
+									remove = true;
 								}
 								} else {
 									// Not time to retry yet — leave in pending_outbound
@@ -3071,29 +2997,10 @@ impl LXMRouter {
 			AppLinks::open(&destination_hash, APP_NAME, &["propagation"]);
 		}
 
-		// Proactively request the path so it is available before the first sync attempt.
-		//
-		// `Transport::request_path` calls `Packet::send` → `Transport::outbound`,
-		// which spinwait/sleeps for transport-job pacing.  We are still holding
-		// the router `&mut self` lock here — performing the blocking request
-		// inline freezes every other router caller (most visibly the UI
-		// thread polling `app_link_status()`).  Defer to a background thread
-		// so the router lock is released as soon as state is updated.
-		if !Transport::has_path(&destination_hash) {
-			log(
-				&format!(
-					"No path to propagation node {}, requesting proactively",
-					reticulum_rust::hexrep(&destination_hash, false)
-				),
-				LOG_DEBUG,
-				false,
-				false,
-			);
-			let dh = destination_hash.clone();
-			std::thread::spawn(move || {
-				Transport::request_path(&dh, None, None, None, None);
-			});
-		}
+		// AppLinks owns the single path-race for propagation. Do not fire a
+		// second proactive PATH_REQUEST here; for propagation that race also
+		// requires a current-session PATH_RESPONSE / announce before LRREQ.
+		// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §3, §5.
 
 		Ok(())
 	}
@@ -5368,6 +5275,35 @@ mod tests {
 			max_guard_present,
 			"MAX_DELIVERY_ATTEMPTS guard must appear after delivery_attempts += 1 \
 			 in the DIRECT CLOSED branch — prevents infinite POB loop"
+		);
+	}
+
+	/// REGRESSION GUARD: PROPAGATED send must not re-open the propagation
+	/// AppLink from the message pump after APP_LINK_DISCONNECTED / NONE.
+	///
+	/// That was an application-level retry loop: CLOSED -> open -> LRREQ ->
+	/// CLOSED, repeated from process_outbound. AppLinks owns the single
+	/// path-race and now requires a current-session PATH_RESPONSE / announce
+	/// before LRREQ; LXMF must surface failure instead of re-triggering.
+	/// NEVER REMOVE — see DESIGN_PRINCIPLES.md §3.
+	#[test]
+	fn propagated_branch_does_not_retrigger_app_link_open() {
+		let src = include_str!("lxm_router.rs");
+		let production = src
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production source prefix must exist");
+		let prop_pos = production
+			.find("LXMessage::PROPAGATED")
+			.expect("PROPAGATED branch must exist");
+		let prop_fragment = &production[prop_pos..];
+		assert!(
+			!prop_fragment.contains("re-triggering open_persistent"),
+			"PROPAGATED branch must not re-trigger AppLinks open after DISCONNECTED"
+		);
+		assert!(
+			!prop_fragment.contains("rns_app_links::AppLinks::open(\n\t\t\t\t\t\t\t\t\t\t\t&node_hash"),
+			"PROPAGATED branch must not call AppLinks::open for the prop node from process_outbound"
 		);
 	}
 }
