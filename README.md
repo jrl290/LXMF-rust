@@ -155,14 +155,16 @@ See [docker/README.md](docker/README.md) for full configuration.
 # Release build
 cargo build --release
 
-# The Reticulum-rust dependency is expected at ../Reticulum-rust/
-# (path dependency in Cargo.toml)
+# Path dependencies expected by Cargo.toml:
+#   ../Reticulum-rust
+#   ../app-links
 ```
 
 ### Dependencies
 
 Requires Rust 2021 edition. Key dependencies:
 - **[Rusticulum](https://github.com/jrl290/Rusticulum)** — Rust Reticulum transport layer (path dependency)
+- **[app-links](https://github.com/jrl290/app-links)** — shared app-link abstractions used by the router/FFI layer (path dependency)
 - **Serialization**: rmp-serde, rmpv (MessagePack — wire-compatible with Python LXMF)
 - **Cryptography**: hkdf, sha2 (stamp workblock generation)
 - **Runtime**: tokio (async), ctrlc (signal handling)

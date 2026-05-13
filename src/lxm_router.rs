@@ -4543,9 +4543,12 @@ impl LXMRouter {
 					self.enqueue_peer_distribution(transient_id, from_peer);
 				}
 			}
+			return true;
 		}
 
-		true
+		self.locally_processed_transient_ids.remove(&transient_id);
+		log("[PROP] client could not decrypt propagated message; leaving it on node for retry", LOG_NOTICE, false, false);
+		false
 	}
 
 	fn enqueue_peer_distribution(&mut self, transient_id: Vec<u8>, from_peer: Option<Vec<u8>>) {
