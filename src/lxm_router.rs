@@ -4289,10 +4289,11 @@ impl LXMRouter {
 						log(&format!("[MGR] lxmf_propagation returned {}", result), LOG_NOTICE, false, false);
 						if !result {
 							duplicates += 1;
-						} else {
-							// Only acknowledge messages that were successfully processed
-							haves.push(Value::Binary(reticulum_rust::identity::full_hash(lxmf_data)));
 						}
+						// Match Python: acknowledge every fetched propagation blob so
+						// stale undecryptable entries are deleted from the node after
+						// one fetch instead of being replayed forever.
+						haves.push(Value::Binary(reticulum_rust::identity::full_hash(lxmf_data)));
 					}
 				}
 
@@ -5250,6 +5251,34 @@ mod tests {
 		assert!(
 			prop_fragment.contains("establish_outbound_propagation_link(&node_hash"),
 			"PROPAGATED branch must establish an LXMF-owned propagation link"
+		);
+	}
+
+	/// REGRESSION GUARD: message_get_response must acknowledge every fetched
+	/// propagation blob, even when local decrypt fails.
+	///
+	/// Python always appends `full_hash(lxmf_data)` to `haves`, which deletes the
+	/// blob from the propagation node after one fetch. Restricting acknowledgments
+	/// to successful local decrypt traps stale undecryptable blobs on the node and
+	/// replays the same `Token HMAC was invalid` messages on every sync.
+	#[test]
+	fn message_get_response_acks_all_fetched_blobs() {
+		let src = include_str!("lxm_router.rs");
+		let mgr_pos = src.find("[MGR] lxmf_propagation returned")
+			.expect("message_get_response propagation handling must exist");
+		let fragment = &src[mgr_pos..src.len().min(mgr_pos + 900)];
+
+		assert!(
+			fragment.contains("if !result") && fragment.contains("duplicates += 1"),
+			"message_get_response must still track unsuccessful local processing"
+		);
+		assert!(
+			fragment.contains("haves.push(Value::Binary(reticulum_rust::identity::full_hash(lxmf_data)))"),
+			"message_get_response must acknowledge every fetched blob so undecryptable entries are deleted from the node"
+		);
+		assert!(
+			!fragment.contains("} else {\n\t\t\t\t\t\t\t// Only acknowledge messages that were successfully processed"),
+			"success-only acknowledgment branch must not be reintroduced"
 		);
 	}
 }
