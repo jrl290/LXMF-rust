@@ -147,6 +147,18 @@ pub type LxmfAppLinkRequestCallback = extern "C" fn(
     status: i32,
 );
 
+/// APP_LINK DATA send completion callback.
+///
+/// Fires exactly once per `lxmf_app_link_send_async` invocation.
+///
+/// `status` is one of:
+///   * 0 = delivered (LRPROOF received)
+///   * 1 = failed (tier chain exhausted without delivery proof)
+pub type LxmfAppLinkSendCallback = extern "C" fn(
+    context: *mut std::ffi::c_void,
+    status: i32,
+);
+
 // =========================================================================
 // Library-level
 // =========================================================================
@@ -896,6 +908,96 @@ pub extern "C" fn lxmf_app_link_reopen(
             unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
         };
         match c.app_link_reopen(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Non-blocking plain DATA send via an ephemeral app-link.
+///
+/// Registers the destination spec for `app_name`/`aspects_csv`, then lets
+/// AppLinks own the establish/send/close lifecycle. `callback` fires exactly
+/// once on LRPROOF delivery or terminal failure.
+///
+/// Returns 0 on success (callback will fire), -1 on immediate error
+/// (invalid args; callback will NOT fire — check `lxmf_last_error`).
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_send_async(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    app_name: *const c_char,
+    aspects_csv: *const c_char,
+    payload: *const u8,
+    payload_len: u32,
+    callback: LxmfAppLinkSendCallback,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        let app = if app_name.is_null() {
+            set_error("null app_name");
+            return -1;
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(app_name) }.to_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    set_error("app_name not utf-8");
+                    return -1;
+                }
+            }
+        };
+        let aspects_str = if aspects_csv.is_null() {
+            ""
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(aspects_csv) }.to_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    set_error("aspects_csv not utf-8");
+                    return -1;
+                }
+            }
+        };
+        let aspects: Vec<&str> = if aspects_str.is_empty() {
+            Vec::new()
+        } else {
+            aspects_str.split('.').collect()
+        };
+        let payload_vec = if payload.is_null() || payload_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, payload_len as usize) }.to_vec()
+        };
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let ctx_ok = context as usize;
+        let fired_ok = fired.clone();
+        let on_delivered: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            if !fired_ok.swap(true, Ordering::SeqCst) {
+                callback(ctx_ok as *mut std::ffi::c_void, 0);
+            }
+        });
+
+        let ctx_fail = context as usize;
+        let fired_fail = fired;
+        let on_failed: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            if !fired_fail.swap(true, Ordering::SeqCst) {
+                callback(ctx_fail as *mut std::ffi::c_void, 1);
+            }
+        });
+
+        match c.app_link_send(hash, app, &aspects, payload_vec, on_delivered, on_failed) {
             Ok(()) => 0,
             Err(e) => {
                 set_error(e);

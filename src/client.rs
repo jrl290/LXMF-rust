@@ -207,6 +207,26 @@ impl LxmfClient {
         lxmf::router_app_link_reopen(self.router_handle, dest_hash)
     }
 
+    pub fn app_link_send(
+        &self,
+        dest_hash: &[u8],
+        app_name: &str,
+        aspects: &[&str],
+        payload: Vec<u8>,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<(), String> {
+        lxmf::router_app_link_send(
+            self.router_handle,
+            dest_hash,
+            app_name,
+            aspects,
+            payload,
+            on_delivered,
+            on_failed,
+        )
+    }
+
     /// Notify the router that the host's network reachability state has
     /// changed (interface up/down, Wi-Fi ↔ cellular, etc.). Triggers one
     /// fresh app-link establishment attempt for every registered link not

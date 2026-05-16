@@ -646,6 +646,34 @@ pub fn router_app_link_reopen(router_handle: u64, dest_hash: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Send a plain DATA packet via an ephemeral app-link.
+///
+/// Registers the destination spec needed for tier-3 destination
+/// construction, then lets AppLinks own the establish/send/close cycle.
+/// Delivery success/failure is reported through the supplied callbacks.
+pub fn router_app_link_send(
+    router_handle: u64,
+    dest_hash: &[u8],
+    app_name: &str,
+    aspects: &[&str],
+    payload: Vec<u8>,
+    on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+    on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+) -> Result<(), String> {
+    let _: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    app_links::AppLinks::send_with_spec(
+        dest_hash,
+        app_name,
+        aspects,
+        payload,
+        on_delivered,
+        Arc::new(|| {}),
+        on_failed,
+    );
+    Ok(())
+}
+
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.
 ///
 /// LXMF only auto-reconnects app-links that announce under `lxmf.delivery`.
