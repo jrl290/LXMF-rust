@@ -766,6 +766,60 @@ pub extern "C" fn lxmf_app_link_open(
     })
 }
 
+/// Open a persistent app link for a destination.
+///
+/// Same destination registration as [`lxmf_app_link_open`], but once the
+/// path-race succeeds AppLinks holds the outbound `LinkHandle` open in its
+/// registry so request-style traffic can reuse it directly.
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_open_persistent(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    app_name: *const std::os::raw::c_char,
+    aspects_csv: *const std::os::raw::c_char,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        let app = if app_name.is_null() {
+            set_error("null app_name");
+            return -1;
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(app_name) }.to_str() {
+                Ok(s) => s,
+                Err(_) => { set_error("app_name not utf-8"); return -1; }
+            }
+        };
+        let aspects_str = if aspects_csv.is_null() {
+            ""
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(aspects_csv) }.to_str() {
+                Ok(s) => s,
+                Err(_) => { set_error("aspects_csv not utf-8"); return -1; }
+            }
+        };
+        let aspects: Vec<&str> = if aspects_str.is_empty() {
+            Vec::new()
+        } else {
+            aspects_str.split('.').collect()
+        };
+        match c.app_link_open_persistent(hash, app, &aspects) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
 /// Close an app link (e.g. when the user leaves the chat screen).
 ///
 /// Tears down the direct link and removes the destination from app_links.
@@ -821,6 +875,36 @@ pub extern "C" fn lxmf_app_link_status(
     })
 }
 
+/// Explicit deterministic re-open trigger for an existing app-link.
+///
+/// Invalidates the cached liveness winner for `dest_hash` and runs one fresh
+/// AppLinks re-open cycle. This is intended for host-driven nudges when the
+/// app has a concrete reason to refresh a persistent link now.
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_reopen(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if dest_hash.is_null() || dest_len == 0 {
+            set_error("null dest hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) }
+        };
+        match c.app_link_reopen(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
 /// Send a blocking request on an existing app-link.
 ///
 /// Looks up the LinkHandle for `dest_hash` from the router's `outbound_links`
@@ -829,10 +913,12 @@ pub extern "C" fn lxmf_app_link_status(
 /// response.
 ///
 /// This is the multiplexing equivalent of `retichat_link_request`: instead
-/// of opening a new outbound link per request, it reuses the persistent
-/// app-link that was opened with `lxmf_app_link_open`.
+/// of opening a new outbound link per request, it reuses an existing active
+/// app-link handle, typically one established with
+/// `lxmf_app_link_open_persistent`.
 ///
-/// Caller MUST call `lxmf_app_link_open` first and wait for the link to be
+/// For outbound request flows, callers SHOULD call
+/// `lxmf_app_link_open_persistent` first and wait for the link to be
 /// `APP_LINK_ACTIVE` (status == 3) before calling this.
 ///
 /// Returns a pointer to the response bytes (caller must free with
@@ -896,7 +982,9 @@ pub extern "C" fn lxmf_app_link_request(
         match guard.app_link_get_handle(hash) {
             Ok(Some(h)) => h,
             Ok(None) => {
-                set_error("no app-link to destination — call lxmf_app_link_open first");
+                set_error(
+                    "no app-link handle to destination — use lxmf_app_link_open_persistent or wait for an inbound link"
+                );
                 return std::ptr::null_mut();
             }
             Err(e) => {
@@ -1060,7 +1148,9 @@ pub extern "C" fn lxmf_app_link_request_async(
         match guard.app_link_get_handle(hash) {
             Ok(Some(h)) => h,
             Ok(None) => {
-                set_error("no app-link to destination — call lxmf_app_link_open first");
+                set_error(
+                    "no app-link handle to destination — use lxmf_app_link_open_persistent or wait for an inbound link"
+                );
                 return -1;
             }
             Err(e) => {

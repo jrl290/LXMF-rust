@@ -522,8 +522,7 @@ pub fn router_peer_link_status(router_handle: u64, dest_hash: &[u8]) -> Result<u
     // Validate handle is live — but do NOT lock the router.
     let _: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
         .ok_or_else(|| "invalid router handle".to_string())?;
-    let handle = app_links::AppLinks::get_handle(dest_hash)
-        .or_else(|| app_links::AppLinks::get_inbound_handle(dest_hash));
+    let handle = app_links::AppLinks::get_preferred_handle(dest_hash);
     match handle {
         None => Ok(0),
         Some(h) => {
@@ -561,6 +560,28 @@ pub fn router_app_link_open(
         .lock()
         .map_err(|e| e.to_string())?
         .app_link_open(dest_hash, app_name, aspects);
+    Ok(())
+}
+
+/// Open a persistent app link: watch + request path + hold an outbound link
+/// open once established.
+///
+/// Uses the same AppLinks registry and announce-driven lifecycle as
+/// [`router_app_link_open`], but keeps the outbound link in the registry so
+/// non-LXMF protocols can reuse it directly.
+pub fn router_app_link_open_persistent(
+    router_handle: u64,
+    dest_hash: &[u8],
+    app_name: &str,
+    aspects: &[&str],
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_open_persistent(dest_hash, app_name, aspects);
     Ok(())
 }
 
@@ -608,6 +629,21 @@ pub fn router_app_link_get_handle(
         .ok_or_else(|| "invalid router handle".to_string())?;
     let guard = router.lock().map_err(|e| e.to_string())?;
     Ok(guard.app_link_get_handle(dest_hash))
+}
+
+/// Explicit deterministic re-open trigger for a registered app link.
+///
+/// This routes through the shared AppLinks registry so host callbacks can
+/// ask for a fresh path-race/link-establish cycle without duplicating the
+/// lifecycle logic above it.
+pub fn router_app_link_reopen(router_handle: u64, dest_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .app_link_reopen(dest_hash);
+    Ok(())
 }
 
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.

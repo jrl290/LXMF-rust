@@ -122,10 +122,13 @@ pub struct LXMRouter {
 	pub messagepath: Option<String>,
 
 	pub outbound_propagation_node: Option<Vec<u8>>,
+	/// Active propagation-node link mirrored from the AppLinks registry.
+	/// AppLinks owns the lifecycle; LXMF only reuses the live handle for
+	/// sync requests and propagated sends.
 	pub outbound_propagation_link: Option<LinkHandle>,
 	/// Wall-clock time (seconds since epoch) at which `outbound_propagation_link`
-	/// was created. Used to detect stuck-pending links and force a teardown so
-	/// the next sync request can establish a fresh link.
+	/// was created. AppLinks-owned propagation links never enter the pending
+	/// mirror here, so this remains `None` for the persistent propagation path.
 	pub outbound_propagation_link_created_at: Option<f64>,
 	/// link_id of the propagation link on which we have already issued an
 	/// `identify`. Used to avoid sending a fresh `identify` packet on every
@@ -244,13 +247,11 @@ impl LXMRouter {
 	/// Hard cap on the propagation-node path-request job. Aligned with
 	/// DESIGN_PRINCIPLES.md §1 send-latency budget: if Transport can't
 	/// produce a path in 5 s the propagation node is unreachable and we
-	/// abandon the sync attempt rather than spinning forever (observed
-	/// in retichat.log Apr 2026 as a 10 s [PSYNC] stall).
+	/// abandon the sync attempt rather than spinning forever.
 	///
-	/// TODO(unify): the propagation link should eventually go through the
-	/// Reticulum-rust `AppLinks` registry so this special-cased path job
-	/// disappears entirely and the link reconnects via the same announce-
-	/// driven plumbing as every other app link.
+	/// Retained only for non-AppLinks callers and regression comparison.
+	/// The iOS/host propagation path now uses a persistent AppLinks-owned
+	/// `lxmf.propagation` link instead of this special-cased path job.
 	pub const PR_PATH_TIMEOUT: f64 = 5.0;
 	/// Maximum time (seconds) a propagation-sync link may remain in
 	/// `STATE_PENDING` before it is considered stuck and forcibly torn down so
@@ -423,21 +424,19 @@ impl LXMRouter {
 		let propagation_handler = propagation_announce_handler(router_clone_for_handlers.clone());
 		Transport::register_announce_handler(propagation_handler);
 
-		// Phase 6 (path-race AppLinks): the registry no longer hands us
-		// a `LinkHandle` (the `link` parameter is always `None`); the
-		// callback's only job here is to wake the outbound thread when a
-		// destination becomes Ready (path arrived) so any queued LXMs
-		// flush via the normal DIRECT picker. `outbound_links` is now
-		// owned exclusively by `handle_outbound`, which builds short-
-		// lived links itself.
+		// AppLinks owns direct-link lifecycle for watched destinations.
+		// EphemeralLink app-links still wake the outbound thread when a
+		// destination becomes Ready, while persistent app-links may also
+		// hand us a held-open outbound `LinkHandle` via the `link`
+		// parameter. `handle_outbound` still owns short-lived delivery
+		// links for non-persistent DIRECT sends, while propagation-node
+		// sync mirrors the active `lxmf.propagation` handle from AppLinks
+		// instead of creating its own outbound link.
 		//
 		// Callbacks fire on the path-race worker thread; do not lock the
 		// router here — spawn a worker that takes the lock.
 		let router_for_status_cb = Arc::downgrade(&router);
 		AppLinks::register_status_callback(Arc::new(move |dest_hash, status, link| {
-			// AppLinks tracks direct-chat readiness. It may hand us a cached
-			// direct handle from tier-3; propagation and RFed infrastructure
-			// nodes are owned by their own request/link paths, not AppLinks.
 			{
 				let weak = router_for_status_cb.clone();
 				let dest_owned = dest_hash.to_vec();
@@ -445,31 +444,81 @@ impl LXMRouter {
 				std::thread::spawn(move || {
 					let arc = match weak.upgrade() { Some(a) => a, None => return };
 					let mut router = match arc.lock() { Ok(g) => g, Err(_) => return };
+					let is_propagation_dest = router
+						.outbound_propagation_node
+						.as_ref()
+						.map(|hash| hash == &dest_owned)
+						.unwrap_or(false);
 					match status {
 						rns_app_links::APP_LINK_ACTIVE => {
 							if let Some(handle) = link_handle {
-								router.outbound_links.insert(dest_owned, handle);
+								if is_propagation_dest {
+									router.install_propagation_link_packet_callback(&handle);
+									router.outbound_propagation_link = Some(handle);
+									router.outbound_propagation_link_created_at = None;
+									router.outbound_propagation_link_identified_id = None;
+									if matches!(
+										router.propagation_transfer_state,
+										LXMRouter::PR_PATH_REQUESTED | LXMRouter::PR_LINK_ESTABLISHING
+									) {
+										let identity = router.identity.clone();
+										let max_messages = router.propagation_transfer_max_messages;
+										router.request_messages_from_propagation_node(identity, max_messages);
+									}
+								} else {
+									router.outbound_links.insert(dest_owned.clone(), handle);
+								}
 							}
 							let _ = router.outbound_wake_tx.send(());
 						}
 						rns_app_links::APP_LINK_DISCONNECTED => {
-							router.outbound_links.remove(&dest_owned);
-							// Re-announce our delivery destination(s) when a direct
-							// messaging link closes.  The link closing IS the
-							// deterministic signal that the peer may need a fresh path
-							// to us in order to establish an inbound link (e.g. Meshchat
-							// cold-send after keepalive expiry).  Announcing here ensures
-							// the relay's path-table entry for us is current before the
-							// peer retries.
-							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-							let delivery_hashes: Vec<Vec<u8>> =
-								router.delivery_destinations.keys().cloned().collect();
-							for hash in delivery_hashes {
-								router.announce(&hash, None);
+							if is_propagation_dest {
+								let no_path = router
+									.outbound_propagation_node
+									.as_ref()
+									.map(|hash| !Transport::has_path(hash))
+									.unwrap_or(false);
+								router.clear_outbound_propagation_link_ref();
+								if matches!(
+									router.propagation_transfer_state,
+									LXMRouter::PR_PATH_REQUESTED | LXMRouter::PR_LINK_ESTABLISHING
+								) {
+									router.acknowledge_sync_completion(Some(if no_path {
+										LXMRouter::PR_NO_PATH
+									} else {
+										LXMRouter::PR_LINK_FAILED
+									}));
+								} else if matches!(
+									router.propagation_transfer_state,
+									LXMRouter::PR_LINK_ESTABLISHED
+										| LXMRouter::PR_REQUEST_SENT
+										| LXMRouter::PR_RECEIVING
+								) {
+									router.acknowledge_sync_completion(Some(LXMRouter::PR_TRANSFER_FAILED));
+								}
+							} else {
+								router.outbound_links.remove(&dest_owned);
+								// Re-announce our delivery destination(s) when a direct
+								// messaging link closes.  The link closing IS the
+								// deterministic signal that the peer may need a fresh path
+								// to us in order to establish an inbound link (e.g. Meshchat
+								// cold-send after keepalive expiry).  Announcing here ensures
+								// the relay's path-table entry for us is current before the
+								// peer retries.
+								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+								let delivery_hashes: Vec<Vec<u8>> =
+									router.delivery_destinations.keys().cloned().collect();
+								for hash in delivery_hashes {
+									router.announce(&hash, None);
+								}
 							}
 						}
 						rns_app_links::APP_LINK_NONE => {
-							router.outbound_links.remove(&dest_owned);
+							if is_propagation_dest {
+								router.clear_outbound_propagation_link_ref();
+							} else {
+								router.outbound_links.remove(&dest_owned);
+							}
 						}
 						_ => {}
 					}
@@ -935,12 +984,7 @@ impl LXMRouter {
 	}
 
 	pub fn cancel_propagation_node_requests(&mut self) {
-		if let Some(link) = self.outbound_propagation_link.as_ref() {
-			link.teardown();
-		}
-		self.outbound_propagation_link = None;
-		self.outbound_propagation_link_created_at = None;
-		self.outbound_propagation_link_identified_id = None;
+		self.clear_outbound_propagation_link_ref();
 		self.acknowledge_sync_completion(None);
 	}
 
@@ -1056,7 +1100,7 @@ impl LXMRouter {
 
 		let mut index = 0;
 		let mut backchannel_setup_links: Vec<(LinkHandle, Vec<u8>)> = Vec::new();
-		let mut propagation_links_to_establish: Vec<(Vec<u8>, bool, String)> = Vec::new();
+		let mut propagation_links_to_open: Vec<(Vec<u8>, String)> = Vec::new();
 		while index < self.pending_outbound.len() {
 			let message = self.pending_outbound[index].clone();
 			let mut remove = false;
@@ -1580,108 +1624,84 @@ impl LXMRouter {
 								remove = true;
 							} else if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
 								let node_hash = self.outbound_propagation_node.clone().unwrap();
-								let _has_link = self.outbound_propagation_link.is_some();
-								if let Some(link_arc) = self.outbound_propagation_link.clone() {
-									let status = link_arc.status();
-									if status == reticulum_rust::link::STATE_ACTIVE {
-										if lxm.state != LXMessage::SENDING {
-											// PROTOCOL: Send propagation_packed over the link using link.send_packet().
-											// propagation_packed = msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | pn_stamp?]]])
-											// This matches Python: link.send_packet(lxm.propagation_packed); lxm.state = SENT
-											//
-											// DO NOT use send_with_handle() / as_packet() / Packet::new() here.
-											// That path calls destination.encrypt() → runtime_encrypt_for_destination()
-											// which fails silently for Link-type destinations (the error was being swallowed),
-											// leaving the message stuck in OUTBOUND forever, retrying every 2 seconds.
-											//
-											// link.send_packet() uses the link's AES-256-CBC session key directly and
-											// builds the raw packet bytes without touching RUNTIME_LINKS.
-											// After a successful send state = SENT immediately (fire-and-forget);
-											// the propagation node does not send a delivery receipt.
-											let propagation_packed = lxm.propagation_packed.clone();
-											if let Some(pdata) = propagation_packed {
-												// Using link.send_packet() directly (not Packet::new → pack → encrypt)
-												// because link.send_packet() correctly uses the link session key.
-												match link_arc.send_packet(&pdata)
-													.map_err(|e| e.to_string())
-												{
-													Ok(()) => {
-														log(&format!("[POB][{}] PROPAGATED sent via link → SENT", message_label), LOG_NOTICE, false, false);
-														lxm.state = LXMessage::SENT; // fire-and-forget
-													}
-													Err(e) => {
-														log(&format!("[POB][{}] PROPAGATED send_packet failed: {}", message_label, e), LOG_NOTICE, false, false);
-														lxm.state = LXMessage::OUTBOUND;
-														lxm.delivery_attempts += 1;
-														lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-													}
+								let active_link = AppLinks::get_handle(&node_hash)
+									.filter(|handle| handle.status() == reticulum_rust::link::STATE_ACTIVE);
+								if let Some(link_arc) = active_link {
+									if lxm.state != LXMessage::SENDING {
+										// PROTOCOL: Send propagation_packed over the link using link.send_packet().
+										// propagation_packed = msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | pn_stamp?]]])
+										// This matches Python: link.send_packet(lxm.propagation_packed); lxm.state = SENT.
+										let propagation_packed = lxm.propagation_packed.clone();
+										if let Some(pdata) = propagation_packed {
+											match link_arc.send_packet(&pdata).map_err(|e| e.to_string()) {
+												Ok(()) => {
+													log(&format!("[POB][{}] PROPAGATED sent via persistent app-link → SENT", message_label), LOG_NOTICE, false, false);
+													lxm.state = LXMessage::SENT;
 												}
-											} else {
-												// Message was packed as DIRECT then downgraded to PROPAGATED at
-												// runtime (link never established). Build propagation_packed now
-												// from the already-present packed bytes and retry this tick.
-												// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-												match lxm.make_propagation_packed() {
-													Ok(()) => {
-														log(&format!("[POB][{}] PROPAGATED re-packed from DIRECT — retrying", message_label), LOG_NOTICE, false, false);
-														// propagation_packed is now Some; the next POB tick will send it.
-														lxm.state = LXMessage::OUTBOUND;
-														lxm.next_delivery_attempt = None;
-													}
-													Err(e) => {
-														log(&format!("[POB][{}] PROPAGATED make_propagation_packed failed: {} — failing message", message_label, e), LOG_ERROR, false, false);
-														self.fail_message(&mut lxm);
-														remove = true;
-													}
+												Err(e) => {
+													log(&format!("[POB][{}] PROPAGATED send_packet failed: {}", message_label, e), LOG_NOTICE, false, false);
+													lxm.state = LXMessage::OUTBOUND;
+													lxm.delivery_attempts += 1;
+													lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+												}
+											}
+										} else {
+											match lxm.make_propagation_packed() {
+												Ok(()) => {
+													log(&format!("[POB][{}] PROPAGATED re-packed from DIRECT — retrying", message_label), LOG_NOTICE, false, false);
+													lxm.state = LXMessage::OUTBOUND;
+													lxm.next_delivery_attempt = None;
+												}
+												Err(e) => {
+													log(&format!("[POB][{}] PROPAGATED make_propagation_packed failed: {} — failing message", message_label, e), LOG_ERROR, false, false);
+													self.fail_message(&mut lxm);
+													remove = true;
 												}
 											}
 										}
-									} else if status == reticulum_rust::link::STATE_CLOSED {
-										self.outbound_propagation_link = None;
-										lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+									}
+								} else {
+									let status = self.propagation_app_link_status();
+									if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
+										match status {
+											rns_app_links::APP_LINK_PATH_REQUESTED => {
+												log(&format!("[POB][{}] PROPAGATED waiting for persistent propagation path", message_label), LOG_DEBUG, false, false);
+												lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
+											}
+											rns_app_links::APP_LINK_ESTABLISHING => {
+												log(&format!("[POB][{}] PROPAGATED waiting for persistent propagation link", message_label), LOG_DEBUG, false, false);
+												lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
+											}
+											_ => {
+												lxm.delivery_attempts += 1;
+												if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
+													log(
+														&format!("[POB][{}] PROPAGATED opening persistent propagation app-link (attempt {}, status={})", message_label, lxm.delivery_attempts, status),
+														LOG_NOTICE,
+														false,
+														false,
+													);
+													lxm.next_delivery_attempt = Some(now() + if Transport::has_path(&node_hash) {
+														Self::DELIVERY_RETRY_WAIT
+													} else {
+														Self::PATH_REQUEST_WAIT
+													});
+													propagation_links_to_open.push((node_hash.clone(), message_label.clone()));
+												} else {
+													log(&format!("[POB][{}] PROPAGATED max attempts reached", message_label), LOG_NOTICE, false, false);
+													self.fail_message(&mut lxm);
+													remove = true;
+												}
+											}
+										}
 									} else {
-										let pending_for = link_arc
-											.snapshot()
-											.ok()
-											.and_then(|s| s.request_time.map(|requested| (now() - requested).max(0.0)))
-											.unwrap_or(0.0);
 										log(
-											&format!("Propagation link to {} pending ({:.1}s elapsed)", prettyhexrep(&node_hash), pending_for),
+											&format!("Persistent propagation app-link to {} not yet ready, waiting for retry", prettyhexrep(&node_hash)),
 											LOG_DEBUG,
 											false,
 											false,
 										);
 									}
-								} else if lxm.next_delivery_attempt.map(|t| now() > t).unwrap_or(true) {
-									if Transport::has_path(&node_hash) {
-										lxm.delivery_attempts += 1;
-										if lxm.delivery_attempts <= Self::MAX_DELIVERY_ATTEMPTS {
-											log(
-												&format!("[POB][{}] PROPAGATED no link → establishing propagation link (attempt {})", message_label, lxm.delivery_attempts),
-												LOG_NOTICE,
-												false,
-												false,
-											);
-											lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
-											propagation_links_to_establish.push((node_hash.clone(), false, message_label.clone()));
-										} else {
-											log(&format!("[POB][{}] PROPAGATED max attempts reached", message_label), LOG_NOTICE, false, false);
-											self.fail_message(&mut lxm);
-											remove = true;
-										}
-									} else {
-										log(&format!("[POB][{}] PROPAGATED no path to propagation node → requesting", message_label), LOG_NOTICE, false, false);
-										Transport::request_path(&node_hash, None, None, None, None);
-										lxm.next_delivery_attempt = Some(now() + Self::PATH_REQUEST_WAIT);
-									}
-								} else {
-									// Not time to retry yet — leave in pending_outbound
-									log(
-										&format!("Propagation link to {} not yet ready, waiting for retry", prettyhexrep(&node_hash)),
-										LOG_DEBUG,
-										false,
-										false,
-									);
 								}
 							} else {
 								self.fail_message(&mut lxm);
@@ -1705,10 +1725,10 @@ impl LXMRouter {
 		// (which needs &mut self)
 		drop(_guard);
 
-		for (node_hash, reenter_sync, message_label) in propagation_links_to_establish {
-			if let Err(e) = self.establish_outbound_propagation_link(&node_hash, reenter_sync) {
-				log(&format!("[POB][{}] PROPAGATED link establish failed: {}", message_label, e), LOG_ERROR, false, false);
-			}
+		for (node_hash, message_label) in propagation_links_to_open {
+			self.watched_destinations.insert(node_hash.clone());
+			AppLinks::open_persistent(&node_hash, APP_NAME, &["propagation"]);
+			log(&format!("[POB][{}] requested persistent propagation app-link", message_label), LOG_DEBUG, false, false);
 		}
 
 		// Set up backchannel delivery callbacks on any outbound links
@@ -2933,36 +2953,16 @@ impl LXMRouter {
 		if self.outbound_propagation_node.as_ref() != Some(&destination_hash) {
 			let old_node = self.outbound_propagation_node.take();
 			self.outbound_propagation_node = Some(destination_hash.clone());
-			let should_teardown = if let Some(link) = self.outbound_propagation_link.as_ref() {
-				link.destination_hash()
-					.map(|hash| hash != destination_hash)
-					.unwrap_or(false)
-			} else {
-				false
-			};
-			if should_teardown {
-				if let Some(link) = self.outbound_propagation_link.as_ref() {
-					link.teardown();
-				}
-				self.outbound_propagation_link = None;
-				self.outbound_propagation_link_created_at = None;
-				self.outbound_propagation_link_identified_id = None;
-			}
+			self.clear_outbound_propagation_link_ref();
 			if let Some(prev) = old_node {
 				if prev != destination_hash {
-					self.outbound_propagation_link = None;
-					self.outbound_propagation_link_created_at = None;
-					self.outbound_propagation_link_identified_id = None;
+					AppLinks::close(&prev);
 				}
 			}
 		}
 
-		if !Transport::has_path(&destination_hash) {
-			let dh = destination_hash.clone();
-			std::thread::spawn(move || {
-				Transport::request_path(&dh, None, None, None, None);
-			});
-		}
+		self.open_persistent_propagation_link();
+		let _ = self.active_propagation_link_from_app_links();
 
 		Ok(())
 	}
@@ -3002,6 +3002,58 @@ impl LXMRouter {
 		}
 
 		target_cost
+	}
+
+	fn clear_outbound_propagation_link_ref(&mut self) {
+		self.outbound_propagation_link = None;
+		self.outbound_propagation_link_created_at = None;
+		self.outbound_propagation_link_identified_id = None;
+	}
+
+	fn install_propagation_link_packet_callback(&self, link: &LinkHandle) {
+		link.set_packet_callback(Some(Arc::new({
+			let router_weak = self.self_handle.clone();
+			move |data, packet| {
+				if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+					if let Ok(mut router) = router_arc.lock() {
+						router.propagation_transfer_signalling_packet(data, packet);
+					}
+				}
+			}
+		})));
+	}
+
+	fn active_propagation_link_from_app_links(&mut self) -> Option<LinkHandle> {
+		let node_hash = self.outbound_propagation_node.clone()?;
+		let handle = AppLinks::get_handle(&node_hash)?;
+		if handle.status() != reticulum_rust::link::STATE_ACTIVE {
+			return None;
+		}
+		let same_link = self
+			.outbound_propagation_link
+			.as_ref()
+			.map(|existing| existing.same_link(&handle))
+			.unwrap_or(false);
+		if !same_link {
+			self.install_propagation_link_packet_callback(&handle);
+			self.outbound_propagation_link_identified_id = None;
+			self.outbound_propagation_link = Some(handle.clone());
+		}
+		Some(handle)
+	}
+
+	fn open_persistent_propagation_link(&mut self) {
+		if let Some(node_hash) = self.outbound_propagation_node.clone() {
+			self.watched_destinations.insert(node_hash.clone());
+			AppLinks::open_persistent(&node_hash, APP_NAME, &["propagation"]);
+		}
+	}
+
+	fn propagation_app_link_status(&self) -> u8 {
+		self.outbound_propagation_node
+			.as_ref()
+			.map(|hash| AppLinks::status(hash))
+			.unwrap_or(rns_app_links::APP_LINK_NONE)
 	}
 
 	pub fn save_outbound_stamp_costs(&self) {
@@ -3172,6 +3224,16 @@ impl LXMRouter {
 		AppLinks::open(dest_hash, app_name, aspects);
 	}
 
+	/// Open a persistent app link for a destination.
+	///
+	/// This uses the same AppLinks registry and status plumbing as
+	/// `app_link_open`, but holds an outbound link open in the registry once
+	/// established so callers can reuse it for non-LXMF request traffic.
+	pub fn app_link_open_persistent(&mut self, dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
+		self.watched_destinations.insert(dest_hash.to_vec());
+		AppLinks::open_persistent(dest_hash, app_name, aspects);
+	}
+
 	/// Close an app link.  Forwards to the registry; the status callback
 	/// drops the mirror entry from `outbound_links`.
 	pub fn app_link_close(&mut self, dest_hash: &[u8]) {
@@ -3193,8 +3255,16 @@ impl LXMRouter {
 	/// Prefers the registry's outbound link, falls back to the inbound link
 	/// registered via `AppLinks::register_inbound`.
 	pub fn app_link_get_handle(&self, dest_hash: &[u8]) -> Option<LinkHandle> {
-		AppLinks::get_handle(dest_hash)
-			.or_else(|| AppLinks::get_inbound_handle(dest_hash))
+		AppLinks::get_preferred_handle(dest_hash)
+	}
+
+	/// Explicit deterministic re-open trigger for an app link.
+	///
+	/// Routes through the shared AppLinks lifecycle so host callbacks can
+	/// request a fresh path-race/link-establish cycle without duplicating the
+	/// registry logic above this layer.
+	pub fn app_link_reopen(&mut self, dest_hash: &[u8]) {
+		AppLinks::request_reopen(dest_hash);
 	}
 
 	/// Trigger one fresh app-link attempt for `dest_hash`.  Forwards to the
@@ -3911,9 +3981,6 @@ impl LXMRouter {
 		if let Some(Value::Array(values)) = Self::decode_value(data) {
 			if let Some(Value::Integer(code)) = values.get(0) {
 				if code.as_i64().unwrap_or(0) as u8 == LXMPeer::ERROR_INVALID_STAMP {
-					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						link.teardown();
-					}
 					self.propagation_transfer_state = Self::PR_FAILED;
 				}
 			}
@@ -3992,10 +4059,13 @@ impl LXMRouter {
 				return;
 			}
 		};
+		let active_link = self.active_propagation_link_from_app_links();
+		let app_link_status = self.propagation_app_link_status();
 
-		log(&format!("[PSYNC] request_messages_from_propagation_node: node={} has_link={} has_path={} state=0x{:02x}",
+		log(&format!("[PSYNC] request_messages_from_propagation_node: node={} has_link={} app_link_status={} has_path={} state=0x{:02x}",
 			reticulum_rust::hexrep(&outbound_node, false),
-			self.outbound_propagation_link.is_some(),
+			active_link.is_some(),
+			app_link_status,
 			Transport::has_path(&outbound_node),
 			self.propagation_transfer_state,
 		), LOG_NOTICE, false, false);
@@ -4012,118 +4082,70 @@ impl LXMRouter {
 			return;
 		}
 
-		if let Some(link_arc) = self.outbound_propagation_link.clone() {
-			let link_status = link_arc.status();
-			log(&format!("[PSYNC] existing link status={}", link_status), LOG_NOTICE, false, false);
-			// If a link is already pending (being established), don't create another one —
-			// replacing the Arc here would drop the first link before its PROOF arrives.
-			// However, if the link has been pending for too long it's stuck (e.g. PROOF
-			// lost on a long path). Tear it down so the next call can establish a fresh
-			// link instead of suppressing retries forever.
-			if link_status == reticulum_rust::link::STATE_PENDING {
-				let age = self
-					.outbound_propagation_link_created_at
-					.map(|t| now() - t)
-					.unwrap_or(0.0);
-				if age >= Self::PR_LINK_PENDING_TIMEOUT {
-					log(&format!("[PSYNC] link pending too long ({:.1}s) → tearing down for fresh attempt", age), LOG_NOTICE, false, false);
-					link_arc.teardown();
-					self.outbound_propagation_link = None;
-					self.outbound_propagation_link_created_at = None;
-					self.propagation_transfer_state = Self::PR_LINK_FAILED;
-					// Fall through to the path/establishment logic below.
-				} else {
-					log(&format!("[PSYNC] link pending ({:.1}s), skipping duplicate sync request", age), LOG_NOTICE, false, false);
-					return;
+		if let Some(link_arc) = active_link {
+			self.propagation_transfer_state = Self::PR_LINK_ESTABLISHED;
+
+			let current_link_id = link_arc.link_id();
+			let already_identified = self
+				.outbound_propagation_link_identified_id
+				.as_ref()
+				.map(|id| id == &current_link_id)
+				.unwrap_or(false);
+			if !already_identified {
+				log(&format!("[PSYNC] identify: link_id={}",
+					reticulum_rust::hexrep(&current_link_id, false)), LOG_NOTICE, false, false);
+				match link_arc.identify(&identity) {
+					Ok(_) => {
+						log("[PSYNC] identify sent OK", LOG_NOTICE, false, false);
+						self.outbound_propagation_link_identified_id = Some(current_link_id);
+					}
+					Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
 				}
 			}
-			let link_is_active = link_status == reticulum_rust::link::STATE_ACTIVE;
-			if link_is_active {
-				self.propagation_transfer_state = Self::PR_LINK_ESTABLISHED;
 
-				// Identify ourselves on the link before requesting messages —
-				// but only once per link. Re-identifying on every poll cycle
-				// produces redundant network traffic and log spam (the
-				// remote already knows who we are after the first identify).
-				let current_link_id = link_arc.link_id();
-				let already_identified = self
-					.outbound_propagation_link_identified_id
-					.as_ref()
-					.map(|id| id == &current_link_id)
-					.unwrap_or(false);
-				if !already_identified {
-					log(&format!("[PSYNC] identify: link_id={}",
-						reticulum_rust::hexrep(&current_link_id, false)), LOG_NOTICE, false, false);
-					match link_arc.identify(&identity) {
-						Ok(_) => {
-							log("[PSYNC] identify sent OK", LOG_NOTICE, false, false);
-							self.outbound_propagation_link_identified_id = Some(current_link_id);
+			self.install_propagation_link_packet_callback(&link_arc);
+
+			let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+				let router_weak = self.self_handle.clone();
+				move |receipt: reticulum_rust::link::RequestReceipt| {
+					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+						if let Ok(mut router) = router_arc.lock() {
+							router.message_list_response(receipt);
 						}
-						Err(e) => log(&format!("[PSYNC] identify FAILED: {}", e), LOG_ERROR, false, false),
 					}
 				}
+			}));
 
-				link_arc.set_packet_callback(Some(Arc::new({
-					let router_weak = self.self_handle.clone();
-					move |data, packet| {
-						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-							if let Ok(mut router) = router_arc.lock() {
-								router.propagation_transfer_signalling_packet(data, packet);
-							}
+			let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
+				let router_weak = self.self_handle.clone();
+				move |receipt: reticulum_rust::link::RequestReceipt| {
+					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
+						if let Ok(mut router) = router_arc.lock() {
+							router.message_get_failed(receipt);
 						}
 					}
-				})));
+				}
+			}));
 
-				let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-					let router_weak = self.self_handle.clone();
-					move |receipt: reticulum_rust::link::RequestReceipt| {
-						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-							if let Ok(mut router) = router_arc.lock() {
-								router.message_list_response(receipt);
-							}
-						}
-					}
-				}));
-
-				let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
-					let router_weak = self.self_handle.clone();
-					move |receipt: reticulum_rust::link::RequestReceipt| {
-						if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-							if let Ok(mut router) = router_arc.lock() {
-								router.message_get_failed(receipt);
-							}
-						}
-					}
-				}));
-
-				let _ = link_arc.request(
-					LXMPeer::MESSAGE_GET_PATH.to_string(),
-					Self::encode_value(Value::Array(vec![Value::Nil, Value::Nil])),
-					request_cb,
-					failed_cb,
-					None,
-				);
-				log("[PSYNC] message_list request sent", LOG_NOTICE, false, false);
-				self.propagation_transfer_state = Self::PR_REQUEST_SENT;
-				return;
-			}
+			let _ = link_arc.request(
+				LXMPeer::MESSAGE_GET_PATH.to_string(),
+				Self::encode_value(Value::Array(vec![Value::Nil, Value::Nil])),
+				request_cb,
+				failed_cb,
+				None,
+			);
+			log("[PSYNC] message_list request sent", LOG_NOTICE, false, false);
+			self.propagation_transfer_state = Self::PR_REQUEST_SENT;
+			return;
 		}
 
-		if Transport::has_path(&outbound_node) {
-			log("[PSYNC] has path → establishing propagation link", LOG_NOTICE, false, false);
-			if let Err(e) = self.establish_outbound_propagation_link(&outbound_node, true) {
-				log(&format!("[PSYNC] propagation link establish failed: {}", e), LOG_ERROR, false, false);
-				self.propagation_transfer_state = Self::PR_LINK_FAILED;
-			}
-		} else {
-			log(&format!("[PSYNC] no path to {} → requesting path, starting path job", reticulum_rust::hexrep(&outbound_node, false)), LOG_NOTICE, false, false);
-			Transport::request_path(&outbound_node, None, None, None, None);
-			self.wants_download_on_path_available_from = Some(outbound_node);
-			self.wants_download_on_path_available_to = Some(identity);
-			self.wants_download_on_path_available_timeout = now() + Self::PR_PATH_TIMEOUT;
-			self.propagation_transfer_state = Self::PR_PATH_REQUESTED;
-			self.request_messages_path_job();
-		}
+		self.open_persistent_propagation_link();
+		self.propagation_transfer_state = match self.propagation_app_link_status() {
+			rns_app_links::APP_LINK_PATH_REQUESTED => Self::PR_PATH_REQUESTED,
+			rns_app_links::APP_LINK_ESTABLISHING | rns_app_links::APP_LINK_ACTIVE => Self::PR_LINK_ESTABLISHING,
+			_ => Self::PR_LINK_ESTABLISHING,
+		};
+		log(&format!("[PSYNC] waiting for persistent propagation app-link status={}", self.propagation_app_link_status()), LOG_NOTICE, false, false);
 	}
 
 	pub fn message_list_response(&mut self, receipt: reticulum_rust::link::RequestReceipt) {
@@ -4140,16 +4162,10 @@ impl LXMRouter {
 			if let Some(Value::Integer(code)) = Self::decode_value(&response) {
 				let code = code.as_i64().unwrap_or(0) as u8;
 				if code == LXMPeer::ERROR_NO_IDENTITY {
-					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						link.teardown();
-					}
 					self.propagation_transfer_state = Self::PR_NO_IDENTITY_RCVD;
 					return;
 				}
 				if code == LXMPeer::ERROR_NO_ACCESS {
-					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						link.teardown();
-					}
 					self.propagation_transfer_state = Self::PR_NO_ACCESS;
 					return;
 				}
@@ -4186,7 +4202,7 @@ impl LXMRouter {
 
 				log(&format!("[MLS] wants={} haves={}, sending second request", wants.len(), haves.len()), LOG_NOTICE, false, false);
 
-				if let Some(link) = self.outbound_propagation_link.as_ref() {
+				if let Some(link) = self.active_propagation_link_from_app_links() {
 					let request_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
 						let router_weak = self.self_handle.clone();
 						move |receipt: reticulum_rust::link::RequestReceipt| {
@@ -4233,9 +4249,7 @@ impl LXMRouter {
 				}
 			} else {
 				log("Invalid message list data received from propagation node", LOG_DEBUG, false, false);
-				if let Some(link) = self.outbound_propagation_link.as_ref() {
-					link.teardown();
-				}
+				self.propagation_transfer_state = Self::PR_TRANSFER_FAILED;
 			}
 		}
 	}
@@ -4245,16 +4259,10 @@ impl LXMRouter {
 			if let Some(Value::Integer(code)) = Self::decode_value(&response) {
 				let code = code.as_i64().unwrap_or(0) as u8;
 				if code == LXMPeer::ERROR_NO_IDENTITY {
-					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						link.teardown();
-					}
 					self.propagation_transfer_state = Self::PR_NO_IDENTITY_RCVD;
 					return;
 				}
 				if code == LXMPeer::ERROR_NO_ACCESS {
-					if let Some(link) = self.outbound_propagation_link.as_ref() {
-						link.teardown();
-					}
 					self.propagation_transfer_state = Self::PR_NO_ACCESS;
 					return;
 				}
@@ -4297,7 +4305,7 @@ impl LXMRouter {
 					}
 				}
 
-				if let Some(link) = self.outbound_propagation_link.as_ref() {
+				if let Some(link) = self.active_propagation_link_from_app_links() {
 					let failed_cb: Option<Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync>> = Some(Arc::new({
 						let router_weak = self.self_handle.clone();
 						move |receipt: reticulum_rust::link::RequestReceipt| {
@@ -4338,9 +4346,6 @@ impl LXMRouter {
 
 	pub fn message_get_failed(&mut self, _receipt: reticulum_rust::link::RequestReceipt) {
 		log("[PSYNC] message list/get request FAILED", LOG_WARNING, false, false);
-		if let Some(link) = self.outbound_propagation_link.as_ref() {
-			link.teardown();
-		}
 		self.propagation_transfer_state = Self::PR_TRANSFER_FAILED;
 	}
 
@@ -5227,14 +5232,14 @@ mod tests {
 		);
 	}
 
-	/// REGRESSION GUARD: PROPAGATED send must not use the AppLinks mechanism.
+	/// REGRESSION GUARD: PROPAGATED send must use the shared persistent AppLinks link.
 	///
-	/// RFed/propagation-node traffic is infrastructure traffic with its own
-	/// request/link lifecycle. Routing it through AppLinks created stale UI
-	/// state and tied propagation sends to unrelated direct-chat liveness.
-	/// NEVER REMOVE — see DESIGN_PRINCIPLES.md §3.
+	/// Python LXMF still treats outbound propagation traffic as link-backed,
+	/// but this workspace now centralizes that link lifecycle in AppLinks so
+	/// sync and send share one held-open `lxmf.propagation` handle.
+	/// NEVER REMOVE — see DESIGN_PRINCIPLES.md §1, §3.
 	#[test]
-	fn propagated_branch_does_not_use_app_links() {
+	fn propagated_branch_uses_persistent_app_links() {
 		let src = include_str!("lxm_router.rs");
 		let production = src
 			.split("#[cfg(test)]")
@@ -5245,12 +5250,12 @@ mod tests {
 			.expect("PROPAGATED branch must exist");
 		let prop_fragment = &production[prop_pos..];
 		assert!(
-			!prop_fragment.contains("rns_app_links::AppLinks"),
-			"PROPAGATED branch must not consult or open AppLinks"
+			prop_fragment.contains("active_propagation_link_from_app_links()"),
+			"PROPAGATED branch must send over the shared AppLinks-owned propagation handle"
 		);
 		assert!(
-			prop_fragment.contains("establish_outbound_propagation_link(&node_hash"),
-			"PROPAGATED branch must establish an LXMF-owned propagation link"
+			prop_fragment.contains("AppLinks::open_persistent(&node_hash, APP_NAME, &[\"propagation\"])"),
+			"PROPAGATED branch must reopen the shared persistent propagation app-link when no active handle exists"
 		);
 	}
 

@@ -177,6 +177,15 @@ impl LxmfClient {
         lxmf::router_app_link_open(self.router_handle, dest_hash, app_name, aspects)
     }
 
+    pub fn app_link_open_persistent(
+        &self,
+        dest_hash: &[u8],
+        app_name: &str,
+        aspects: &[&str],
+    ) -> Result<(), String> {
+        lxmf::router_app_link_open_persistent(self.router_handle, dest_hash, app_name, aspects)
+    }
+
     pub fn app_link_close(&self, dest_hash: &[u8]) -> Result<(), String> {
         lxmf::router_app_link_close(self.router_handle, dest_hash)
     }
@@ -192,6 +201,10 @@ impl LxmfClient {
         -> Result<Option<reticulum_rust::link::LinkHandle>, String>
     {
         lxmf::router_app_link_get_handle(self.router_handle, dest_hash)
+    }
+
+    pub fn app_link_reopen(&self, dest_hash: &[u8]) -> Result<(), String> {
+        lxmf::router_app_link_reopen(self.router_handle, dest_hash)
     }
 
     /// Notify the router that the host's network reachability state has
