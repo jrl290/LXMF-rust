@@ -53,6 +53,14 @@ fn string_to_cstr(s: &str) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
 
+fn parse_aspect_spec(aspects: &str) -> Vec<&str> {
+    aspects
+        .split(|c| c == '.' || c == ',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
 fn set_error(msg: impl Into<String>) {
     reticulum_rust::ffi::set_error(msg.into());
 }
@@ -127,6 +135,13 @@ pub type LxmfAppLinkStatusCallback = extern "C" fn(
     dest_hash: *const u8,
     hash_len: u32,
     status: u8,
+);
+
+/// APP_LINK packet callback: fires for DATA received on a persistent APP_LINK.
+pub type LxmfAppLinkPacketCallback = extern "C" fn(
+    context: *mut std::ffi::c_void,
+    bytes: *const u8,
+    bytes_len: u32,
 );
 
 /// APP_LINK request completion callback (async variant).
@@ -484,6 +499,49 @@ pub extern "C" fn lxmf_app_link_register_status_callback(
     }
 }
 
+/// Register a packet callback for DATA received on a persistent APP_LINK.
+///
+/// The callback is bound to the tracked persistent link for `dest_hash`. If
+/// the link is already ACTIVE, the callback is attached immediately; if the
+/// link reconnects later, the callback is reattached on the next ACTIVE
+/// transition.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_register_packet_callback(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    callback: LxmfAppLinkPacketCallback,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    if dest_hash.is_null() || dest_len == 0 {
+        set_error("dest_hash is null or empty");
+        return -1;
+    }
+
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return -1;
+        }
+    };
+    let mut guard = arc.lock().unwrap();
+
+    let dest = unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) };
+    let ctx = SendPtr(context);
+    let adapter = Arc::new(move |bytes: &[u8]| {
+        callback(ctx.ptr(), bytes.as_ptr(), bytes.len() as u32);
+    });
+
+    match guard.register_app_link_packet_callback(dest, adapter) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
 // =========================================================================
 // Client queries
 // =========================================================================
@@ -534,6 +592,32 @@ pub extern "C" fn lxmf_client_dest_hash(
 // Propagation
 // =========================================================================
 
+/// Set the outbound propagation node without requesting messages.
+/// `node_hash` is the 16-byte propagation node destination hash.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_client_set_propagation_node(
+    client: u64,
+    node_hash: *const u8,
+    node_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let hash = if node_hash.is_null() || node_len == 0 {
+            set_error("null node hash");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(node_hash, node_len as usize) }
+        };
+        match c.set_propagation_node(hash) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
 /// Set a propagation node and request messages.
 /// `node_hash` is the 16-byte propagation node destination hash.
 /// Returns 0 on success, -1 on error.
@@ -552,6 +636,36 @@ pub extern "C" fn lxmf_client_sync(
         };
         match c.sync_from_propagation_node(hash) {
             Ok(()) => 0,
+            Err(e) => {
+                set_error(e);
+                -1
+            }
+        }
+    })
+}
+
+/// Feed raw propagated `lxmf_data` into the client's normal delivery path.
+///
+/// Returns:
+///   * `1` when the packet was accepted for delivery or duplicate tracking
+///   * `0` when the packet was ignored (duplicate, undecipherable, etc.)
+///   * `-1` on API error
+#[no_mangle]
+pub extern "C" fn lxmf_client_ingest_propagated(
+    client: u64,
+    lxmf_data: *const u8,
+    lxmf_len: u32,
+) -> i32 {
+    with_client!(client, c, {
+        let data = if lxmf_data.is_null() || lxmf_len == 0 {
+            set_error("null propagated payload");
+            return -1;
+        } else {
+            unsafe { std::slice::from_raw_parts(lxmf_data, lxmf_len as usize) }
+        };
+        match c.ingest_propagated_lxmf(data) {
+            Ok(true) => 1,
+            Ok(false) => 0,
             Err(e) => {
                 set_error(e);
                 -1
@@ -727,8 +841,8 @@ pub extern "C" fn lxmf_peer_link_status(
 ///   `app_name="lxmf"`, `aspects_csv="delivery"` — peer chat link.
 ///   `app_name="rfed"`, `aspects_csv="channel"` — rfed channel link.
 ///   `app_name="rfed"`, `aspects_csv="notify"`  — rfed notify link.
-/// `aspects_csv` is a `.`-separated list (matches Destination naming convention)
-/// — pass `"foo.bar"` for app aspects `["foo","bar"]`. Empty string is allowed.
+/// `aspects_csv` accepts `.`- or `,`-separated aspect segments. Empty string
+/// is allowed.
 ///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -763,11 +877,7 @@ pub extern "C" fn lxmf_app_link_open(
                 Err(_) => { set_error("aspects_csv not utf-8"); return -1; }
             }
         };
-        let aspects: Vec<&str> = if aspects_str.is_empty() {
-            Vec::new()
-        } else {
-            aspects_str.split('.').collect()
-        };
+        let aspects: Vec<&str> = parse_aspect_spec(aspects_str);
         match c.app_link_open(hash, app, &aspects) {
             Ok(()) => 0,
             Err(e) => {
@@ -817,11 +927,7 @@ pub extern "C" fn lxmf_app_link_open_persistent(
                 Err(_) => { set_error("aspects_csv not utf-8"); return -1; }
             }
         };
-        let aspects: Vec<&str> = if aspects_str.is_empty() {
-            Vec::new()
-        } else {
-            aspects_str.split('.').collect()
-        };
+        let aspects: Vec<&str> = parse_aspect_spec(aspects_str);
         match c.app_link_open_persistent(hash, app, &aspects) {
             Ok(()) => 0,
             Err(e) => {
@@ -969,11 +1075,7 @@ pub extern "C" fn lxmf_app_link_send_async(
                 }
             }
         };
-        let aspects: Vec<&str> = if aspects_str.is_empty() {
-            Vec::new()
-        } else {
-            aspects_str.split('.').collect()
-        };
+        let aspects: Vec<&str> = parse_aspect_spec(aspects_str);
         let payload_vec = if payload.is_null() || payload_len == 0 {
             Vec::new()
         } else {
@@ -1372,7 +1474,10 @@ pub extern "C" fn lxmf_app_link_request_async(
 /// # Arguments
 /// * `client`         – handle returned by `lxmf_client_start`.
 /// * `aspect_filter`  – NUL-terminated ASCII string of the full aspect name,
-///   e.g. `"rfed.channel"` or `"rfed.notify"`.
+///   e.g. `"rfed.delivery"`, `"rfed.channel.subscribe"`,
+///   `"rfed.notify.register"`. Legacy parent aspects `"rfed.channel"` and
+///   `"rfed.notify"` are still accepted during the soft-cut transition
+///   (REFACTOR.md 2026-05-17).
 ///
 /// Returns 0 on success, -1 on error (call `lxmf_last_error` for details).
 #[no_mangle]

@@ -140,12 +140,23 @@ impl LxmfClient {
     // Propagation
     // -------------------------------------------------------------------
 
+    pub fn set_propagation_node(
+        &self,
+        node_hash: &[u8],
+    ) -> Result<(), String> {
+        lxmf::router_set_propagation_node(self.router_handle, node_hash)
+    }
+
     pub fn sync_from_propagation_node(
         &self,
         node_hash: &[u8],
     ) -> Result<(), String> {
         lxmf::router_set_propagation_node(self.router_handle, node_hash)?;
         lxmf::router_request_messages(self.router_handle, self.rns.identity_handle)
+    }
+
+    pub fn ingest_propagated_lxmf(&self, lxmf_data: &[u8]) -> Result<bool, String> {
+        lxmf::router_ingest_propagated_lxmf(self.router_handle, lxmf_data)
     }
 
     pub fn propagation_state(&self) -> Result<u8, String> {
@@ -205,6 +216,14 @@ impl LxmfClient {
 
     pub fn app_link_reopen(&self, dest_hash: &[u8]) -> Result<(), String> {
         lxmf::router_app_link_reopen(self.router_handle, dest_hash)
+    }
+
+    pub fn register_app_link_packet_callback(
+        &self,
+        dest_hash: &[u8],
+        cb: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    ) -> Result<(), String> {
+        lxmf::router_register_app_link_packet_callback(self.router_handle, dest_hash, cb)
     }
 
     pub fn app_link_send(

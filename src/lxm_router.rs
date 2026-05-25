@@ -205,6 +205,10 @@ pub struct LXMRouter {
 	/// Fires when an outbound message changes delivery state.
 	/// Args: message hash bytes, new state byte (LXMessage::DELIVERED etc.).
 	pub message_state_callback: Option<Arc<dyn Fn(&[u8], u8) + Send + Sync>>,
+	/// Per-destination packet callbacks for persistent APP_LINK handles.
+	/// Installed onto the live LinkHandle whenever the corresponding
+	/// app-link reaches ACTIVE.
+	pub app_link_packet_callbacks: HashMap<Vec<u8>, Arc<dyn Fn(&[u8]) + Send + Sync>>,
 	/// Channel to wake the job thread for immediate process_outbound.
 	/// Link-established callbacks send on this instead of calling
 	/// process_outbound inline, which would block the TCP read thread.
@@ -413,6 +417,7 @@ impl LXMRouter {
 
 			self_handle: None,
 			message_state_callback: None,
+			app_link_packet_callbacks: HashMap::new(),
 			outbound_wake_tx,
 		}));
 
@@ -466,6 +471,7 @@ impl LXMRouter {
 										router.request_messages_from_propagation_node(identity, max_messages);
 									}
 								} else {
+									router.install_registered_app_link_packet_callback(&dest_owned, &handle);
 									router.outbound_links.insert(dest_owned.clone(), handle);
 								}
 							}
@@ -874,7 +880,7 @@ impl LXMRouter {
 		let router_weak_offer = self.self_handle.clone();
 		self.propagation_destination.register_request_handler(
 			LXMPeer::OFFER_REQUEST_PATH.to_string(),
-			Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+			Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
 				if let Some(router_arc) = router_weak_offer.as_ref().and_then(|w| w.upgrade()) {
 					if let Ok(mut router) = router_arc.lock() {
 						return router.offer_request(path, data, request_id, remote_identity, requested_at);
@@ -890,7 +896,7 @@ impl LXMRouter {
 		let router_weak3 = self.self_handle.clone();
 		self.propagation_destination.register_request_handler(
 			LXMPeer::MESSAGE_GET_PATH.to_string(),
-			Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+			Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
 				if let Some(router_arc) = router_weak3.as_ref().and_then(|w| w.upgrade()) {
 					if let Ok(mut router) = router_arc.lock() {
 						return router.message_get_request(path, data, request_id, remote_identity, requested_at);
@@ -915,7 +921,7 @@ impl LXMRouter {
 		let router_weak4 = self.self_handle.clone();
 		control_destination.register_request_handler(
 			Self::STATS_GET_PATH.to_string(),
-			Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+			Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
 				if let Some(router_arc) = router_weak4.as_ref().and_then(|w| w.upgrade()) {
 					if let Ok(mut router) = router_arc.lock() {
 						return router.stats_get_request(path, data, request_id, remote_identity, requested_at);
@@ -931,7 +937,7 @@ impl LXMRouter {
 		let router_weak5 = self.self_handle.clone();
 		control_destination.register_request_handler(
 			Self::SYNC_REQUEST_PATH.to_string(),
-			Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+			Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
 				if let Some(router_arc) = router_weak5.as_ref().and_then(|w| w.upgrade()) {
 					if let Ok(mut router) = router_arc.lock() {
 						return router.peer_sync_request(path, data, request_id, remote_identity, requested_at);
@@ -947,7 +953,7 @@ impl LXMRouter {
 		let router_weak6 = self.self_handle.clone();
 		control_destination.register_request_handler(
 			Self::UNPEER_REQUEST_PATH.to_string(),
-			Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+			Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
 				if let Some(router_arc) = router_weak6.as_ref().and_then(|w| w.upgrade()) {
 					if let Ok(mut router) = router_arc.lock() {
 						return router.peer_unpeer_request(path, data, request_id, remote_identity, requested_at);
@@ -1362,18 +1368,11 @@ impl LXMRouter {
 								remove = true;
 							}
 
-							// SENDING: AppLinks::send is in flight — nothing to do this tick.
-							// index increments at end of loop body so the next job tick re-checks.
-							// NEVER REMOVE EVER — do NOT add `continue` here; it skips the
-							// `if remove { pending_outbound.remove(index) }` cleanup at the end
-							// of the while loop body (which is outside this if-let block).
-							if !remove && lxm.state != LXMessage::SENDING {
-
 							// Timer P signal: AppLinks fired on_propagation_needed (5 s elapsed).
 							// Signal the caller to start a parallel propagation send while
 							// the direct send is still running.
 							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-							if lxm.needs_prop_fallback {
+							if !remove && lxm.needs_prop_fallback {
 								lxm.needs_prop_fallback = false;
 								if !LXMessage::is_success_state(lxm.state) {
 									if let Some(hash) = lxm.hash.as_ref() {
@@ -1381,6 +1380,15 @@ impl LXMRouter {
 									}
 								}
 							}
+
+							// SENDING: AppLinks::send is in flight.
+							// Timer P is handled above even while SENDING; everything else waits
+							// for the next non-SENDING tick.
+							// index increments at end of loop body so the next job tick re-checks.
+							// NEVER REMOVE EVER — do NOT add `continue` here; it skips the
+							// `if remove { pending_outbound.remove(index) }` cleanup at the end
+							// of the while loop body (which is outside this if-let block).
+							if !remove && lxm.state != LXMessage::SENDING {
 
 							// Failure: on_failed fired (tier 3 exhausted all protocol timeouts).
 							// AppLinks::send is a one-shot 3-tier call; fail immediately.
@@ -3297,12 +3305,41 @@ impl LXMRouter {
 	///
 	/// The callback fires whenever an APP_LINK transitions state.  Used by
 	/// the host (Swift) to react to ACTIVE without polling — e.g. to drive
-	/// re-subscribe-after-reconnect once the rfed.channel link is up.
+	/// re-subscribe-after-reconnect once the rfed.channel.subscribe link is
+	/// up (legacy: rfed.channel).
 	pub fn register_app_link_status_callback(
 		&self,
 		callback: rns_app_links::AppLinkStatusCallback,
 	) {
 		AppLinks::register_status_callback(callback);
+	}
+
+	fn install_registered_app_link_packet_callback(&self, dest_hash: &[u8], handle: &LinkHandle) {
+		let packet_cb = match self.app_link_packet_callbacks.get(dest_hash) {
+			Some(callback) => callback.clone(),
+			None => return,
+		};
+		handle.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt: &Packet| {
+			packet_cb(data);
+		})));
+	}
+
+	/// Register a packet callback for an APP_LINK destination.
+	///
+	/// The callback fires for DATA packets received on the live persistent
+	/// link for `dest_hash`. If the link is already ACTIVE when the callback
+	/// is registered, it is attached immediately; otherwise it is attached on
+	/// the next APP_LINK_ACTIVE transition for that destination.
+	pub fn register_app_link_packet_callback(
+		&mut self,
+		dest_hash: &[u8],
+		callback: Arc<dyn Fn(&[u8]) + Send + Sync>,
+	) {
+		self.app_link_packet_callbacks
+			.insert(dest_hash.to_vec(), callback);
+		if let Some(handle) = AppLinks::get_handle(dest_hash) {
+			self.install_registered_app_link_packet_callback(dest_hash, &handle);
+		}
 	}
 
 	/// Register a callback that fires whenever an outbound message changes
@@ -4557,6 +4594,24 @@ impl LXMRouter {
 		false
 	}
 
+	/// Ingest raw propagated `lxmf_data` delivered by an external live stream.
+	///
+	/// This reuses the normal propagation-delivery path so delivery callbacks,
+	/// duplicate suppression, and ratchet handling stay identical to `/get`
+	/// responses from `lxmf.propagation`.
+	pub fn ingest_propagated_lxmf(&mut self, lxmf_data: &[u8]) -> bool {
+		self.lxmf_propagation(
+			lxmf_data,
+			None,
+			None,
+			false,
+			false,
+			None,
+			None,
+			None,
+		)
+	}
+
 	fn enqueue_peer_distribution(&mut self, transient_id: Vec<u8>, from_peer: Option<Vec<u8>>) {
 		self.peer_distribution_queue.push_back((transient_id, from_peer));
 	}
@@ -5179,6 +5234,27 @@ mod tests {
 			"Arc::ptr_eq dedup guard must appear after 'DIRECT send OK' — \
 			 it prevents the same link being queued for delivery_link_established \
 			 more than once per process_outbound cycle"
+		);
+	}
+
+	/// REGRESSION GUARD: Timer P fallback must be handled while a DIRECT
+	/// AppLinks send is still in `SENDING` state.
+	///
+	/// If `needs_prop_fallback` is gated behind `lxm.state != SENDING`, the
+	/// propagation signal is delayed until the direct send has already failed,
+	/// which defeats the parallel-send rule in DESIGN_PRINCIPLES.md §1.
+	#[test]
+	fn prop_fallback_signal_is_not_gated_on_non_sending_state() {
+		let src = include_str!("lxm_router.rs");
+
+		let prop_pos = src.find("if !remove && lxm.needs_prop_fallback")
+			.expect("needs_prop_fallback guard must exist in process_outbound");
+		let sending_guard_pos = src.find("if !remove && lxm.state != LXMessage::SENDING")
+			.expect("non-SENDING guard must exist in process_outbound");
+
+		assert!(
+			prop_pos < sending_guard_pos,
+			"needs_prop_fallback must be handled before the non-SENDING guard so Timer P can start propagation while the direct send is still SENDING"
 		);
 	}
 

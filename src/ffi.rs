@@ -479,6 +479,20 @@ pub fn router_request_messages(
     Ok(())
 }
 
+/// Feed raw propagated `lxmf_data` into the router's normal client ingress
+/// path. Returns `true` if the packet was accepted for local delivery or
+/// duplicate tracking, `false` if it was ignored.
+pub fn router_ingest_propagated_lxmf(
+    router_handle: u64,
+    lxmf_data: &[u8],
+) -> Result<bool, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+
+    let mut guard = router.lock().map_err(|e| e.to_string())?;
+    Ok(guard.ingest_propagated_lxmf(lxmf_data))
+}
+
 /// Get the current propagation transfer state.
 ///
 /// Returns one of the `PR_*` constants (e.g. PR_IDLE=0x00, PR_COMPLETE=0x07).
@@ -677,9 +691,12 @@ pub fn router_app_link_send(
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.
 ///
 /// LXMF only auto-reconnects app-links that announce under `lxmf.delivery`.
-/// For any other aspect (e.g. `rfed.channel`, `rfed.notify`) the caller must
-/// register one handler per aspect so the router reconnects when that
-/// destination announces.  Call once per aspect during application startup.
+/// For any other aspect (e.g. `rfed.delivery`, `rfed.channel.subscribe`,
+/// `rfed.notify.register`) the caller must register one handler per aspect
+/// so the router reconnects when that destination announces. Call once per
+/// aspect during application startup. Legacy parent aspects `rfed.channel`
+/// and `rfed.notify` are still accepted during the soft-cut transition
+/// (REFACTOR.md 2026-05-17).
 pub fn router_register_app_link_reconnect_handler(
     router_handle: u64,
     aspect_filter: &str,
@@ -788,6 +805,26 @@ pub fn router_register_app_link_status_callback(
         .lock()
         .map_err(|e| e.to_string())?
         .register_app_link_status_callback(callback);
+    Ok(())
+}
+
+/// Register a callback that fires for DATA packets received on an APP_LINK.
+///
+/// The callback is bound to the persistent link tracked for `dest_hash`. If
+/// the link is already ACTIVE, the callback is attached immediately; if the
+/// link reconnects later, the callback is reattached on the next ACTIVE
+/// transition.
+pub fn router_register_app_link_packet_callback(
+    router_handle: u64,
+    dest_hash: &[u8],
+    callback: Arc<dyn Fn(&[u8]) + Send + Sync>,
+) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router
+        .lock()
+        .map_err(|e| e.to_string())?
+        .register_app_link_packet_callback(dest_hash, callback);
     Ok(())
 }
 

@@ -158,13 +158,16 @@ pub fn propagation_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHa
 /// destination aspect whenever an announce (or path-response) arrives.
 ///
 /// The `delivery_announce_handler` only fires for `lxmf.delivery`, so
-/// app-links to other aspects (e.g. `rfed.channel`) need their own handlers.
-/// Callers register one handler per extra aspect they care about.
+/// app-links to other aspects (e.g. `rfed.channel.publish`) need their own
+/// handlers. Callers register one handler per extra aspect they care about.
 ///
 /// # Arguments
 /// * `router`        – shared LXMRouter (the one holding `app_links`).
 /// * `aspect_filter` – full dot-separated name of the aspect to watch,
-///   e.g. `"rfed.channel"` or `"rfed.notify"`.
+///   e.g. `"rfed.delivery"`, `"rfed.channel.subscribe"`,
+///   `"rfed.notify.register"`. The legacy parent aspects `"rfed.channel"`
+///   and `"rfed.notify"` are still accepted during the soft-cut transition
+///   (see REFACTOR.md 2026-05-17).
 pub fn app_link_reconnect_handler(
 	router: Arc<Mutex<LXMRouter>>,
 	aspect_filter: String,
