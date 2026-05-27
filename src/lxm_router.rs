@@ -60,6 +60,14 @@ pub fn global_router() -> Option<Arc<Mutex<LXMRouter>>> {
 		.and_then(|g| g.as_ref().and_then(|w| w.upgrade()))
 }
 
+fn arm_repair_announce_latch(latched_destinations: &mut HashSet<Vec<u8>>, destination_hash: &[u8]) -> bool {
+	latched_destinations.insert(destination_hash.to_vec())
+}
+
+fn clear_repair_announce_latch(latched_destinations: &mut HashSet<Vec<u8>>, destination_hash: &[u8]) -> bool {
+	latched_destinations.remove(destination_hash)
+}
+
 #[derive(Clone)]
 pub struct PropagationEntry {
 	pub destination_hash: Vec<u8>,
@@ -195,6 +203,9 @@ pub struct LXMRouter {
 	/// Destination hashes we care about (contacts, pending targets).
 	/// Announces from destinations NOT in this set are ignored.
 	pub watched_destinations: HashSet<Vec<u8>>,
+	/// Local delivery destinations that have already emitted one automatic
+	/// repair announce after a deterministic decrypt failure.
+	pub failed_decrypt_announced_destinations: HashSet<Vec<u8>>,
 	/// Phase 3: app_links spec/lifecycle moved to
 	/// `app_links::AppLinks`. LXMF mirrors the active outbound
 	/// `LinkHandle` for each app-link destination into `outbound_links` via a
@@ -414,6 +425,7 @@ impl LXMRouter {
 			announce_callback: None,
 			sync_complete_callback: None,
 			watched_destinations: HashSet::new(),
+			failed_decrypt_announced_destinations: HashSet::new(),
 
 			self_handle: None,
 			message_state_callback: None,
@@ -604,6 +616,47 @@ impl LXMRouter {
 			let dest_hex = reticulum_rust::hexrep(destination_hash, false);
 			reticulum_rust::log(&format!("[LXMF] Announce: delivery destination {} not registered", dest_hex), reticulum_rust::LOG_ERROR, false, false);
 			false
+		}
+	}
+
+	fn maybe_send_failed_decrypt_repair_announce(&mut self, destination_hash: &[u8]) {
+		let dest_hex = reticulum_rust::hexrep(destination_hash, false);
+		if !arm_repair_announce_latch(&mut self.failed_decrypt_announced_destinations, destination_hash) {
+			reticulum_rust::log(
+				&format!(
+					"[LXMF] Suppressing repeated repair announce after failed decrypt dest={}",
+					dest_hex,
+				),
+				reticulum_rust::LOG_WARNING,
+				false,
+				false,
+			);
+			return;
+		}
+
+		reticulum_rust::log(
+			&format!(
+				"[LXMF] Failed decrypt for local destination {}; sending repair announce",
+				dest_hex,
+			),
+			reticulum_rust::LOG_NOTICE,
+			false,
+			false,
+		);
+		let _ = self.announce(destination_hash, None);
+	}
+
+	fn clear_failed_decrypt_repair_announce(&mut self, destination_hash: &[u8]) {
+		if clear_repair_announce_latch(&mut self.failed_decrypt_announced_destinations, destination_hash) {
+			reticulum_rust::log(
+				&format!(
+					"[LXMF] Clearing failed-decrypt repair announce latch dest={}",
+					reticulum_rust::hexrep(destination_hash, false),
+				),
+				reticulum_rust::LOG_DEBUG,
+				false,
+				false,
+			);
 		}
 	}
 
@@ -2781,6 +2834,13 @@ impl LXMRouter {
 			self.pending_outbound.push(message_arc);
 		}
 		drop(lock);
+		if enqueue {
+			// A propagation fallback can reach this path while the original DIRECT
+			// send is still failing in parallel. Re-run POB immediately instead of
+			// waiting for the next 2-second jobs tick, or Timer P loses its parallel
+			// send guarantee and trips DESIGN_PRINCIPLES.md §1.
+			self.process_outbound();
+		}
 	}
 
 	pub fn cancel_outbound(&mut self, message_id: &[u8], cancel_state: u8) {
@@ -3409,6 +3469,10 @@ impl LXMRouter {
 				return false;
 			}
 		};
+
+			if self.delivery_destinations.contains_key(&message.destination_hash) {
+				self.clear_failed_decrypt_repair_announce(&message.destination_hash);
+			}
 
 		if ratchet_id.is_some() && message.ratchet_id.is_none() {
 			message.ratchet_id = ratchet_id;
@@ -4515,7 +4579,7 @@ impl LXMRouter {
 		), LOG_NOTICE, false, false);
 		self.locally_processed_transient_ids.insert(transient_id.clone(), received);
 
-		let (decrypted, ratchet_id, destination_type) = if let Some(delivery_destination) = self.delivery_destinations.get_mut(&destination_hash) {
+		let (decrypted, ratchet_id, destination_type, had_local_destination) = if let Some(delivery_destination) = self.delivery_destinations.get_mut(&destination_hash) {
 			let encrypted = &lxmf_data[LXMessage::DESTINATION_LENGTH..];
 			log(&format!("[PROP] LXMF raw hex ({} bytes): {}", lxmf_data.len(), hexrep(lxmf_data, false)), LOG_NOTICE, false, false);
 			log(&format!("[PROP] encrypted ({} bytes): ephemeral={} token_data_len={}",
@@ -4532,10 +4596,11 @@ impl LXMRouter {
 				result.ok(),
 				delivery_destination.latest_ratchet_id.clone(),
 				Some(delivery_destination.dest_type),
+				true,
 			)
 		} else {
 			log("[PROP] destination_hash NOT FOUND in delivery_destinations — message cannot be decrypted", LOG_NOTICE, false, false);
-			(None, None, None)
+			(None, None, None, false)
 		};
 
 		if let Some(decrypted) = decrypted {
@@ -4554,6 +4619,10 @@ impl LXMRouter {
 			self.locally_delivered_transient_ids.insert(transient_id.clone(), now());
 			let _ = signal_local_delivery;
 			return true;
+		}
+
+		if had_local_destination {
+			self.maybe_send_failed_decrypt_repair_announce(&destination_hash);
 		}
 
 		if self.propagation_node {
@@ -5120,7 +5189,51 @@ impl LXMRouter {
 
 #[cfg(test)]
 mod tests {
+	use super::{arm_repair_announce_latch, clear_repair_announce_latch};
+	use std::collections::HashSet;
 	use std::sync::{Arc, Mutex};
+
+	#[test]
+	fn failed_decrypt_repair_announce_latch_is_edge_triggered() {
+		let mut latched_destinations = HashSet::new();
+		let dest_hash = vec![0x42; 16];
+
+		assert!(
+			arm_repair_announce_latch(&mut latched_destinations, &dest_hash),
+			"first failed decrypt must arm one repair announce"
+		);
+		assert!(
+			!arm_repair_announce_latch(&mut latched_destinations, &dest_hash),
+			"repeated failed decrypts must not re-arm another repair announce"
+		);
+		assert!(
+			clear_repair_announce_latch(&mut latched_destinations, &dest_hash),
+			"successful recovery must clear the latch"
+		);
+		assert!(
+			arm_repair_announce_latch(&mut latched_destinations, &dest_hash),
+			"a later recovery episode must be able to trigger one new repair announce"
+		);
+	}
+
+	#[test]
+	fn failed_decrypt_repair_announce_is_latched_until_successful_delivery() {
+		let src = include_str!("lxm_router.rs");
+		let production = src
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production source prefix must exist");
+
+		assert!(
+			production.contains("self.maybe_send_failed_decrypt_repair_announce(&destination_hash);"),
+			"failed decrypts for local destinations must funnel through the repair-announce latch"
+		);
+
+		assert!(
+			production.contains("self.clear_failed_decrypt_repair_announce(&message.destination_hash);"),
+			"successful local delivery must clear the repair-announce latch so only one announce is emitted per failure episode"
+		);
+	}
 
 	/// REGRESSION GUARD: `Arc::ptr_eq` dedup logic prevents the same link from
 	/// being pushed to `backchannel_setup_links` more than once per
@@ -5255,6 +5368,29 @@ mod tests {
 		assert!(
 			prop_pos < sending_guard_pos,
 			"needs_prop_fallback must be handled before the non-SENDING guard so Timer P can start propagation while the direct send is still SENDING"
+		);
+	}
+
+	/// REGRESSION GUARD: once deferred stamp generation finishes, the message
+	/// must be handed straight back to POB instead of waiting for another jobs
+	/// interval.
+	///
+	/// Timer P fallback on iOS creates a PROPAGATED message immediately when the
+	/// 5-second direct budget expires. If `process_deferred_stamps` only pushes
+	/// that message onto `pending_outbound` and waits for the next 2-second jobs
+	/// tick, the propagated copy starts 2-4 seconds late and the send is no
+	/// longer parallel.
+	#[test]
+	fn deferred_stamp_enqueue_reprocesses_outbound_immediately() {
+		let src = include_str!("lxm_router.rs");
+
+		let push_pos = src.find("self.pending_outbound.push(message_arc);")
+			.expect("process_deferred_stamps must enqueue completed deferred messages");
+		let tail = &src[push_pos..];
+
+		assert!(
+			tail.contains("self.process_outbound();"),
+			"process_deferred_stamps must rerun process_outbound immediately after enqueueing a deferred message"
 		);
 	}
 
