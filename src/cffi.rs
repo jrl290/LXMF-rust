@@ -223,7 +223,8 @@ pub extern "C" fn lxmf_free_bytes(ptr: *mut u8, len: u32) {
 /// - `storage_path`    — LXMF storage directory
 /// - `identity_path`   — Path to identity file
 /// - `create_identity` — If non-zero and identity file missing, create one
-/// - `display_name`    — Announced display name (empty string = anonymous)
+/// - `display_name`    — Display name (sent per-message via FIELD_SENDER_NAME;
+///                       NOT broadcast in announces — privacy-preserving)
 /// - `log_level`       — 0–7 or -1 for default
 /// - `stamp_cost`      — Stamp cost for delivery endpoint (-1 = none)
 #[no_mangle]
@@ -1597,6 +1598,10 @@ pub extern "C" fn lxmf_client_recall_display_name(
     };
 
     let app_data = reticulum_rust::identity::Identity::recall_app_data(hash);
+    // Fallback: extract display name from announce app_data.
+    // Since v0.6.0, announces no longer carry display names (DESIGN_PRINCIPLES.md §9).
+    // This only returns names from OLD clients that still broadcast them.
+    // New code should use sender_name_from_fields() on incoming messages instead.
     let name = crate::lxmf::display_name_from_app_data(app_data.as_deref());
 
     match name {

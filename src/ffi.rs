@@ -9,6 +9,7 @@ use reticulum_rust::ffi::{
     destroy_handle, get_handle, store_handle,
 };
 use reticulum_rust::identity::Identity;
+use reticulum_rust::transport::Transport;
 
 use crate::lx_message::LXMessage;
 use crate::lxm_router::LXMRouter;
@@ -241,12 +242,27 @@ pub fn router_process_outbound(router_handle: u64) -> Result<(), String> {
 
 /// Destroy a router handle.
 pub fn router_destroy(router_handle: u64) -> Result<(), String> {
-    // Clear all callbacks first so that Transport background threads that are
-    // already in-flight (or will fire from network packets arriving after
-    // shutdown) cannot call into a stale context pointer after the test
-    // (or caller) has released the ctx memory.
+    // Deregister destinations from Transport first so that the next
+    // router instance can re-register them with fresh callbacks.
+    // Without this, `Transport::register_destination` silently skips
+    // new registrations whose hash matches a stale destination left
+    // behind by a previous (now destroyed) router — the stale
+    // destination's packet/link callbacks hold weak refs to the dead
+    // router and silently drop all inbound traffic.
     if let Some(router) = get_handle::<Arc<Mutex<LXMRouter>>>(router_handle) {
         if let Ok(mut r) = router.lock() {
+            for dest_hash in r.delivery_destinations.keys() {
+                Transport::deregister_destination(dest_hash);
+            }
+            Transport::deregister_destination(&r.propagation_destination.hash);
+            if let Some(ref control) = r.control_destination {
+                Transport::deregister_destination(&control.hash);
+            }
+
+            // Clear all callbacks so that Transport background threads that are
+            // already in-flight (or will fire from network packets arriving after
+            // shutdown) cannot call into a stale context pointer after the test
+            // (or caller) has released the ctx memory.
             r.announce_callback = None;
             r.delivery_callback = None;
             r.sync_complete_callback = None;

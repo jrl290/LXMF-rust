@@ -672,11 +672,12 @@ impl LXMRouter {
 			return None;
 		}
 
-		let display_name = self
-			.delivery_display_names
-			.get(destination_hash)
-			.map(|name| Value::Binary(name.as_bytes().to_vec()))
-			.unwrap_or(Value::Nil);
+		// NEVER REMOVE: Display name is NOT broadcast in announces.
+		// It travels per-message via FIELD_SENDER_NAME for privacy.
+		// Re-adding it here is a DESIGN_PRINCIPLES.md §9 violation.
+		// The announce is heard by everyone on the network.
+		// Only message recipients should see your name.
+		let display_name = Value::Nil;
 
 		let stamp_cost = self
 			.delivery_stamp_costs
@@ -1889,6 +1890,17 @@ impl LXMRouter {
 						]),
 					);
 				}
+			}
+
+			// Inject sender display name as a per-message field.
+			// This replaces the old behavior of broadcasting it in
+			// the announce app_data — now only message recipients see it.
+			// NEVER REMOVE — see DESIGN_PRINCIPLES.md §9
+			if let Some(name) = self.delivery_display_names.get(&lxm.source_hash) {
+				lxm.set_field(
+					crate::lxmf::FIELD_SENDER_NAME,
+					Value::Binary(name.as_bytes().to_vec()),
+				);
 			}
 
 			// Resolve the Destination object from the hash if needed.
