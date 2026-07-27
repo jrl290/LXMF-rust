@@ -115,6 +115,8 @@ pub struct LXMRouter {
 	pub ignored_list: Vec<Vec<u8>>,
 	pub allowed_list: Vec<Vec<u8>>,
 	pub control_allowed_list: Vec<Vec<u8>>,
+	pub delivery_filter_strangers: bool,
+	pub delivery_allowed_list: HashSet<Vec<u8>>,
 	pub auth_required: bool,
 	pub retain_synced_on_node: bool,
 
@@ -358,6 +360,8 @@ impl LXMRouter {
 			ignored_list: Vec::new(),
 			allowed_list: Vec::new(),
 			control_allowed_list: Vec::new(),
+			delivery_filter_strangers: false,
+			delivery_allowed_list: HashSet::new(),
 			auth_required: false,
 			retain_synced_on_node: false,
 			default_sync_strategy: sync_strategy,
@@ -3260,6 +3264,22 @@ impl LXMRouter {
 		self.watched_destinations.remove(dest_hash);
 	}
 
+	pub fn set_delivery_filter_strangers(&mut self, enabled: bool) {
+		self.delivery_filter_strangers = enabled;
+	}
+
+	pub fn clear_delivery_allowlist(&mut self) {
+		self.delivery_allowed_list.clear();
+	}
+
+	pub fn allow_delivery_identity(&mut self, identity_hash: Vec<u8>) {
+		self.delivery_allowed_list.insert(identity_hash);
+	}
+
+	pub fn disallow_delivery_identity(&mut self, identity_hash: &[u8]) {
+		self.delivery_allowed_list.remove(identity_hash);
+	}
+
 	/// Return the current state of a direct link to a peer.
 	/// 0 = no link / closed, 1 = pending (establishing), 2 = active.
 	pub fn peer_link_status(&self, dest_hash: &[u8]) -> u8 {
@@ -3601,6 +3621,18 @@ impl LXMRouter {
 					self.locally_delivered_transient_ids.insert(hash.clone(), now());
 				}
 			}
+		}
+
+		if self.delivery_filter_strangers
+			&& !self.delivery_allowed_list.contains(&message.source_hash)
+		{
+			log(
+				&format!("Dropped message from non-allowlisted source {}", hexrep(&message.source_hash, false)),
+				LOG_DEBUG,
+				false,
+				false,
+			);
+			return false;
 		}
 
 		// Call delivery callback

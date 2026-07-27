@@ -1734,6 +1734,19 @@ pub extern "C" fn lxmf_message_add_attachment(
     }
 }
 
+/// Clone a message as a fresh PROPAGATED message.
+/// Returns a new handle, or 0 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_message_clone_propagated(msg: u64) -> u64 {
+    match lxmf::message_clone_propagated(msg) {
+        Ok(handle) => handle,
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
 /// Submit a message for delivery.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 autobins = false
 
+[features]
+default = ["reticulum-default"]
+reticulum-default = ["reticulum_rust/default"]
+
 [[bin]]
 name = "lxmf_send"
 path = "src/bin/lxmf_send.rs"
@@ -25,7 +29,7 @@ name = "rmp_format_test"
 path = "src/bin/rmp_format_test.rs"
 
 [dependencies]
-reticulum_rust = { path = "../Reticulum-rust" }
+reticulum_rust = { path = "../Reticulum-rust", default-features = false }
 app_links = { path = "../app-links" }
 rmp = "0.8.14"
 rmpv = "=1.0.0"

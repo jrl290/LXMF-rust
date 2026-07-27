@@ -231,6 +231,34 @@ pub fn router_unwatch_destination(router_handle: u64, dest_hash: &[u8]) -> Resul
     Ok(())
 }
 
+pub fn router_set_delivery_filter_strangers(router_handle: u64, enabled: bool) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router.lock().map_err(|e| e.to_string())?.set_delivery_filter_strangers(enabled);
+    Ok(())
+}
+
+pub fn router_clear_delivery_allowlist(router_handle: u64) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router.lock().map_err(|e| e.to_string())?.clear_delivery_allowlist();
+    Ok(())
+}
+
+pub fn router_allow_delivery_identity(router_handle: u64, identity_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router.lock().map_err(|e| e.to_string())?.allow_delivery_identity(identity_hash.to_vec());
+    Ok(())
+}
+
+pub fn router_disallow_delivery_identity(router_handle: u64, identity_hash: &[u8]) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router.lock().map_err(|e| e.to_string())?.disallow_delivery_identity(identity_hash);
+    Ok(())
+}
+
 /// Trigger a processing pass on outbound messages (retries, link mgmt, etc).
 pub fn router_process_outbound(router_handle: u64) -> Result<(), String> {
     let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
@@ -381,6 +409,15 @@ pub fn message_add_field_bool(
         .map_err(|e| e.to_string())?
         .set_field(key, rmpv::Value::Boolean(value));
     Ok(())
+}
+
+/// Clone an outbound message as a fresh PROPAGATED message, preserving all
+/// application fields and attachments while resetting transport state.
+pub fn message_clone_propagated(handle: u64) -> Result<u64, String> {
+    let msg: Arc<Mutex<LXMessage>> =
+        get_handle(handle).ok_or_else(|| "invalid message handle".to_string())?;
+    let copy = msg.lock().map_err(|e| e.to_string())?.propagated_copy()?;
+    Ok(store_handle(Arc::new(Mutex::new(copy))))
 }
 
 /// Submit a message to the router for sending.

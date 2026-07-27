@@ -264,6 +264,26 @@ impl LXMessage {
 		})
 	}
 
+	/// Create a fresh propagated-method copy preserving the application payload.
+	/// Transport state, packing, hashes and receipts are intentionally reset.
+	pub fn propagated_copy(&self) -> Result<Self, String> {
+		let mut copy = Self::new(
+			self.destination.clone(),
+			self.source.clone(),
+			Some(self.content.clone()),
+			Some(self.title.clone()),
+			Some(self.fields.clone()),
+			Some(Self::PROPAGATED),
+			Some(self.destination_hash.clone()),
+			Some(self.source_hash.clone()),
+			self.stamp_cost,
+			self.include_ticket,
+		)?;
+		copy.timestamp = self.timestamp;
+		copy.outbound_ticket = self.outbound_ticket.clone();
+		Ok(copy)
+	}
+
 	pub fn set_title_from_string(&mut self, title_string: &str) {
 		self.title = title_string.as_bytes().to_vec();
 	}
@@ -1678,6 +1698,23 @@ mod tests {
 			LXMessage::PROPAGATED,
 			"msg.method must be PROPAGATED after pack() — router dispatch depends on this"
 		);
+	}
+
+	#[test]
+	fn propagated_copy_preserves_canonical_hash_and_application_payload() {
+		let mut direct = make_propagated_message();
+		direct.desired_method = Some(LXMessage::DIRECT);
+		direct.set_field(0x09, Value::Boolean(true));
+		direct.add_file_attachment("note.txt", b"attachment payload".to_vec());
+		direct.pack(false).expect("pack direct");
+
+		let mut propagated = direct.propagated_copy().expect("propagated copy");
+		assert_eq!(propagated.desired_method, Some(LXMessage::PROPAGATED));
+		assert_eq!(propagated.timestamp, direct.timestamp);
+		assert_eq!(propagated.fields, direct.fields);
+
+		propagated.pack(false).expect("pack propagated");
+		assert_eq!(propagated.hash, direct.hash);
 	}
 
 	/// REGRESSION GUARD: The POB route for PROPAGATED+ACTIVE must NOT call
