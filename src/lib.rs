@@ -2,6 +2,7 @@ pub mod client;
 pub mod cffi;
 pub mod handlers;
 pub mod lx_message;
+pub mod distro;
 pub mod lx_stamper;
 pub mod lxmf;
 pub mod lxm_peer;
