@@ -866,7 +866,7 @@ impl LXMessage {
 				self.progress = 0.50;
 				self.ratchet_id = packet.ratchet_id.clone();
 				self.state = Self::SENT;
-				if let Some(mut receipt) = receipt {
+				if let Some(receipt) = receipt {
 					if let Some(handle) = handle.clone() {
 						let delivery_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 							mark_delivered_shared(&handle);

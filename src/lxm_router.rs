@@ -20,7 +20,7 @@ use reticulum_rust::identity::{Identity, HASHLENGTH, TRUNCATED_HASHLENGTH};
 use reticulum_rust::link::{Link, LinkHandle};
 use reticulum_rust::packet::Packet;
 use reticulum_rust::reticulum::Reticulum;
-use reticulum_rust::resource::{Resource, ResourceStatus};
+use reticulum_rust::resource::{Resource, ResourceAdvertisement, ResourceStatus};
 use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, prettyhexrep, prettytime, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 
@@ -3738,18 +3738,17 @@ impl LXMRouter {
 		link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
 		// Set resource callbacks
-		let resource_cb = Arc::new({
+		// LXMF/LXMRouter.py delivery_link_established(): the advertisement
+		// callback's return value decides acceptance (RNS/Link.py:1108).
+		let resource_cb: reticulum_rust::link::ResourceAcceptCallback = Arc::new({
 			let router_weak = self.self_handle.clone();
-			move |resource: Arc<Mutex<Resource>>| {
-				if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-					if let Ok(router) = router_arc.lock() {
-						if let Ok(resource_guard) = resource.lock() {
-							let allowed = router.delivery_resource_advertised(&resource_guard);
-							if !allowed {
-								resource_guard.link.cancel_incoming_resource(resource.clone());
-							}
-						}
-					}
+			move |advertisement: &ResourceAdvertisement| -> bool {
+				match router_weak.as_ref().and_then(|w| w.upgrade()) {
+					Some(router_arc) => match router_arc.lock() {
+						Ok(router) => router.delivery_resource_advertised(advertisement),
+						Err(_) => false,
+					},
+					None => false,
 				}
 			}
 		});
@@ -3794,8 +3793,9 @@ impl LXMRouter {
 	}
 
 	/// Check if an advertised resource should be accepted
-	pub fn delivery_resource_advertised(&self, resource: &Resource) -> bool {
-		let size = resource.total_size as f64;
+	/// LXMF/LXMRouter.py delivery_resource_advertised(resource_advertisement).
+	pub fn delivery_resource_advertised(&self, advertisement: &ResourceAdvertisement) -> bool {
+		let size = advertisement.get_data_size() as f64;
 		let limit = self.delivery_per_transfer_limit * 1000.0;
 
 		if size > limit {
@@ -3975,18 +3975,17 @@ impl LXMRouter {
 
 			link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
-			let resource_cb = Arc::new({
+			// LXMF/LXMRouter.py propagation_link_established(): the
+			// advertisement callback's return value decides acceptance.
+			let resource_cb: reticulum_rust::link::ResourceAcceptCallback = Arc::new({
 				let router_weak = self.self_handle.clone();
-				move |resource: Arc<Mutex<Resource>>| {
-					if let Some(router_arc) = router_weak.as_ref().and_then(|w| w.upgrade()) {
-						if let Ok(router) = router_arc.lock() {
-							let allowed = router.propagation_resource_advertised(resource.clone());
-							if !allowed {
-								if let Ok(resource_guard) = resource.lock() {
-									resource_guard.link.cancel_incoming_resource(resource.clone());
-								}
-							}
-						}
+				move |advertisement: &ResourceAdvertisement| -> bool {
+					match router_weak.as_ref().and_then(|w| w.upgrade()) {
+						Some(router_arc) => match router_arc.lock() {
+							Ok(router) => router.propagation_resource_advertised(advertisement),
+							Err(_) => false,
+						},
+						None => false,
 					}
 				}
 			});
@@ -4082,14 +4081,11 @@ impl LXMRouter {
 	}
 
 	/// Decide whether an incoming propagation resource should be accepted
-	pub fn propagation_resource_advertised(&self, resource: Arc<Mutex<Resource>>) -> bool {
-		let resource_guard = match resource.lock() {
-			Ok(guard) => guard,
-			Err(_) => return false,
-		};
-
+	/// LXMF/LXMRouter.py propagation_resource_advertised(resource): the
+	/// advertisement carries the link it arrived on.
+	pub fn propagation_resource_advertised(&self, advertisement: &ResourceAdvertisement) -> bool {
 		if self.from_static_only {
-			let remote_identity = resource_guard.link.remote_identity().ok().flatten();
+			let remote_identity = advertisement.get_link().and_then(|link| link.remote_identity().ok().flatten());
 			let remote_identity = match remote_identity {
 				Some(identity) => identity,
 				None => return false,
@@ -4103,7 +4099,7 @@ impl LXMRouter {
 			}
 		}
 
-		let size = resource_guard.total_size as f64;
+		let size = advertisement.get_data_size() as f64;
 		let limit = self.propagation_per_sync_limit * 1000.0;
 		if size > limit {
 			log(
