@@ -2820,7 +2820,19 @@ impl LXMRouter {
 
 			if !propagation_ok {
 				let target_cost = self.get_outbound_propagation_cost();
+				if target_cost.is_none() {
+					// Waiting for the propagation node's announce
+					// (LXMF/LXMRouter.py PATH_REQUEST_WAIT): keep the message in
+					// pending_deferred_stamps and come back on the next tick;
+					// fail it once the wait is over, as upstream does.
+					let started = *message.propagation_cost_wait_started.get_or_insert_with(now);
+					if now() - started < Self::PATH_REQUEST_WAIT {
+						return;
+					}
+					log("Failed to get propagation node stamp cost, cannot generate propagation stamp", LOG_ERROR, false, false);
+				}
 				if let Some(cost) = target_cost {
+					message.propagation_cost_wait_started = None;
 					let _prop_start = std::time::Instant::now();
 					if let Ok(stamp) = message.get_propagation_stamp(cost) {
 						if let Some(stamp) = stamp {
@@ -3078,11 +3090,16 @@ impl LXMRouter {
 			});
 
 		if target_cost.is_none() {
-			// Fire off a path request so future sends will have the cached cost,
-			// but don't block — default to 0 so the message ships immediately.
+			// LXMF/LXMRouter.py get_outbound_propagation_cost(): request the
+			// path and wait for the announce that carries the cost. Until
+			// 2026-09-22 this returned Some(0) instead ("ship immediately"),
+			// so the first propagated message after a cold start went out
+			// unstamped and any node with a real stamp cost rejected it. The
+			// waiting is done by the caller across jobs ticks (no sleep under
+			// the router lock), for PATH_REQUEST_WAIT, then the message fails
+			// as upstream's does.
 			Transport::request_path(&pn_hash, None, None, None, None);
-			log("Propagation node stamp cost not cached, requesting path and defaulting to 0", LOG_NOTICE, false, false);
-			return Some(0);
+			log("Propagation node stamp cost not cached, requesting path", LOG_NOTICE, false, false);
 		}
 
 		target_cost

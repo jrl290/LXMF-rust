@@ -47,6 +47,11 @@ pub struct LXMessage {
 	pub propagation_stamp_value: Option<u32>,
 	pub propagation_stamp_valid: bool,
 	pub propagation_target_cost: Option<u32>,
+	/// When the router first found the propagation node's stamp cost missing
+	/// and requested its path. LXMF/LXMRouter.py waits PATH_REQUEST_WAIT for
+	/// the announce, then fails the message; here the wait is a deferral
+	/// across jobs ticks instead of a blocking sleep under the router lock.
+	pub propagation_cost_wait_started: Option<f64>,
 	pub defer_stamp: bool,
 	pub defer_propagation_stamp: bool,
 	pub outbound_ticket: Option<Vec<u8>>,
@@ -230,6 +235,7 @@ impl LXMessage {
 			propagation_stamp_value: None,
 			propagation_stamp_valid: false,
 			propagation_target_cost: None,
+			propagation_cost_wait_started: None,
 			defer_stamp: true,
 			defer_propagation_stamp: true,
 			outbound_ticket: None,
