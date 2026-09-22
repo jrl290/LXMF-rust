@@ -60,14 +60,6 @@ pub fn global_router() -> Option<Arc<Mutex<LXMRouter>>> {
 		.and_then(|g| g.as_ref().and_then(|w| w.upgrade()))
 }
 
-fn arm_repair_announce_latch(latched_destinations: &mut HashSet<Vec<u8>>, destination_hash: &[u8]) -> bool {
-	latched_destinations.insert(destination_hash.to_vec())
-}
-
-fn clear_repair_announce_latch(latched_destinations: &mut HashSet<Vec<u8>>, destination_hash: &[u8]) -> bool {
-	latched_destinations.remove(destination_hash)
-}
-
 #[derive(Clone)]
 pub struct PropagationEntry {
 	pub destination_hash: Vec<u8>,
@@ -205,9 +197,6 @@ pub struct LXMRouter {
 	/// Destination hashes we care about (contacts, pending targets).
 	/// Announces from destinations NOT in this set are ignored.
 	pub watched_destinations: HashSet<Vec<u8>>,
-	/// Local delivery destinations that have already emitted one automatic
-	/// repair announce after a deterministic decrypt failure.
-	pub failed_decrypt_announced_destinations: HashSet<Vec<u8>>,
 	/// Phase 3: app_links spec/lifecycle moved to
 	/// `app_links::AppLinks`. LXMF mirrors the active outbound
 	/// `LinkHandle` for each app-link destination into `outbound_links` via a
@@ -429,7 +418,6 @@ impl LXMRouter {
 			announce_callback: None,
 			sync_complete_callback: None,
 			watched_destinations: HashSet::new(),
-			failed_decrypt_announced_destinations: HashSet::new(),
 
 			self_handle: None,
 			message_state_callback: None,
@@ -520,19 +508,12 @@ impl LXMRouter {
 								}
 							} else {
 								router.outbound_links.remove(&dest_owned);
-								// Re-announce our delivery destination(s) when a direct
-								// messaging link closes.  The link closing IS the
-								// deterministic signal that the peer may need a fresh path
-								// to us in order to establish an inbound link (e.g. Meshchat
-								// cold-send after keepalive expiry).  Announcing here ensures
-								// the relay's path-table entry for us is current before the
-								// peer retries.
-								// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-								let delivery_hashes: Vec<Vec<u8>> =
-									router.delivery_destinations.keys().cloned().collect();
-								for hash in delivery_hashes {
-									router.announce(&hash, None);
-								}
+								// LXMF/LXMRouter.py announces a delivery destination only
+								// when the application asks. Until 2026-09-22 every closed
+								// direct link re-announced all delivery destinations here;
+								// public transport nodes rate-limit announces per
+								// destination and blocked the Android app for it
+								// (Reticulum-rust PARITY-AUDIT-1.5.2.md B22).
 							}
 						}
 						rns_app_links::APP_LINK_NONE => {
@@ -620,47 +601,6 @@ impl LXMRouter {
 			let dest_hex = reticulum_rust::hexrep(destination_hash, false);
 			reticulum_rust::log(&format!("[LXMF] Announce: delivery destination {} not registered", dest_hex), reticulum_rust::LOG_ERROR, false, false);
 			false
-		}
-	}
-
-	fn maybe_send_failed_decrypt_repair_announce(&mut self, destination_hash: &[u8]) {
-		let dest_hex = reticulum_rust::hexrep(destination_hash, false);
-		if !arm_repair_announce_latch(&mut self.failed_decrypt_announced_destinations, destination_hash) {
-			reticulum_rust::log(
-				&format!(
-					"[LXMF] Suppressing repeated repair announce after failed decrypt dest={}",
-					dest_hex,
-				),
-				reticulum_rust::LOG_WARNING,
-				false,
-				false,
-			);
-			return;
-		}
-
-		reticulum_rust::log(
-			&format!(
-				"[LXMF] Failed decrypt for local destination {}; sending repair announce",
-				dest_hex,
-			),
-			reticulum_rust::LOG_NOTICE,
-			false,
-			false,
-		);
-		let _ = self.announce(destination_hash, None);
-	}
-
-	fn clear_failed_decrypt_repair_announce(&mut self, destination_hash: &[u8]) {
-		if clear_repair_announce_latch(&mut self.failed_decrypt_announced_destinations, destination_hash) {
-			reticulum_rust::log(
-				&format!(
-					"[LXMF] Clearing failed-decrypt repair announce latch dest={}",
-					reticulum_rust::hexrep(destination_hash, false),
-				),
-				reticulum_rust::LOG_DEBUG,
-				false,
-				false,
-			);
 		}
 	}
 
@@ -3519,10 +3459,6 @@ impl LXMRouter {
 			}
 		};
 
-			if self.delivery_destinations.contains_key(&message.destination_hash) {
-				self.clear_failed_decrypt_repair_announce(&message.destination_hash);
-			}
-
 		if ratchet_id.is_some() && message.ratchet_id.is_none() {
 			message.ratchet_id = ratchet_id;
 		}
@@ -4678,9 +4614,11 @@ impl LXMRouter {
 			return true;
 		}
 
-		if had_local_destination {
-			self.maybe_send_failed_decrypt_repair_announce(&destination_hash);
-		}
+		// A failed decrypt for a local destination is final here, as in
+		// LXMF/LXMRouter.py. Until 2026-09-22 it sent a "repair announce"
+		// (latched per destination) - a self-initiated announce the
+		// reference does not have (Reticulum-rust PARITY-AUDIT-1.5.2.md B22).
+		let _ = had_local_destination;
 
 		if self.propagation_node {
 			if let Some(messagepath) = &self.messagepath {
@@ -5246,51 +5184,8 @@ impl LXMRouter {
 
 #[cfg(test)]
 mod tests {
-	use super::{arm_repair_announce_latch, clear_repair_announce_latch};
 	use std::collections::HashSet;
 	use std::sync::{Arc, Mutex};
-
-	#[test]
-	fn failed_decrypt_repair_announce_latch_is_edge_triggered() {
-		let mut latched_destinations = HashSet::new();
-		let dest_hash = vec![0x42; 16];
-
-		assert!(
-			arm_repair_announce_latch(&mut latched_destinations, &dest_hash),
-			"first failed decrypt must arm one repair announce"
-		);
-		assert!(
-			!arm_repair_announce_latch(&mut latched_destinations, &dest_hash),
-			"repeated failed decrypts must not re-arm another repair announce"
-		);
-		assert!(
-			clear_repair_announce_latch(&mut latched_destinations, &dest_hash),
-			"successful recovery must clear the latch"
-		);
-		assert!(
-			arm_repair_announce_latch(&mut latched_destinations, &dest_hash),
-			"a later recovery episode must be able to trigger one new repair announce"
-		);
-	}
-
-	#[test]
-	fn failed_decrypt_repair_announce_is_latched_until_successful_delivery() {
-		let src = include_str!("lxm_router.rs");
-		let production = src
-			.split("#[cfg(test)]")
-			.next()
-			.expect("production source prefix must exist");
-
-		assert!(
-			production.contains("self.maybe_send_failed_decrypt_repair_announce(&destination_hash);"),
-			"failed decrypts for local destinations must funnel through the repair-announce latch"
-		);
-
-		assert!(
-			production.contains("self.clear_failed_decrypt_repair_announce(&message.destination_hash);"),
-			"successful local delivery must clear the repair-announce latch so only one announce is emitted per failure episode"
-		);
-	}
 
 	/// REGRESSION GUARD: `Arc::ptr_eq` dedup logic prevents the same link from
 	/// being pushed to `backchannel_setup_links` more than once per

@@ -263,13 +263,10 @@ impl LxmfClient {
     }
 
     /// Opt this client's delivery destination into Transport's announce
-    /// daemon. Once published, Transport automatically re-announces:
-    ///   * on every false→true `online` transition of any interface, and
-    ///   * every `refresh_secs` seconds (pass `0.0` to disable periodic
-    ///     refresh and only re-announce on interface up-edges).
-    ///
-    /// This replaces the per-app pattern of running a 30-min Timer +
-    /// announce-on-network-reconnect + announce-on-foreground.
+    /// daemon: it is re-announced every `refresh_secs` seconds (`0.0` =
+    /// no periodic refresh). Nothing announces on interface state changes
+    /// (reference behaviour; Reticulum-rust PARITY-AUDIT-1.5.2.md B22), so
+    /// this replaces an app-side timer, not reconnect-driven announces.
     pub fn publish(&self, refresh_secs: f64) -> Result<(), String> {
         reticulum_rust::ffi::transport_publish_destination(
             &self.dest_hash,
