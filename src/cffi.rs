@@ -750,6 +750,10 @@ pub extern "C" fn lxmf_client_announce(client: u64) -> i32 {
 ///   * once on every interface false→true `online` transition, and
 ///   * every `refresh_secs` seconds (pass 0.0 to disable periodic
 ///     refresh and only re-announce on interface up-edges).
+/// Both are held per destination and per interface to one announce per
+/// period (`refresh_secs`, or 30 min when 0.0), counted from the last
+/// announce there, including the application's own `lxmf_client_announce`,
+/// which always goes out.
 ///
 /// Idempotent: calling again with a different `refresh_secs` updates
 /// the existing entry without re-announcing. Returns 0 on success.
