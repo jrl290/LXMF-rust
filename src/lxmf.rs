@@ -81,6 +81,41 @@ pub fn display_name_from_app_data(app_data: Option<&[u8]>) -> Option<String> {
 	}
 }
 
+/// LXMF/LXMF.py `SF_COMPRESSION`: the supported-functionality flag for bz2
+/// compressed Resources, carried as the third element of a 0.5.0+ announce.
+pub const SF_COMPRESSION: i64 = 0x00;
+
+/// LXMF/LXMF.py `compression_support_from_app_data()`: `None` for no
+/// app_data; `true` for the original (non-msgpack) format or a list with
+/// fewer than three elements or a non-list third element; otherwise whether
+/// `SF_COMPRESSION` is in the third element. A sender compresses a Resource
+/// only when this is not `Some(false)`.
+pub fn compression_support_from_app_data(app_data: Option<&[u8]>) -> Option<bool> {
+	let data = app_data?;
+	if data.is_empty() {
+		return None;
+	}
+	if is_msgpack_list(data) {
+		if let Some(Value::Array(items)) = decode_msgpack_value(data) {
+			return Some(match items.get(2) {
+				Some(Value::Array(flags)) => flags.iter().any(|f| value_to_i64(f) == Some(SF_COMPRESSION)),
+				_ => true,
+			});
+		}
+		Some(true)
+	} else {
+		Some(true)
+	}
+}
+
+/// Whether a Resource to `destination_hash` may be compressed: the peer's
+/// last announce decides (LXMF/LXMessage.py determine_compression_support();
+/// no announce means compression is assumed).
+pub fn peer_accepts_compression(destination_hash: &[u8]) -> bool {
+	let app_data = reticulum_rust::identity::Identity::recall_app_data(destination_hash);
+	compression_support_from_app_data(app_data.as_deref()).unwrap_or(true)
+}
+
 pub fn stamp_cost_from_app_data(app_data: Option<&[u8]>) -> Option<i64> {
 	let data = app_data?;
 	if data.is_empty() {
@@ -243,5 +278,29 @@ fn value_key_matches(value: &Value, target: u8) -> bool {
 	match value {
 		Value::Integer(int) => int.as_u64().map(|v| v == target as u64).unwrap_or(false),
 		_ => false,
+	}
+}
+
+#[cfg(test)]
+mod compression_support_tests {
+	use super::compression_support_from_app_data;
+	use rmpv::Value;
+
+	fn pack(v: Value) -> Vec<u8> {
+		let mut buf = Vec::new();
+		rmpv::encode::write_value(&mut buf, &v).unwrap();
+		buf
+	}
+
+	/// LXMF/LXMF.py compression_support_from_app_data(), case by case.
+	#[test]
+	fn matches_the_reference() {
+		assert_eq!(compression_support_from_app_data(None), None);
+		assert_eq!(compression_support_from_app_data(Some(b"")), None);
+		assert_eq!(compression_support_from_app_data(Some(b"Alice")), Some(true), "original format");
+		assert_eq!(compression_support_from_app_data(Some(&pack(Value::Array(vec![Value::Nil, Value::Nil])))), Some(true), "fewer than three elements");
+		assert_eq!(compression_support_from_app_data(Some(&pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Integer(7.into())])))), Some(true), "third element not a list");
+		assert_eq!(compression_support_from_app_data(Some(&pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Array(vec![])])))), Some(false), "empty list: no SF_COMPRESSION");
+		assert_eq!(compression_support_from_app_data(Some(&pack(Value::Array(vec![Value::Nil, Value::Integer(8.into()), Value::Array(vec![Value::Integer(0.into())])])))), Some(true), "SF_COMPRESSION present");
 	}
 }

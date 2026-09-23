@@ -1446,9 +1446,10 @@ impl LXMRouter {
 									let msg_prop = message.clone();
 									let msg_fail = message.clone();
 									let wake_tx_prop = self.outbound_wake_tx.clone();
-									AppLinks::send(
+									AppLinks::send_with_compression(
 										&dest_hash,
 										packed,
+										crate::lxmf::peer_accepts_compression(&dest_hash),
 										Arc::new(move || {
 											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 											mark_delivered_shared(&msg_del);

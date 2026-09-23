@@ -1340,7 +1340,15 @@ impl LXMessage {
 			link.clone(),
 			None,
 			false,
-			reticulum_rust::resource::AutoCompressOption::Enabled,
+			// LXMF/LXMessage.py: auto_compress comes from the peer's announce
+			// (determine_compression_support), so a peer that cannot
+			// decompress (the web client announces an empty functionality
+			// list) is sent the Resource uncompressed.
+			if crate::lxmf::peer_accepts_compression(&self.destination_hash) {
+				reticulum_rust::resource::AutoCompressOption::Enabled
+			} else {
+				reticulum_rust::resource::AutoCompressOption::Disabled
+			},
 			callback,
 			progress_callback,
 			None,
