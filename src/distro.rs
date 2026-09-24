@@ -14,7 +14,8 @@
 //! platform layer, mirroring how `RfedChannelClient` already works.
 //!
 //! Payload shapes are pinned by `rfed`'s `verify_signed_payload` and
-//! `parse_distro_announce_payload`; see RFed SPEC §17.5 and §17.9.
+//! `parse_distro_announce_payload`; see RFed SPEC §17.5 and §17.9. The
+//! sent-message sync marker read by `unwrap_blob` is RFed SPEC §17.11.
 
 use std::io::Cursor;
 
@@ -23,7 +24,7 @@ use rmpv::encode::write_value;
 use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType, Direction};
-use reticulum_rust::identity::Identity;
+use reticulum_rust::identity::{full_hash, Identity};
 
 /// Size of an LXMF signature and of an identity public key half, in bytes.
 const PUBKEY_LEN: usize = 64;
@@ -55,6 +56,19 @@ pub struct DistroMessage {
     /// §17.9): FIELD_CUSTOM_DATA of a message whose FIELD_CUSTOM_TYPE is
     /// `DISTRO_TRANSFER_TYPE`. Present only on an identity-transfer message.
     pub distro_transfer_key: Option<String>,
+    /// RFed SPEC §17.11 sent-message sync: the recipient R of the message a
+    /// sibling device sent as the distro — FIELD_CUSTOM_DATA of a message whose
+    /// FIELD_CUSTOM_TYPE is `DISTRO_SENT_TYPE`, lowercased. `None` unless the
+    /// value is exactly 32 hex characters, so a client never files a copy into
+    /// a conversation with a malformed address.
+    pub sent_to: Option<String>,
+    /// RFed SPEC §17.11: FIELD_CUSTOM_META of the same copy, lowercased — the
+    /// sending device's own `lxmf.delivery` address, which lets the sender
+    /// recognise and drop its own echo. `Some` whenever the custom type is
+    /// `DISTRO_SENT_TYPE` (empty when 0xFD is absent), so `sent_by.is_some()`
+    /// is how a client tells "sync copy with a bad 0xFC — drop and log" apart
+    /// from an ordinary message, whose `sent_to` is also `None`.
+    pub sent_by: Option<String>,
 }
 
 const FIELD_TICKET: u64 = 0x0C;
@@ -64,8 +78,16 @@ const FIELD_TICKET: u64 = 0x0C;
 /// FIELD_EVENT.
 pub const FIELD_CUSTOM_TYPE: u64 = 0xFB;
 pub const FIELD_CUSTOM_DATA: u64 = 0xFC;
+/// LXMF/LXMF.py FIELD_CUSTOM_META: upstream's metadata slot beside the pair
+/// above. The sent-message sync copy (RFed SPEC §17.11) carries the sending
+/// device's address here.
+pub const FIELD_CUSTOM_META: u64 = 0xFD;
 /// The FIELD_CUSTOM_TYPE value of a distro identity transfer (RFed SPEC §17.9).
 pub const DISTRO_TRANSFER_TYPE: &str = "rfed.distro.transfer";
+/// The FIELD_CUSTOM_TYPE value of a sent-message sync copy (RFed SPEC §17.11):
+/// a device that sent a message as the distro copies it to the distro itself
+/// so every sibling device shows it as sent.
+pub const DISTRO_SENT_TYPE: &str = "rfed.distro.sent";
 
 fn encode(value: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -206,6 +228,8 @@ pub fn announce_payload(distro: &Identity, app_data: Option<&[u8]>) -> Result<Ve
 ///
 /// Returns `Ok(None)` when the blob is addressed to a different distro — a node
 /// may legitimately hand over blobs for an address this device does not hold.
+/// Returns `Err` for a §17.11 sent-copy that claims the distro as its source
+/// but is not signed by the distro key.
 pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMessage>, String> {
     if blob.len() < DEST_HASH_LEN + LXMF_HEADER_LEN {
         return Err(format!("blob too short: {} bytes", blob.len()));
@@ -237,16 +261,31 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
     let title = value_to_string(&arr[1]);
     let content = value_to_string(&arr[2]);
 
-    let (ticket, distro_transfer_key) = match arr.get(3) {
+    let (ticket, distro_transfer_key, (sent_to, sent_by)) = match arr.get(3) {
         Some(Value::Map(entries)) => {
             let ticket = entries
                 .iter()
                 .find(|(k, _)| k.as_u64() == Some(FIELD_TICKET))
                 .map(|(_, v)| value_to_string(v));
-            (ticket, transfer_key_from_fields(entries))
+            (ticket, transfer_key_from_fields(entries), sent_marker_from_fields(entries))
         }
-        _ => (None, None),
+        _ => (None, None, (None, None)),
     };
+
+    // RFed SPEC §17.11 point 4: a sync copy is filed as the user's OWN sent
+    // message, so "source = D" must be proven by D's signature, not taken
+    // from the plaintext — D's public key is announced, so anyone can encrypt
+    // a message to D that claims source D. Rejecting it here, once, covers
+    // both native clients (Android classifySentCopy and iOS
+    // sentCopyDisposition only compare the claimed source); Retichat-js
+    // _handleDistroBlob makes the same check and drops the copy. A marker
+    // from any other source is left to the clients' "not our distro" rule.
+    if sent_by.is_some() && source_hash[..] == expected[..] {
+        let signature = &plaintext[DEST_HASH_LEN..LXMF_HEADER_LEN];
+        if !lxmf_signature_valid(distro, &expected, &source_hash, payload, &arr, signature) {
+            return Err("§17.11 sent-copy claims the distro as source but fails the distro signature — dropped".into());
+        }
+    }
 
     let is_delivery_notification = ticket.is_some() && content.is_empty();
 
@@ -258,6 +297,8 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         is_delivery_notification,
         ticket,
         distro_transfer_key,
+        sent_to,
+        sent_by,
     }))
 }
 
@@ -276,6 +317,64 @@ fn transfer_key_from_fields(entries: &[(Value, Value)]) -> Option<String> {
         }
     }
     if custom_type.as_deref() == Some(DISTRO_TRANSFER_TYPE) { custom_data } else { None }
+}
+
+/// RFed SPEC §17.11: `(sent_to, sent_by)` of a sent-message sync copy, read
+/// from the custom triple only when FIELD_CUSTOM_TYPE is `DISTRO_SENT_TYPE`.
+/// `sent_to` (0xFC) must be exactly 32 hex characters after lowercasing or it
+/// is `None`; `sent_by` (0xFD) is lowercased and is `Some` whenever the type
+/// matches, so the marker's presence survives a malformed 0xFC and the client
+/// can drop the copy with a log line instead of showing it as an ordinary
+/// message from the distro.
+fn sent_marker_from_fields(entries: &[(Value, Value)]) -> (Option<String>, Option<String>) {
+    let mut custom_type = None;
+    let mut custom_data = None;
+    let mut custom_meta = None;
+    for (k, v) in entries {
+        match k.as_u64() {
+            Some(FIELD_CUSTOM_TYPE) => custom_type = Some(value_to_string(v)),
+            Some(FIELD_CUSTOM_DATA) => custom_data = Some(value_to_string(v)),
+            Some(FIELD_CUSTOM_META) => custom_meta = Some(value_to_string(v)),
+            _ => {}
+        }
+    }
+    if custom_type.as_deref() != Some(DISTRO_SENT_TYPE) {
+        return (None, None);
+    }
+    let sent_to = custom_data
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s.len() == DEST_HASH_LEN * 2 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    let sent_by = Some(custom_meta.unwrap_or_default().to_ascii_lowercase());
+    (sent_to, sent_by)
+}
+
+/// LXMF's signature check, as LXMF/LXMF.py `LXMessage.unpack_from_bytes`
+/// does it: the signed part is `dest || src || packed_payload ||
+/// full_hash(dest || src || packed_payload)`, where a payload carrying a stamp
+/// (a 5th element) is re-packed without it and any other payload is hashed
+/// as received.
+fn lxmf_signature_valid(
+    signer: &Identity,
+    dest: &[u8],
+    src: &[u8],
+    packed_payload: &[u8],
+    items: &[Value],
+    signature: &[u8],
+) -> bool {
+    let restamped;
+    let packed = if items.len() > 4 {
+        restamped = encode(&Value::Array(items[..4].to_vec()));
+        &restamped[..]
+    } else {
+        packed_payload
+    };
+    let mut hashed_part = Vec::with_capacity(dest.len() + src.len() + packed.len());
+    hashed_part.extend_from_slice(dest);
+    hashed_part.extend_from_slice(src);
+    hashed_part.extend_from_slice(packed);
+    let mut signed_part = hashed_part.clone();
+    signed_part.extend_from_slice(&full_hash(&hashed_part));
+    signer.validate(signature, &signed_part)
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -335,6 +434,55 @@ mod tests {
         assert_eq!(transfer_key_from_fields(&fields), None);
         let legacy = vec![(Value::Integer(0x0D.into()), Value::String(key_hex.clone().into()))];
         assert_eq!(transfer_key_from_fields(&legacy), None);
+    }
+
+    /// RFed SPEC §17.11: a sync copy is FIELD_CUSTOM_TYPE == DISTRO_SENT_TYPE
+    /// with R in FIELD_CUSTOM_DATA and the sending device in FIELD_CUSTOM_META.
+    #[test]
+    fn sent_marker_with_valid_recipient_and_sender() {
+        let fields = vec![
+            (Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_SENT_TYPE.into())),
+            (Value::Integer(FIELD_CUSTOM_DATA.into()), Value::String("AB".repeat(16).into())),
+            (Value::Integer(FIELD_CUSTOM_META.into()), Value::String("CD".repeat(16).into())),
+        ];
+        let (to, by) = sent_marker_from_fields(&fields);
+        assert_eq!(to.as_deref(), Some("ab".repeat(16).as_str()), "lowercased");
+        assert_eq!(by.as_deref(), Some("cd".repeat(16).as_str()), "lowercased");
+        assert_eq!(transfer_key_from_fields(&fields), None, "a sync copy is not a transfer");
+    }
+
+    /// RFed SPEC §17.11: a malformed 0xFC yields no recipient, but sent_by
+    /// stays Some so the client still sees the marker and drops the copy.
+    #[test]
+    fn sent_marker_with_bad_recipient_has_no_sent_to() {
+        for bad in ["ab".repeat(15), "ab".repeat(17), "zz".repeat(16), String::new()] {
+            let fields = vec![
+                (Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_SENT_TYPE.into())),
+                (Value::Integer(FIELD_CUSTOM_DATA.into()), Value::String(bad.clone().into())),
+                (Value::Integer(FIELD_CUSTOM_META.into()), Value::String("cd".repeat(16).into())),
+            ];
+            let (to, by) = sent_marker_from_fields(&fields);
+            assert_eq!(to, None, "0xFC {bad:?} must be rejected");
+            assert_eq!(by.as_deref(), Some("cd".repeat(16).as_str()));
+        }
+        let no_data = vec![(Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_SENT_TYPE.into()))];
+        assert_eq!(sent_marker_from_fields(&no_data), (None, Some(String::new())));
+    }
+
+    /// RFed SPEC §17.9 / §17.11: a transfer's 0xFC is a key, never a recipient.
+    #[test]
+    fn transfer_type_does_not_set_sent_to() {
+        let fields = vec![
+            (Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_TRANSFER_TYPE.into())),
+            (Value::Integer(FIELD_CUSTOM_DATA.into()), Value::String("ab".repeat(16).into())),
+            (Value::Integer(FIELD_CUSTOM_META.into()), Value::String("cd".repeat(16).into())),
+        ];
+        assert_eq!(sent_marker_from_fields(&fields), (None, None));
+    }
+
+    #[test]
+    fn no_fields_means_no_sent_marker() {
+        assert_eq!(sent_marker_from_fields(&[]), (None, None));
     }
 
     /// Mirrors rfed's verify_signed_payload: decode the triple, check the
@@ -429,6 +577,85 @@ mod tests {
             Destination::hash(Some(&distro.hash.clone().unwrap()), "lxmf", &["delivery"]),
             "senders address this hash; the identity hash routes nowhere",
         );
+    }
+
+    /// A propagated LXMF blob to `distro`, as a sender builds it: `dest ||
+    /// encrypt(src || sig || payload)`, signed by `signer` over LXMF's signed
+    /// part. `stamp` adds a 5th payload element, which LXMF excludes from the
+    /// signature.
+    fn lxmf_blob(distro: &Identity, src: &[u8], signer: &Identity, fields: Vec<(Value, Value)>, stamp: bool) -> Vec<u8> {
+        let dest = delivery_hash(distro).unwrap();
+        let mut items = vec![
+            Value::F64(1_790_000_000.5),
+            Value::Binary(Vec::new()),
+            Value::Binary(b"hello R".to_vec()),
+            Value::Map(fields),
+        ];
+        let mut hashed_part = [dest.clone(), src.to_vec(), encode(&Value::Array(items.clone()))].concat();
+        let hash = full_hash(&hashed_part);
+        hashed_part.extend_from_slice(&hash);
+        let sig = signer.sign(&hashed_part);
+        if stamp {
+            items.push(Value::Binary(vec![7u8; 32]));
+        }
+        let plaintext = [src.to_vec(), sig, encode(&Value::Array(items))].concat();
+        [dest, distro.encrypt(&plaintext).unwrap()].concat()
+    }
+
+    fn sent_copy_fields() -> Vec<(Value, Value)> {
+        vec![
+            (Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_SENT_TYPE.into())),
+            (Value::Integer(FIELD_CUSTOM_DATA.into()), Value::String("ab".repeat(16).into())),
+            (Value::Integer(FIELD_CUSTOM_META.into()), Value::String("cd".repeat(16).into())),
+        ]
+    }
+
+    /// RFed SPEC §17.11: a copy signed by the distro key unwraps with its
+    /// marker, stamped or not.
+    #[test]
+    fn a_distro_signed_sent_copy_is_accepted() {
+        let mut distro = identity();
+        let d = delivery_hash(&distro).unwrap();
+        for stamp in [false, true] {
+            let blob = lxmf_blob(&distro, &d, &distro, sent_copy_fields(), stamp);
+            let msg = unwrap_blob(&mut distro, &blob).expect("genuine copy").expect("addressed to us");
+            assert_eq!(msg.source_hash, d);
+            assert_eq!(msg.sent_to.as_deref(), Some("ab".repeat(16).as_str()));
+            assert_eq!(msg.sent_by.as_deref(), Some("cd".repeat(16).as_str()));
+            assert_eq!(msg.content, "hello R");
+        }
+    }
+
+    /// RFed SPEC §17.11 point 4: anyone can encrypt to D's announced key and
+    /// claim source D; without D's signature the copy must not reach a
+    /// client that would file it as the user's own sent message.
+    #[test]
+    fn a_sent_copy_claiming_the_distro_without_its_signature_is_rejected() {
+        let mut distro = identity();
+        let d = delivery_hash(&distro).unwrap();
+        let forger = identity();
+        let blob = lxmf_blob(&distro, &d, &forger, sent_copy_fields(), false);
+        let err = unwrap_blob(&mut distro, &blob).expect_err("forged copy must be rejected");
+        assert!(err.contains("signature"), "{err}");
+    }
+
+    /// Only the marker triggers the check (a D-sourced message without it
+    /// keeps today's behaviour), and a marker from another source is left to
+    /// the clients' "not our distro" rule, which needs sent_by to see it.
+    #[test]
+    fn the_signature_check_applies_only_to_sent_copies_claiming_the_distro() {
+        let mut distro = identity();
+        let d = delivery_hash(&distro).unwrap();
+        let other = identity();
+        let plain = lxmf_blob(&distro, &d, &other, Vec::new(), false);
+        let msg = unwrap_blob(&mut distro, &plain).unwrap().unwrap();
+        assert_eq!((msg.sent_to, msg.sent_by), (None, None));
+
+        let o = delivery_hash(&other).unwrap();
+        let foreign = lxmf_blob(&distro, &o, &other, sent_copy_fields(), false);
+        let msg = unwrap_blob(&mut distro, &foreign).unwrap().unwrap();
+        assert_eq!(msg.source_hash, o);
+        assert!(msg.sent_by.is_some(), "the client must still see the marker to ignore it");
     }
 
     #[test]
