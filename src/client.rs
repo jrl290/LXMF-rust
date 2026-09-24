@@ -382,6 +382,9 @@ impl LxmfClient {
     /// Shut down: destroy router, then delegate identity + transport to ReticulumClient.
     pub fn shutdown(&self) -> Result<(), String> {
         lxmf::router_destroy(self.router_handle)?;
+        // The app-link registry outlives the Reticulum instance; drop it so a
+        // client started later in this process inherits no dead links.
+        app_links::AppLinks::close_all();
         self.rns.shutdown()
     }
 }

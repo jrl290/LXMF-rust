@@ -25,7 +25,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, prettyhexrep, prettytime, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 
 use crate::handlers::{delivery_announce_handler, propagation_announce_handler};
-use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared};
+use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared, mark_propagated_shared, propagation_packet_timed_out_shared};
 use crate::lx_stamper;
 use crate::lxmf::{pn_announce_data_is_valid, APP_NAME, FIELD_TICKET};
 use crate::lxm_peer::LXMPeer;
@@ -1633,20 +1633,54 @@ impl LXMRouter {
 								let node_hash = self.outbound_propagation_node.clone().unwrap();
 								let active_link = AppLinks::get_handle(&node_hash)
 									.filter(|handle| handle.status() == reticulum_rust::link::STATE_ACTIVE);
-								if let Some(link_arc) = active_link {
+								if active_link.is_some() {
 									if lxm.state != LXMessage::SENDING {
-										// PROTOCOL: Send propagation_packed over the link using link.send_packet().
+										// PROTOCOL: send propagation_packed over the persistent
+										// propagation link, exactly as LXMF/LXMessage.py `send`
+										// does for PROPAGATED: state SENDING now, SENT only when
+										// the node proves the packet (`__mark_propagated`), back
+										// to OUTBOUND with the link torn down when the receipt
+										// times out (`__link_packet_timed_out`). Until 2026-09-24
+										// this set SENT the moment the packet was queued; a link
+										// whose interface was gone reported three messages sent
+										// that never left the phone.
 										// propagation_packed = msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | pn_stamp?]]])
-										// This matches Python: link.send_packet(lxm.propagation_packed); lxm.state = SENT.
 										let propagation_packed = lxm.propagation_packed.clone();
 										if let Some(pdata) = propagation_packed {
-											match link_arc.send_packet(&pdata).map_err(|e| e.to_string()) {
+											let msg_ok = message.clone();
+											let msg_fail = message.clone();
+											let node_fail = node_hash.clone();
+											let wake_ok = self.outbound_wake_tx.clone();
+											let wake_fail = self.outbound_wake_tx.clone();
+											let label_ok = message_label.to_string();
+											let label_fail = message_label.to_string();
+											let queued = AppLinks::send_on_held_link(
+												&node_hash,
+												pdata,
+												true,
+												Arc::new(move || {
+													mark_propagated_shared(&msg_ok);
+													log(&format!("[POB][{}] PROPAGATED proved by propagation node → SENT", label_ok), LOG_NOTICE, false, false);
+													let _ = wake_ok.send(());
+												}),
+												Arc::new(move || {
+													propagation_packet_timed_out_shared(&msg_fail);
+													let torn_down = AppLinks::teardown_held_link(&node_fail);
+													log(
+														&format!("[POB][{}] PROPAGATED not proved (receipt timed out or Resource failed) → OUTBOUND, propagation link torn down={}", label_fail, torn_down),
+														LOG_NOTICE, false, false,
+													);
+													let _ = wake_fail.send(());
+												}),
+											);
+											match queued {
 												Ok(()) => {
-													log(&format!("[POB][{}] PROPAGATED sent via persistent app-link → SENT", message_label), LOG_NOTICE, false, false);
-													lxm.state = LXMessage::SENT;
+													log(&format!("[POB][{}] PROPAGATED queued on persistent app-link, awaiting proof", message_label), LOG_NOTICE, false, false);
+													lxm.state = LXMessage::SENDING;
+													lxm.progress = 0.50;
 												}
 												Err(e) => {
-													log(&format!("[POB][{}] PROPAGATED send_packet failed: {}", message_label, e), LOG_NOTICE, false, false);
+													log(&format!("[POB][{}] PROPAGATED send failed: {}", message_label, e), LOG_NOTICE, false, false);
 													lxm.state = LXMessage::OUTBOUND;
 													lxm.delivery_attempts += 1;
 													lxm.next_delivery_attempt = Some(now() + Self::DELIVERY_RETRY_WAIT);
@@ -5421,6 +5455,18 @@ mod tests {
 		assert!(
 			prop_fragment.contains("AppLinks::open_persistent(&node_hash, APP_NAME, &[\"propagation\"])"),
 			"PROPAGATED branch must reopen the shared persistent propagation app-link when no active handle exists"
+		);
+			assert!(
+			prop_fragment.contains("AppLinks::send_on_held_link("),
+			"PROPAGATED branch must send through the receipt-bearing held-link send"
+		);
+		assert!(
+			prop_fragment.contains("mark_propagated_shared(") && prop_fragment.contains("propagation_packet_timed_out_shared("),
+			"SENT must come from the node's proof and a timeout must return the message to OUTBOUND (LXMF/LXMessage.py PROPAGATED)"
+		);
+		assert!(
+			!prop_fragment.contains("PROPAGATED sent via persistent app-link → SENT"),
+			"a queued packet is not a sent message"
 		);
 	}
 

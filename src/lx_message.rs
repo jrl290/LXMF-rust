@@ -1464,6 +1464,20 @@ impl LXMessage {
 		}
 	}
 
+	/// LXMF/LXMessage.py `__link_packet_timed_out` for a PROPAGATED message.
+	/// The reference tears the propagation link down and returns the message
+	/// to OUTBOUND; the router then counts the attempt when it re-sends.
+	/// SENT is never reverted: it now means the node proved receipt.
+	fn propagation_packet_timed_out(&mut self) {
+		let msg_hash = self.hash.as_ref().map(|h| hexrep(h, false)).unwrap_or_default();
+		log(&format!("propagation_packet_timed_out msg={} state={}", msg_hash, self.state), LOG_NOTICE, false, false);
+		if self.state != Self::CANCELLED && !Self::is_success_state(self.state) {
+			self.delivery_attempts += 1;
+			self.state = Self::OUTBOUND;
+			self.progress = 0.0;
+		}
+	}
+
 	fn update_transfer_progress(&mut self, resource: &mut Resource) {
 		let progress = resource.get_progress();
 		self.progress = 0.10 + (progress * 0.90);
@@ -1543,9 +1557,18 @@ pub(crate) fn mark_delivered_shared(handle: &Arc<Mutex<LXMessage>>) {
 	}
 }
 
-fn mark_propagated_shared(handle: &Arc<Mutex<LXMessage>>) {
+pub(crate) fn mark_propagated_shared(handle: &Arc<Mutex<LXMessage>>) {
 	if let Ok(mut message) = handle.lock() {
 		message.mark_propagated();
+	}
+}
+
+/// The propagation node did not prove the link packet (or the Resource
+/// failed) — LXMF/LXMessage.py `__link_packet_timed_out` for a PROPAGATED
+/// message: back to OUTBOUND so the router re-sends on a fresh link.
+pub(crate) fn propagation_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
+	if let Ok(mut message) = handle.lock() {
+		message.propagation_packet_timed_out();
 	}
 }
 

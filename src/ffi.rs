@@ -452,6 +452,15 @@ pub fn message_send_via_app_links(msg_handle: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Shut the whole stack down: every app-link registration and held link is
+/// dropped, then Reticulum itself (`reticulum_rust::ffi::shutdown`). Both
+/// registries are process-global; a host that restarts the stack in one
+/// process must call this rather than the Reticulum shutdown alone.
+pub fn shutdown() -> Result<(), String> {
+    app_links::AppLinks::close_all();
+    reticulum_rust::ffi::shutdown()
+}
+
 /// Forget the cached liveness winner for `dest_hash` so the next
 /// [`message_send_via_app_links`] re-races interfaces.
 ///
