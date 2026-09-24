@@ -51,13 +51,21 @@ pub struct DistroMessage {
     pub is_delivery_notification: bool,
     /// FIELD_TICKET (0x0C), when present.
     pub ticket: Option<String>,
-    /// FIELD_DISTRO_ID (0x0D): a distro private key being transferred to this
-    /// device. Present only on an identity-transfer message.
+    /// A distro private key being transferred to this device (RFed SPEC
+    /// §17.9): FIELD_CUSTOM_DATA of a message whose FIELD_CUSTOM_TYPE is
+    /// `DISTRO_TRANSFER_TYPE`. Present only on an identity-transfer message.
     pub distro_transfer_key: Option<String>,
 }
 
 const FIELD_TICKET: u64 = 0x0C;
-const FIELD_DISTRO_ID: u64 = 0x0D;
+/// LXMF/LXMF.py FIELD_CUSTOM_TYPE / FIELD_CUSTOM_DATA: upstream's pair for
+/// application payloads — a format identifier and the payload. Until
+/// 2026-09-24 the transfer used field 0x0D, which LXMF 1.1.1 defines as
+/// FIELD_EVENT.
+pub const FIELD_CUSTOM_TYPE: u64 = 0xFB;
+pub const FIELD_CUSTOM_DATA: u64 = 0xFC;
+/// The FIELD_CUSTOM_TYPE value of a distro identity transfer (RFed SPEC §17.9).
+pub const DISTRO_TRANSFER_TYPE: &str = "rfed.distro.transfer";
 
 fn encode(value: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -109,6 +117,42 @@ pub fn list_payload(distro: &Identity) -> Result<Vec<u8>, String> {
 
 /// Payload for `/rfed/distro/announce`.
 ///
+/// The app_data of a distro address's announce (RFed SPEC §17.10): the LXMF
+/// 0.5.0+ list `[display_name, stamp_cost, supported_functionality]` with
+/// `SF_RFED_DISTRO` in the functionality list, which is how every sender
+/// learns, once and from the announce it needs anyway, that no device answers
+/// a direct link to this address. With no caller data this is
+/// `[nil, nil, [SF_RFED_DISTRO]]`: no name (names travel inside encrypted
+/// messages), no stamp cost, no compression claim. Caller data in the list
+/// format keeps its name and cost and gains the flag; anything else is
+/// replaced, since a raw-format announce cannot carry it.
+pub fn distro_announce_app_data(app_data: Option<&[u8]>) -> Vec<u8> {
+    let flag = Value::Integer(crate::lxmf::SF_RFED_DISTRO.into());
+    let mut items: Vec<Value> = match app_data.filter(|d| !d.is_empty()) {
+        Some(data) => match read_value(&mut Cursor::new(data)) {
+            Ok(Value::Array(items)) => items,
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    while items.len() < 3 {
+        items.push(Value::Nil);
+    }
+    let flags = match items.get(2) {
+        Some(Value::Array(existing)) => {
+            let mut flags = existing.clone();
+            if !flags.iter().any(|f| f.as_i64() == Some(crate::lxmf::SF_RFED_DISTRO)) {
+                flags.push(flag);
+            }
+            flags
+        }
+        _ => vec![flag],
+    };
+    items[2] = Value::Array(flags);
+    items.truncate(3);
+    encode(&Value::Array(items))
+}
+
 /// `msgpack [ bin value, bin(64) distro_pubkey, bin(64) sig(value) ]`
 /// where `value = flags(1) || announce_data` and bit 0 of `flags` signals a
 /// ratchet.
@@ -122,6 +166,7 @@ pub fn list_payload(distro: &Identity) -> Result<Vec<u8>, String> {
 /// this device claim inbound delivery for the distro address, which is exactly
 /// what must not happen — delivery arrives fanned out on `rfed.delivery`.
 pub fn announce_payload(distro: &Identity, app_data: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let app_data = distro_announce_app_data(app_data);
     let mut destination = Destination::new_outbound(
         Some(distro.clone()),
         DestinationType::Single,
@@ -134,7 +179,7 @@ pub fn announce_payload(distro: &Identity, app_data: Option<&[u8]>) -> Result<Ve
     destination.direction = Direction::IN;
 
     let packet = destination
-        .announce(app_data, false, None, None, false)?
+        .announce(Some(&app_data), false, None, None, false)?
         .ok_or("announce did not produce a packet")?;
     let announce_data = packet.data.clone();
 
@@ -194,16 +239,11 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
 
     let (ticket, distro_transfer_key) = match arr.get(3) {
         Some(Value::Map(entries)) => {
-            let mut ticket = None;
-            let mut transfer = None;
-            for (k, v) in entries {
-                match k.as_u64() {
-                    Some(FIELD_TICKET) => ticket = Some(value_to_string(v)),
-                    Some(FIELD_DISTRO_ID) => transfer = Some(value_to_string(v)),
-                    _ => {}
-                }
-            }
-            (ticket, transfer)
+            let ticket = entries
+                .iter()
+                .find(|(k, _)| k.as_u64() == Some(FIELD_TICKET))
+                .map(|(_, v)| value_to_string(v));
+            (ticket, transfer_key_from_fields(entries))
         }
         _ => (None, None),
     };
@@ -221,6 +261,23 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
     }))
 }
 
+/// RFed SPEC §17.9: the transferred distro key, when the message's
+/// FIELD_CUSTOM_TYPE is `DISTRO_TRANSFER_TYPE`; the key travels in
+/// FIELD_CUSTOM_DATA. Any other custom type, or the pre-2026-09-24 field
+/// 0x0D, is not a transfer.
+fn transfer_key_from_fields(entries: &[(Value, Value)]) -> Option<String> {
+    let mut custom_type = None;
+    let mut custom_data = None;
+    for (k, v) in entries {
+        match k.as_u64() {
+            Some(FIELD_CUSTOM_TYPE) => custom_type = Some(value_to_string(v)),
+            Some(FIELD_CUSTOM_DATA) => custom_data = Some(value_to_string(v)),
+            _ => {}
+        }
+    }
+    if custom_type.as_deref() == Some(DISTRO_TRANSFER_TYPE) { custom_data } else { None }
+}
+
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Binary(b) => String::from_utf8_lossy(b).into_owned(),
@@ -236,6 +293,48 @@ mod tests {
 
     fn identity() -> Identity {
         Identity::new(true)
+    }
+
+    /// RFed SPEC §17.10: the pre-signed announce always carries the distro
+    /// flag, whatever the caller supplied.
+    #[test]
+    fn announce_app_data_always_carries_the_distro_flag() {
+        use crate::lxmf::{distro_from_app_data, compression_support_from_app_data, display_name_from_app_data, SF_COMPRESSION};
+        let bare = distro_announce_app_data(None);
+        assert!(distro_from_app_data(Some(&bare)));
+        assert_eq!(compression_support_from_app_data(Some(&bare)), Some(false), "no compression claim");
+        assert_eq!(display_name_from_app_data(Some(&bare)), None);
+
+        let named = encode(&Value::Array(vec![
+            Value::Binary(b"Alice".to_vec()),
+            Value::Integer(8.into()),
+            Value::Array(vec![Value::Integer(SF_COMPRESSION.into())]),
+        ]));
+        let merged = distro_announce_app_data(Some(&named));
+        assert!(distro_from_app_data(Some(&merged)));
+        assert_eq!(compression_support_from_app_data(Some(&merged)), Some(true), "existing flags kept");
+        assert_eq!(display_name_from_app_data(Some(&merged)).as_deref(), Some("Alice"));
+        assert_eq!(distro_announce_app_data(Some(&merged)), merged, "adding the flag twice changes nothing");
+
+        let raw = distro_announce_app_data(Some(b"Alice"));
+        assert!(distro_from_app_data(Some(&raw)), "the raw format is replaced");
+    }
+
+    /// RFed SPEC §17.9: a transfer is FIELD_CUSTOM_TYPE == DISTRO_TRANSFER_TYPE
+    /// with the key in FIELD_CUSTOM_DATA; a custom message of another type
+    /// is not one, and field 0x0D is ignored.
+    #[test]
+    fn transfer_key_is_read_from_the_custom_pair_only() {
+        let key_hex = "ab".repeat(64);
+        let mut fields = vec![
+            (Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_TRANSFER_TYPE.into())),
+            (Value::Integer(FIELD_CUSTOM_DATA.into()), Value::String(key_hex.clone().into())),
+        ];
+        assert_eq!(transfer_key_from_fields(&fields).as_deref(), Some(key_hex.as_str()));
+        fields[0].1 = Value::String("something.else".into());
+        assert_eq!(transfer_key_from_fields(&fields), None);
+        let legacy = vec![(Value::Integer(0x0D.into()), Value::String(key_hex.clone().into()))];
+        assert_eq!(transfer_key_from_fields(&legacy), None);
     }
 
     /// Mirrors rfed's verify_signed_payload: decode the triple, check the

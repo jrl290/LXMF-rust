@@ -1838,6 +1838,23 @@ impl LXMRouter {
 			// the regression log entry above.
 			let _ = AppLinks::status; // keep symbol referenced for future use
 
+			// RFed SPEC §17.10: a distro address says so in its announce
+			// (SF_RFED_DISTRO). No device answers a direct link to it, so the
+			// message goes to the propagation node at once, as Retichat-js does
+			// for its isDistro contacts, instead of a direct attempt that can
+			// only time out. This is the announce the sender already needs to
+			// encrypt to the address; nothing is asked or waited for.
+			if lxm.desired_method != Some(LXMessage::PROPAGATED)
+				&& self.outbound_propagation_node.is_some()
+				&& crate::lxmf::peer_is_distro(&destination_hash)
+			{
+				log(
+					&format!("Destination {} is a distro address (announce) — sending PROPAGATED", prettyhexrep(&destination_hash)),
+					LOG_NOTICE, false, false,
+				);
+				lxm.desired_method = Some(LXMessage::PROPAGATED);
+			}
+
 			if lxm.stamp_cost.is_none() {
 				if let Some((_, stamp_cost)) = self.outbound_stamp_costs.get(&destination_hash) {
 					lxm.stamp_cost = Some(*stamp_cost);

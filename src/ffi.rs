@@ -461,6 +461,13 @@ pub fn shutdown() -> Result<(), String> {
     reticulum_rust::ffi::shutdown()
 }
 
+/// RFed SPEC §17.10: whether `dest_hash` announced itself as a distro
+/// address. Hosts use it to skip the direct attempt and send propagated at
+/// once; unknown destinations are not distros.
+pub fn peer_is_distro(dest_hash: &[u8]) -> bool {
+    crate::lxmf::peer_is_distro(dest_hash)
+}
+
 /// Forget the cached liveness winner for `dest_hash` so the next
 /// [`message_send_via_app_links`] re-races interfaces.
 ///

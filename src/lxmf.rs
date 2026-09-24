@@ -85,6 +85,43 @@ pub fn display_name_from_app_data(app_data: Option<&[u8]>) -> Option<String> {
 /// compressed Resources, carried as the third element of a 0.5.0+ announce.
 pub const SF_COMPRESSION: i64 = 0x00;
 
+/// RFed SPEC §17.10: the supported-functionality value a distro address puts
+/// in its pre-signed `lxmf.delivery` announce. No device answers a direct
+/// link to such an address; a sender that has seen this goes straight to the
+/// propagation node. The list has no custom range, so the value sits far
+/// above the ones upstream counts up from zero (0x00 so far) and outside the
+/// one-byte range it would fill first.
+pub const SF_RFED_DISTRO: i64 = 0xD0;
+
+/// RFed SPEC §17.10: whether `app_data` is a distro address's announce —
+/// a 0.5.0+ list whose third element is a list containing `SF_RFED_DISTRO`.
+/// Anything else (no app_data, the original raw format, a short list, a
+/// non-list third element) is not.
+pub fn distro_from_app_data(app_data: Option<&[u8]>) -> bool {
+	let data = match app_data {
+		Some(d) if !d.is_empty() => d,
+		_ => return false,
+	};
+	if !is_msgpack_list(data) {
+		return false;
+	}
+	match decode_msgpack_value(data) {
+		Some(Value::Array(items)) => match items.get(2) {
+			Some(Value::Array(flags)) => flags.iter().any(|f| value_to_i64(f) == Some(SF_RFED_DISTRO)),
+			_ => false,
+		},
+		_ => false,
+	}
+}
+
+/// Whether `destination_hash` is a distro address, from its last announce.
+/// Unknown destinations are not: a sender learns it once, from the announce
+/// it needs anyway to encrypt to the address.
+pub fn peer_is_distro(destination_hash: &[u8]) -> bool {
+	let app_data = reticulum_rust::identity::Identity::recall_app_data(destination_hash);
+	distro_from_app_data(app_data.as_deref())
+}
+
 /// LXMF/LXMF.py `compression_support_from_app_data()`: `None` for no
 /// app_data; `true` for the original (non-msgpack) format or a list with
 /// fewer than three elements or a non-list third element; otherwise whether
@@ -278,6 +315,41 @@ fn value_key_matches(value: &Value, target: u8) -> bool {
 	match value {
 		Value::Integer(int) => int.as_u64().map(|v| v == target as u64).unwrap_or(false),
 		_ => false,
+	}
+}
+
+#[cfg(test)]
+mod distro_flag_tests {
+	use super::{distro_from_app_data, SF_COMPRESSION, SF_RFED_DISTRO};
+	use rmpv::Value;
+
+	fn pack(v: Value) -> Vec<u8> {
+		let mut buf = Vec::new();
+		rmpv::encode::write_value(&mut buf, &v).unwrap();
+		buf
+	}
+
+	/// RFed SPEC §17.10: only the flag in the third element marks a distro.
+	#[test]
+	fn only_the_flag_marks_a_distro() {
+		let distro = pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Array(vec![Value::Integer(SF_RFED_DISTRO.into())])]));
+		assert!(distro_from_app_data(Some(&distro)));
+		let both = pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Array(vec![Value::Integer(SF_COMPRESSION.into()), Value::Integer(SF_RFED_DISTRO.into())])]));
+		assert!(distro_from_app_data(Some(&both)), "the flag may sit next to compression");
+		let plain = pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Array(vec![Value::Integer(SF_COMPRESSION.into())])]));
+		assert!(!distro_from_app_data(Some(&plain)));
+		let empty = pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Array(vec![])]));
+		assert!(!distro_from_app_data(Some(&empty)));
+		let short = pack(Value::Array(vec![Value::Nil, Value::Nil]));
+		assert!(!distro_from_app_data(Some(&short)));
+		let not_a_list = pack(Value::Array(vec![Value::Nil, Value::Nil, Value::Integer(SF_RFED_DISTRO.into())]));
+		assert!(!distro_from_app_data(Some(&not_a_list)));
+		assert!(!distro_from_app_data(Some(b"Alice")), "original raw format");
+		assert!(!distro_from_app_data(Some(b"")));
+		assert!(!distro_from_app_data(None));
+		// The reference reads compression from the same list and ignores the flag.
+		assert_eq!(super::compression_support_from_app_data(Some(&distro)), Some(false));
+		assert_eq!(super::compression_support_from_app_data(Some(&both)), Some(true));
 	}
 }
 
