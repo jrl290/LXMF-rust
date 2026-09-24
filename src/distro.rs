@@ -272,14 +272,15 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         _ => (None, None, (None, None)),
     };
 
-    // RFed SPEC §17.11 point 4: a sync copy is filed as the user's OWN sent
-    // message, so "source = D" must be proven by D's signature, not taken
-    // from the plaintext — D's public key is announced, so anyone can encrypt
-    // a message to D that claims source D. Rejecting it here, once, covers
-    // both native clients (Android classifySentCopy and iOS
+    // RFed SPEC §17.11 receive rule 2: a sync copy is filed as the user's
+    // OWN sent message, so "source = D" must be proven by D's signature, not
+    // taken from the plaintext — D's public key is announced, so anyone can
+    // encrypt a message to D that claims source D. Rejecting it here, once,
+    // covers both native clients (Android classifySentCopy and iOS
     // sentCopyDisposition only compare the claimed source); Retichat-js
     // _handleDistroBlob makes the same check and drops the copy. A marker
-    // from any other source is left to the clients' "not our distro" rule.
+    // from any other source is left to the clients' "not our distro" check,
+    // receive rule 1.
     if sent_by.is_some() && source_hash[..] == expected[..] {
         let signature = &plaintext[DEST_HASH_LEN..LXMF_HEADER_LEN];
         if !lxmf_signature_valid(distro, &expected, &source_hash, payload, &arr, signature) {
@@ -626,9 +627,9 @@ mod tests {
         }
     }
 
-    /// RFed SPEC §17.11 point 4: anyone can encrypt to D's announced key and
-    /// claim source D; without D's signature the copy must not reach a
-    /// client that would file it as the user's own sent message.
+    /// RFed SPEC §17.11 receive rule 2: anyone can encrypt to D's announced
+    /// key and claim source D; without D's signature the copy must not reach
+    /// a client that would file it as the user's own sent message.
     #[test]
     fn a_sent_copy_claiming_the_distro_without_its_signature_is_rejected() {
         let mut distro = identity();
@@ -641,7 +642,8 @@ mod tests {
 
     /// Only the marker triggers the check (a D-sourced message without it
     /// keeps today's behaviour), and a marker from another source is left to
-    /// the clients' "not our distro" rule, which needs sent_by to see it.
+    /// the clients' "not our distro" check (receive rule 1), which needs
+    /// sent_by to see it.
     #[test]
     fn the_signature_check_applies_only_to_sent_copies_claiming_the_distro() {
         let mut distro = identity();
