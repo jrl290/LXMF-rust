@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -1631,6 +1631,38 @@ pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
 	}
 }
 
+/// AppLinks Timer P: the direct send went 5 s without a proof (at once when
+/// the link was already DISCONNECTED). Flag the message and wake the router,
+/// whose next pass reports PROP_FALLBACK_REQUESTED so the app starts the
+/// propagated copy.
+///
+/// Waits for the message lock rather than skipping when it is busy: Timer P
+/// fires once, so a skipped request is never made again. The lock is busy
+/// often enough to matter — the router holds it for its whole pass over the
+/// message (a zero-delay Timer P fires while that pass is still in
+/// `send_with_compression`), and the FFI getters take it too. Waiting cannot
+/// deadlock: the Timer P thread (app-links `spawn_after`) holds no other lock
+/// when it calls in, and nothing that holds a message lock waits for that
+/// thread.
+/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+pub(crate) fn request_prop_fallback_shared(handle: &Arc<Mutex<LXMessage>>, wake: &mpsc::Sender<()>) {
+	match handle.lock() {
+		Ok(mut message) => message.needs_prop_fallback = true,
+		Err(poisoned) => {
+			// The router skips a poisoned message, so the request cannot
+			// reach the app; say so rather than lose it silently.
+			let hash = poisoned.get_ref().hash.clone().unwrap_or_default();
+			log(
+				&format!("Propagation fallback for {} dropped: message lock poisoned", hexrep(&hash, false)),
+				LOG_ERROR,
+				false,
+				false,
+			);
+		}
+	}
+	let _ = wake.send(());
+}
+
 fn resource_concluded_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mutex<Resource>>) {
 	eprintln!("[LXM-RC] resource_concluded_shared called");
 	let mut late = None;
@@ -1848,6 +1880,43 @@ mod tests {
 		handle.lock().unwrap().release_state_reporting(Some(state_callback));
 		mark_delivered_shared(&handle);
 		assert!(reports.lock().unwrap().is_empty());
+	}
+
+	/// Timer P fires once. When the message is locked at that instant — the
+	/// router's pass holds it, and a zero-delay Timer P fires inside that
+	/// pass — the request must wait for the lock, not be dropped, or the app
+	/// never hears PROP_FALLBACK_REQUESTED and the message never propagates.
+	#[test]
+	fn a_fallback_request_waits_for_a_held_message_lock() {
+		use std::time::Duration;
+
+		let (handle, _) = packed_direct_message(LXMessage::SENDING);
+		let (wake_tx, wake_rx) = mpsc::channel::<()>();
+		let (step_tx, step_rx) = mpsc::channel::<&str>();
+
+		let held = handle.lock().unwrap();
+		let requester = {
+			let handle = handle.clone();
+			std::thread::spawn(move || {
+				step_tx.send("requesting").unwrap();
+				request_prop_fallback_shared(&handle, &wake_tx);
+				step_tx.send("requested").unwrap();
+			})
+		};
+		assert_eq!(step_rx.recv_timeout(Duration::from_secs(5)), Ok("requesting"));
+		// A request that waits cannot finish while the lock is held; the
+		// bound only keeps one that skips the lock from passing unseen.
+		assert_eq!(
+			step_rx.recv_timeout(Duration::from_millis(200)),
+			Err(mpsc::RecvTimeoutError::Timeout),
+			"the request returned while the message lock was held — it was dropped"
+		);
+		drop(held);
+
+		assert_eq!(step_rx.recv_timeout(Duration::from_secs(5)), Ok("requested"));
+		requester.join().unwrap();
+		assert!(handle.lock().unwrap().needs_prop_fallback, "the request must reach the message");
+		assert_eq!(wake_rx.try_recv(), Ok(()), "the router must be woken to report the request");
 	}
 
 	#[test]

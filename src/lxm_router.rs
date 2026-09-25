@@ -25,7 +25,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, prettyhexrep, prettytime, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 
 use crate::handlers::{delivery_announce_handler, propagation_announce_handler};
-use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared, mark_propagated_shared, propagation_packet_timed_out_shared};
+use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared, mark_propagated_shared, propagation_packet_timed_out_shared, request_prop_fallback_shared};
 use crate::lx_stamper;
 use crate::lxmf::{pn_announce_data_is_valid, APP_NAME, FIELD_TICKET};
 use crate::lxm_peer::LXMPeer;
@@ -1458,11 +1458,10 @@ impl LXMRouter {
 											// Timer P: 5 s elapsed without delivery.
 											// Set the flag; wake POB to fire PROP_FALLBACK_REQUESTED
 											// immediately so the caller can start a parallel prop send.
+											// Waits for the message lock (this pass may still hold
+											// it) — request_prop_fallback_shared says why that is safe.
 											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-											if let Ok(mut lxm) = msg_prop.try_lock() {
-												lxm.needs_prop_fallback = true;
-											}
-											let _ = wake_tx_prop.send(());
+											request_prop_fallback_shared(&msg_prop, &wake_tx_prop);
 										}),
 										Arc::new(move || {
 											// on_failed: tier 3 exhausted all protocol timeouts.
@@ -5376,6 +5375,28 @@ mod tests {
 		assert!(
 			prop_pos < sending_guard_pos,
 			"needs_prop_fallback must be handled before the non-SENDING guard so Timer P can start propagation while the direct send is still SENDING"
+		);
+	}
+
+	/// REGRESSION GUARD: the Timer P callback must set the flag through
+	/// `request_prop_fallback_shared`, which waits for the message lock. An
+	/// inline `try_lock` dropped the request whenever this pass (or an FFI
+	/// getter) held the lock, and PROP_FALLBACK_REQUESTED never reached the
+	/// app. The wait itself is tested in lx_message.rs.
+	#[test]
+	fn timer_p_callback_requests_the_fallback_through_the_waiting_helper() {
+		let src = include_str!("lxm_router.rs");
+		let production = src
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production source prefix must exist");
+		assert!(
+			production.contains("request_prop_fallback_shared(&msg_prop, &wake_tx_prop)"),
+			"the AppLinks Timer P callback must go through request_prop_fallback_shared"
+		);
+		assert!(
+			!production.contains("needs_prop_fallback = true"),
+			"only request_prop_fallback_shared may set needs_prop_fallback"
 		);
 	}
 
