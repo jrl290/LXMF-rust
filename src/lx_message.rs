@@ -99,6 +99,13 @@ pub struct LXMessage {
 	delivery_callback: Option<Arc<dyn Fn(&LXMessage) + Send + Sync>>,
 	failed_callback: Option<Arc<dyn Fn(&LXMessage) + Send + Sync>>,
 	pn_encrypted_data: Option<Vec<u8>>,
+	/// The router's state callback, handed over when the router stops
+	/// tracking this outbound message. A delivery proof can still land after
+	/// that (Reticulum-rust B35: a receipt proved after its timeout counts as
+	/// delivered), and the router no longer sees the state change, so the
+	/// message reports DELIVERED itself.
+	released_state_callback: Option<Arc<dyn Fn(&[u8], u8) + Send + Sync>>,
+	late_delivery_unreported: bool,
 }
 
 impl LXMessage {
@@ -267,6 +274,8 @@ impl LXMessage {
 			delivery_callback: None,
 			failed_callback: None,
 			pn_encrypted_data: None,
+			released_state_callback: None,
+			late_delivery_unreported: false,
 		})
 	}
 
@@ -1371,11 +1380,32 @@ impl LXMessage {
 			false,
 			false,
 		);
+		let newly = self.state != Self::DELIVERED;
 		self.state = Self::DELIVERED;
 		self.progress = 1.0;
+		if newly && self.released_state_callback.is_some() {
+			self.late_delivery_unreported = true;
+		}
 		if let Some(callback) = self.delivery_callback.as_ref() {
 			callback(self);
 		}
+	}
+
+	/// The router stops tracking this message: from now on a delivery proof
+	/// reports DELIVERED through `state_callback` (see
+	/// `released_state_callback`).
+	pub(crate) fn release_state_reporting(&mut self, state_callback: Option<Arc<dyn Fn(&[u8], u8) + Send + Sync>>) {
+		self.released_state_callback = state_callback;
+	}
+
+	/// The DELIVERED report owed for a proof that landed after the router let
+	/// go of this message, taken once. The caller fires it after dropping the
+	/// message lock.
+	fn take_late_delivery_report(&mut self) -> Option<LateDeliveryReport> {
+		if !std::mem::take(&mut self.late_delivery_unreported) {
+			return None;
+		}
+		Some((self.released_state_callback.clone()?, self.hash.clone()?))
 	}
 
 	fn mark_propagated(&mut self) {
@@ -1551,10 +1581,33 @@ fn recall_identity(hash: &[u8]) -> Option<Identity> {
 	Identity::recall(hash)
 }
 
-pub(crate) fn mark_delivered_shared(handle: &Arc<Mutex<LXMessage>>) {
-	if let Ok(mut message) = handle.lock() {
-		message.mark_delivered();
+type LateDeliveryReport = (Arc<dyn Fn(&[u8], u8) + Send + Sync>, Vec<u8>);
+
+/// A delivery proof that landed after the router concluded the message —
+/// FAILED because its receipt timed out, or SENT for a fire-and-forget direct
+/// packet. The recipient has it, so the app hears DELIVERED: delivery may
+/// follow a failure, never the reverse (`fail_message` skips success states).
+fn report_late_delivery(report: Option<LateDeliveryReport>) {
+	if let Some((state_callback, hash)) = report {
+		log(
+			&format!("Delivery proof for {} arrived after the router concluded it; reporting DELIVERED", hexrep(&hash, false)),
+			LOG_NOTICE,
+			false,
+			false,
+		);
+		state_callback(&hash, LXMessage::DELIVERED);
 	}
+}
+
+pub(crate) fn mark_delivered_shared(handle: &Arc<Mutex<LXMessage>>) {
+	let late = match handle.lock() {
+		Ok(mut message) => {
+			message.mark_delivered();
+			message.take_late_delivery_report()
+		}
+		Err(_) => None,
+	};
+	report_late_delivery(late);
 }
 
 pub(crate) fn mark_propagated_shared(handle: &Arc<Mutex<LXMessage>>) {
@@ -1580,6 +1633,7 @@ pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
 
 fn resource_concluded_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mutex<Resource>>) {
 	eprintln!("[LXM-RC] resource_concluded_shared called");
+	let mut late = None;
 	let resource_guard = match resource.lock() {
 		Ok(guard) => guard,
 		Err(_) => {
@@ -1596,10 +1650,13 @@ fn resource_concluded_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mute
 			eprintln!("[LXM-RC] calling resource_concluded, current state={}", message.state);
 			message.resource_concluded(&resource_guard);
 			eprintln!("[LXM-RC] after resource_concluded, state={}", message.state);
+			late = message.take_late_delivery_report();
 		}
 	} else {
 		eprintln!("[LXM-RC] failed to lock message handle");
 	}
+	drop(resource_guard);
+	report_late_delivery(late);
 }
 
 fn update_transfer_progress_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mutex<Resource>>) {
@@ -1735,6 +1792,62 @@ mod tests {
 			LXMessage::PROPAGATED,
 			"msg.method must be PROPAGATED after pack() — router dispatch depends on this"
 		);
+	}
+
+	type StateReports = Arc<Mutex<Vec<(Vec<u8>, u8)>>>;
+
+	fn packed_direct_message(state: u8) -> (Arc<Mutex<LXMessage>>, Vec<u8>) {
+		let mut direct = make_propagated_message();
+		direct.desired_method = Some(LXMessage::DIRECT);
+		direct.pack(false).expect("pack");
+		direct.state = state;
+		let hash = direct.hash.clone().expect("hash");
+		(Arc::new(Mutex::new(direct)), hash)
+	}
+
+	fn state_sink() -> (Arc<dyn Fn(&[u8], u8) + Send + Sync>, StateReports) {
+		let reports: StateReports = Arc::default();
+		let sink = reports.clone();
+		(Arc::new(move |hash: &[u8], state: u8| sink.lock().unwrap().push((hash.to_vec(), state))), reports)
+	}
+
+	/// The router reported FAILED (the receipt timed out) and let go; the
+	/// proof then arrives. The recipient has the message, so the app hears
+	/// DELIVERED, once.
+	#[test]
+	fn a_proof_after_the_router_failed_the_message_reports_delivered_once() {
+		let (handle, hash) = packed_direct_message(LXMessage::FAILED);
+		let (state_callback, reports) = state_sink();
+		handle.lock().unwrap().release_state_reporting(Some(state_callback));
+
+		mark_delivered_shared(&handle);
+		assert_eq!(handle.lock().unwrap().state, LXMessage::DELIVERED);
+		assert_eq!(*reports.lock().unwrap(), vec![(hash.clone(), LXMessage::DELIVERED)]);
+
+		mark_delivered_shared(&handle);
+		assert_eq!(reports.lock().unwrap().len(), 1, "a second proof reports nothing new");
+	}
+
+	/// While the router still tracks the message it reports DELIVERED on its
+	/// next pass; the message must not report it a second time.
+	#[test]
+	fn a_proof_while_the_router_tracks_the_message_is_left_to_the_router() {
+		let (handle, _) = packed_direct_message(LXMessage::SENDING);
+		mark_delivered_shared(&handle);
+		let mut message = handle.lock().unwrap();
+		assert_eq!(message.state, LXMessage::DELIVERED);
+		assert!(message.take_late_delivery_report().is_none());
+	}
+
+	/// A duplicate proof for a message the router already reported DELIVERED
+	/// reports nothing.
+	#[test]
+	fn a_duplicate_proof_after_delivery_reports_nothing() {
+		let (handle, _) = packed_direct_message(LXMessage::DELIVERED);
+		let (state_callback, reports) = state_sink();
+		handle.lock().unwrap().release_state_reporting(Some(state_callback));
+		mark_delivered_shared(&handle);
+		assert!(reports.lock().unwrap().is_empty());
 	}
 
 	#[test]

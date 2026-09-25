@@ -1753,6 +1753,10 @@ impl LXMRouter {
 					}
 				}
 				if remove {
+					// A proof can still land once the router lets go (a receipt
+					// proved after its timeout counts as delivered): the
+					// message then reports DELIVERED itself.
+					lxm.release_state_reporting(self.message_state_callback.clone());
 					self.pending_outbound.remove(index);
 				} else {
 					index += 1;
