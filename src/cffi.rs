@@ -245,6 +245,48 @@ pub extern "C" fn lxmf_client_start(
     log_level: i32,
     stamp_cost: i32,
 ) -> u64 {
+    lxmf_client_start_with_ratchets(
+        config_dir,
+        storage_path,
+        identity_path,
+        create_identity,
+        display_name,
+        log_level,
+        stamp_cost,
+        std::ptr::null(),
+        0,
+    )
+}
+
+/// `lxmf_client_start` with the delivery ratchets' mirror and freeze in place
+/// from the start: before the delivery destination loads its ratchets and
+/// before it is registered with Transport, which answers path requests for
+/// it (announcing, and so rotating a ratchet) from then on.
+///
+/// Retichat iOS only (Reticulum-rust PARITY-AUDIT-1.5.2.md A29, a named
+/// departure from the reference, off by default):
+/// - `ratchets_mirror_dir` — NULL or "" = no mirror. Otherwise a directory
+///   (which must exist) that receives, after every write of the delivery
+///   ratchet file, the identical file under the same name
+///   (`<dest hexhash>.ratchets`). The app passes the directory its
+///   Notification Service Extension loads its ratchets from.
+/// - `ratchets_frozen` — non-zero: the delivery ratchets are read-only; no
+///   ratchet is ever rotated and the ratchet file is never written, not even
+///   created. Announces carry the newest ratchet held; decryption reloads the
+///   file after a miss. The Notification Service Extension passes 1.
+#[no_mangle]
+pub extern "C" fn lxmf_client_start_with_ratchets(
+    config_dir: *const c_char,
+    storage_path: *const c_char,
+    identity_path: *const c_char,
+    create_identity: i32,
+    display_name: *const c_char,
+    log_level: i32,
+    stamp_cost: i32,
+    ratchets_mirror_dir: *const c_char,
+    ratchets_frozen: i32,
+) -> u64 {
+    let mirror_dir = unsafe { cstr_to_string(ratchets_mirror_dir) };
     let config = ClientConfig {
         config_dir: unsafe { cstr_to_string(config_dir) },
         lxmf_storage_path: unsafe { cstr_to_string(storage_path) },
@@ -257,6 +299,8 @@ pub extern "C" fn lxmf_client_start(
         } else {
             Some(stamp_cost as u32)
         },
+        ratchets_mirror_dir: if mirror_dir.is_empty() { None } else { Some(mirror_dir) },
+        ratchets_frozen: ratchets_frozen != 0,
     };
 
     match LxmfClient::start(config, ClientCallbacks::default()) {
@@ -266,6 +310,37 @@ pub extern "C" fn lxmf_client_start(
             0
         }
     }
+}
+
+/// Retichat iOS only (A29): mirror the delivery ratchet file into `dir`
+/// (NULL or "" stops mirroring) on every copy of the delivery destination
+/// (the router's, Transport's registered one, the client's handle). Prefer
+/// `lxmf_client_start_with_ratchets`, which has it in place before anything
+/// can announce. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_client_set_ratchets_mirror_dir(client: u64, dir: *const c_char) -> i32 {
+    let dir = unsafe { cstr_to_string(dir) };
+    with_client!(client, c, {
+        match c.set_ratchets_mirror_dir(if dir.is_empty() { None } else { Some(dir.as_str()) }) {
+            Ok(()) => 0,
+            Err(e) => { set_error(e); -1 }
+        }
+    })
+}
+
+/// Retichat iOS Notification Service Extension only (A29): `frozen` non-zero
+/// makes the delivery ratchets read-only on every copy of the delivery
+/// destination; 0 makes them writable again. Prefer
+/// `lxmf_client_start_with_ratchets`, which freezes them before they are
+/// loaded and before anything can announce. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_client_set_ratchets_frozen(client: u64, frozen: i32) -> i32 {
+    with_client!(client, c, {
+        match c.set_ratchets_frozen(frozen != 0) {
+            Ok(()) => 0,
+            Err(e) => { set_error(e); -1 }
+        }
+    })
 }
 
 /// Shut down the client: destroy router, identity, and transport.

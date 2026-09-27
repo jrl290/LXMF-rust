@@ -41,6 +41,19 @@ pub struct ClientConfig {
 
     /// Stamp cost for the delivery endpoint (`None` = no stamps).
     pub stamp_cost: Option<u32>,
+
+    /// Retichat iOS app only (Reticulum-rust PARITY-AUDIT-1.5.2.md A29, a
+    /// named departure, off = `None`): a directory that receives the
+    /// identical delivery ratchet file after every write of it, applied
+    /// before the delivery destination can announce. See
+    /// `LXMRouter::set_ratchets_mirror_dir`.
+    pub ratchets_mirror_dir: Option<String>,
+
+    /// Retichat iOS Notification Service Extension only (A29, off = `false`):
+    /// the delivery ratchets are read-only, from before `enable_ratchets` and
+    /// before the delivery destination can announce. See
+    /// `LXMRouter::set_ratchets_frozen`.
+    pub ratchets_frozen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +110,16 @@ impl LxmfClient {
             &config.lxmf_storage_path,
         )?;
 
+        // Before the delivery destination exists: it is created, loads its
+        // ratchets and is registered with Transport (which can announce it
+        // from then on) with these already in place.
+        if config.ratchets_frozen {
+            lxmf::router_set_ratchets_frozen(router_handle, true)?;
+        }
+        if let Some(dir) = config.ratchets_mirror_dir.as_deref() {
+            lxmf::router_set_ratchets_mirror_dir(router_handle, Some(dir))?;
+        }
+
         let display = if config.display_name.is_empty() {
             None
         } else {
@@ -126,6 +149,32 @@ impl LxmfClient {
             dest_handle,
             dest_hash,
         })
+    }
+
+    /// Retichat iOS only (A29): mirror the delivery ratchet file into `dir`
+    /// (`None` stops), on every copy of the delivery destination: the
+    /// router's, Transport's registered one and this client's handle. Prefer
+    /// `ClientConfig::ratchets_mirror_dir`, in place before anything can
+    /// announce; set here, a rotation already under way is not mirrored.
+    pub fn set_ratchets_mirror_dir(&self, dir: Option<&str>) -> Result<(), String> {
+        lxmf::router_set_ratchets_mirror_dir(self.router_handle, dir)?;
+        let mirror = dir.map(|d| crate::lxm_router::ratchets_mirror_file(d, &self.dest_hash));
+        reticulum_rust::ffi::with_handle_mut(self.dest_handle, |d: &mut reticulum_rust::destination::Destination| {
+            d.set_ratchets_mirror_path(mirror)
+        })
+        .ok_or_else(|| "invalid delivery destination handle".to_string())
+    }
+
+    /// Retichat iOS Notification Service Extension only (A29): make the
+    /// delivery ratchets read-only (or writable again), on every copy of the
+    /// delivery destination. Prefer `ClientConfig::ratchets_frozen`, in place
+    /// before `enable_ratchets` and before anything can announce.
+    pub fn set_ratchets_frozen(&self, frozen: bool) -> Result<(), String> {
+        lxmf::router_set_ratchets_frozen(self.router_handle, frozen)?;
+        reticulum_rust::ffi::with_handle_mut(self.dest_handle, |d: &mut reticulum_rust::destination::Destination| {
+            d.set_ratchets_frozen(frozen)
+        })
+        .ok_or_else(|| "invalid delivery destination handle".to_string())
     }
 
     /// DISPLAY_NAMES.md §4.1: change the Message Display Name at runtime.

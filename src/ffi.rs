@@ -149,6 +149,24 @@ pub fn router_register_delivery(
     Ok(store_handle(dest))
 }
 
+/// Retichat iOS only (A29): mirror the router's delivery ratchet files into
+/// `dir` (`None` stops). See `LXMRouter::set_ratchets_mirror_dir`.
+pub fn router_set_ratchets_mirror_dir(router_handle: u64, dir: Option<&str>) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router.lock().map_err(|e| e.to_string())?.set_ratchets_mirror_dir(dir.map(|d| d.to_string()));
+    Ok(())
+}
+
+/// Retichat iOS Notification Service Extension only (A29): make the router's
+/// delivery ratchets read-only. See `LXMRouter::set_ratchets_frozen`.
+pub fn router_set_ratchets_frozen(router_handle: u64, frozen: bool) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    router.lock().map_err(|e| e.to_string())?.set_ratchets_frozen(frozen);
+    Ok(())
+}
+
 /// DISPLAY_NAMES.md §4.1: set the router's Message Display Name at runtime.
 /// `None` or a name that cleans to nothing clears it. Returns the cleaned name.
 pub fn router_set_message_display_name(router_handle: u64, name: Option<&str>) -> Result<Option<String>, String> {

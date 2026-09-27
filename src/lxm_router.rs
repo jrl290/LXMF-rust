@@ -134,6 +134,14 @@ pub struct LXMRouter {
 	pub propagation_node_start_time: Option<f64>,
 	pub storagepath: String,
 	pub ratchetpath: String,
+	/// Retichat iOS only (Reticulum-rust PARITY-AUDIT-1.5.2.md A29, a named
+	/// departure, off by default): a directory that receives, after every
+	/// write of a delivery destination's ratchet file, the identical file
+	/// under the same name. See `set_ratchets_mirror_dir`.
+	pub ratchets_mirror_dir: Option<String>,
+	/// Retichat iOS Notification Service Extension only (A29): the delivery
+	/// destinations' ratchets are read-only here. See `set_ratchets_frozen`.
+	pub ratchets_frozen: bool,
 	pub messagepath: Option<String>,
 
 	pub outbound_propagation_node: Option<Vec<u8>>,
@@ -228,6 +236,12 @@ pub struct LXMRouter {
 	/// Link-established callbacks send on this instead of calling
 	/// process_outbound inline, which would block the TCP read thread.
 	pub outbound_wake_tx: mpsc::Sender<()>,
+}
+
+/// The mirror of delivery destination `dest_hash`'s ratchet file in `dir`:
+/// the same file name the router gives the primary (`<hexhash>.ratchets`).
+pub fn ratchets_mirror_file(dir: &str, dest_hash: &[u8]) -> String {
+	format!("{}/{}.ratchets", dir.trim_end_matches('/'), hexrep(dest_hash, false))
 }
 
 impl LXMRouter {
@@ -376,6 +390,8 @@ impl LXMRouter {
 			propagation_node_start_time: None,
 			storagepath,
 			ratchetpath,
+			ratchets_mirror_dir: None,
+			ratchets_frozen: false,
 			messagepath: None,
 			outbound_propagation_node: None,
 			outbound_propagation_link: None,
@@ -3257,6 +3273,13 @@ impl LXMRouter {
 			vec!["delivery".to_string()],
 		)?;
 
+		// The ratchet mirror and freeze (A29) before enable_ratchets, which
+		// writes the file when there is none, and before the registration with
+		// Transport, from which on Transport's copy answers path requests by
+		// announcing (and so rotating): both copies start with them.
+		delivery_destination.set_ratchets_frozen(self.ratchets_frozen);
+		delivery_destination.set_ratchets_mirror_path(self.ratchets_mirror_path_for(&delivery_destination.hash));
+
 		// Enable ratchets
 		let ratchet_file = format!("{}/{}.ratchets", self.ratchetpath, hexrep(&delivery_destination.hash, false));
 		log(&format!("[RATCHET] enable_ratchets: path={} exists={}", ratchet_file, std::path::Path::new(&ratchet_file).exists()), LOG_NOTICE, false, false);
@@ -3310,6 +3333,61 @@ impl LXMRouter {
 		self.update_delivery_announce_app_data(&dest_hash);
 
 		Ok(delivery_destination)
+	}
+
+	/// Where the ratchet file of delivery destination `dest_hash` is mirrored:
+	/// the same file name in `ratchets_mirror_dir`.
+	fn ratchets_mirror_path_for(&self, dest_hash: &[u8]) -> Option<String> {
+		self.ratchets_mirror_dir.as_deref().map(|dir| ratchets_mirror_file(dir, dest_hash))
+	}
+
+	/// Retichat iOS only (Reticulum-rust PARITY-AUDIT-1.5.2.md A29, a named
+	/// departure from the reference, off by default): mirror every delivery
+	/// destination's ratchet file into `dir` (the same file name), so the
+	/// app's Notification Service Extension, which loads its ratchets from
+	/// there, holds every ratchet the app rotates. `None` stops mirroring.
+	///
+	/// Applied to the router's copy of each delivery destination and to
+	/// Transport's registered copy (both announce, so both rotate and
+	/// persist); a delivery destination registered later starts with it.
+	/// Set it before the first announce: set before `register_delivery_identity`
+	/// (LxmfClient's `ClientConfig::ratchets_mirror_dir`) it is in place before
+	/// the destination can announce at all.
+	pub fn set_ratchets_mirror_dir(&mut self, dir: Option<String>) {
+		self.ratchets_mirror_dir = dir;
+		let hashes: Vec<Vec<u8>> = self.delivery_destinations.keys().cloned().collect();
+		for hash in hashes {
+			let mirror = self.ratchets_mirror_path_for(&hash);
+			if let Some(destination) = self.delivery_destinations.get_mut(&hash) {
+				destination.set_ratchets_mirror_path(mirror.clone());
+			}
+			if !Transport::set_registered_ratchets_mirror_path(&hash, mirror) {
+				log(&format!("[RATCHET] mirror: delivery destination {} is not registered with Transport", hexrep(&hash, false)), LOG_ERROR, false, false);
+			}
+		}
+	}
+
+	/// Retichat iOS Notification Service Extension only (A29, off by
+	/// default): make the delivery destinations' ratchets read-only. A frozen
+	/// destination never rotates a ratchet or writes its ratchet file; its
+	/// announces carry the newest ratchet it holds and decryption still
+	/// reloads the file (the app's mirror) after a miss.
+	///
+	/// Applied to the router's copy and Transport's registered copy; a
+	/// delivery destination registered later starts frozen. Set before
+	/// `register_delivery_identity` (`ClientConfig::ratchets_frozen`) it is in
+	/// place before `enable_ratchets` and before anything can announce.
+	pub fn set_ratchets_frozen(&mut self, frozen: bool) {
+		self.ratchets_frozen = frozen;
+		let hashes: Vec<Vec<u8>> = self.delivery_destinations.keys().cloned().collect();
+		for hash in hashes {
+			if let Some(destination) = self.delivery_destinations.get_mut(&hash) {
+				destination.set_ratchets_frozen(frozen);
+			}
+			if !Transport::set_registered_ratchets_frozen(&hash, frozen) {
+				log(&format!("[RATCHET] freeze: delivery destination {} is not registered with Transport", hexrep(&hash, false)), LOG_ERROR, false, false);
+			}
+		}
 	}
 
 	/// Register a callback to be called when messages are delivered
@@ -5957,5 +6035,128 @@ mod display_name_router_tests {
 
 		let (stranger, _) = packed(&Identity::new(true));
 		assert_eq!(deliver(&stranger), (false, LXMessage::SOURCE_UNKNOWN), "source unknown");
+	}
+}
+
+/// Reticulum-rust PARITY-AUDIT-1.5.2.md A29: the ratchet mirror and freeze
+/// reach every copy of the delivery destination that can rotate or persist:
+/// the router's and Transport's registered copy.
+#[cfg(test)]
+mod ratchet_mirror_router_tests {
+	use super::*;
+
+	struct TempDir(std::path::PathBuf);
+	impl TempDir {
+		fn new(label: &str) -> Self {
+			let mut bytes = [0u8; 8];
+			rand::thread_rng().fill(&mut bytes);
+			let dir = std::env::temp_dir().join(format!("lxmf-router-ratchets-{label}-{}", hexrep(&bytes, false)));
+			std::fs::create_dir_all(&dir).expect("temp dir");
+			TempDir(dir)
+		}
+		fn path(&self, name: &str) -> String {
+			self.0.join(name).to_string_lossy().into_owned()
+		}
+	}
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn router(storage: &str) -> Arc<Mutex<LXMRouter>> {
+		LXMRouter::new(
+			Some(Identity::new(true)), storage.to_string(), None, None, None, None, None,
+			false, false, Vec::new(), None, false, 0, 0, 0, 0, 0, None,
+		)
+		.expect("router")
+	}
+
+	fn primary_file(r: &LXMRouter, hash: &[u8]) -> String {
+		format!("{}/{}.ratchets", r.ratchetpath, hexrep(hash, false))
+	}
+
+	#[test]
+	fn a_mirror_dir_set_before_registration_is_on_every_copy_from_the_start() {
+		let tmp = TempDir::new("mirror");
+		let mirror_dir = tmp.path("nse_ratchets");
+		std::fs::create_dir_all(&mirror_dir).unwrap();
+		let router = router(&tmp.path("storage"));
+		let mut r = router.lock().unwrap();
+		r.set_ratchets_mirror_dir(Some(mirror_dir.clone()));
+		let destination = r.register_delivery_identity(Identity::new(true), None, None).expect("register");
+		let hash = destination.hash.clone();
+		let primary = primary_file(&r, &hash);
+		let mirror = ratchets_mirror_file(&mirror_dir, &hash);
+
+		assert_eq!(destination.ratchets_mirror_path.as_deref(), Some(mirror.as_str()), "the returned copy (the client's handle) carries it");
+		assert_eq!(r.delivery_destinations[&hash].ratchets_mirror_path.as_deref(), Some(mirror.as_str()), "the router's copy carries it");
+		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((Some(mirror.clone()), false)), "Transport's copy carries it");
+		assert_eq!(
+			std::fs::read(&mirror).expect("the file enable_ratchets created was mirrored: set before enable_ratchets"),
+			std::fs::read(&primary).expect("primary"),
+		);
+
+		// The first announce rotates; the rotation reaches the mirror.
+		let _ = r.announce(&hash, None);
+		assert_eq!(r.delivery_destinations[&hash].ratchets.as_ref().map(|x| x.len()), Some(1), "the announce rotated");
+		assert_eq!(std::fs::read(&mirror).unwrap(), std::fs::read(&primary).unwrap(), "the rotation was mirrored byte for byte");
+		assert_eq!(
+			Transport::registered_ratchet_settings(&hash),
+			Some((Some(mirror.clone()), false)),
+			"the router's update of Transport's copy after the announce keeps it"
+		);
+		Transport::deregister_destination(&hash);
+	}
+
+	#[test]
+	fn a_router_frozen_before_registration_never_creates_or_rotates_the_ratchet_file() {
+		let tmp = TempDir::new("frozen");
+		let router = router(&tmp.path("storage"));
+		let mut r = router.lock().unwrap();
+		r.set_ratchets_frozen(true);
+		let destination = r.register_delivery_identity(Identity::new(true), None, None).expect("register");
+		let hash = destination.hash.clone();
+		let primary = primary_file(&r, &hash);
+
+		assert!(destination.ratchets_frozen, "the returned copy (the client's handle) is frozen");
+		assert!(r.delivery_destinations[&hash].ratchets_frozen, "the router's copy is frozen");
+		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((None, true)), "Transport's copy is frozen");
+		assert!(!std::path::Path::new(&primary).exists(), "frozen before enable_ratchets: no ratchet file is created");
+
+		let _ = r.announce(&hash, None);
+		assert_eq!(r.delivery_destinations[&hash].ratchets.as_ref().map(|x| x.len()), Some(0), "no ratchet was rotated");
+		assert!(!std::path::Path::new(&primary).exists(), "nor written");
+		Transport::deregister_destination(&hash);
+	}
+
+	#[test]
+	fn runtime_mirror_and_freeze_reach_the_router_and_transport_copies() {
+		let tmp = TempDir::new("runtime");
+		let mirror_dir = tmp.path("nse_ratchets");
+		std::fs::create_dir_all(&mirror_dir).unwrap();
+		let router = router(&tmp.path("storage"));
+		let mut r = router.lock().unwrap();
+		let destination = r.register_delivery_identity(Identity::new(true), None, None).expect("register");
+		let hash = destination.hash.clone();
+		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((None, false)), "off by default");
+		assert!(!r.delivery_destinations[&hash].ratchets_frozen);
+		assert_eq!(r.delivery_destinations[&hash].ratchets_mirror_path, None);
+
+		r.set_ratchets_mirror_dir(Some(format!("{}/", mirror_dir)));
+		let mirror = ratchets_mirror_file(&mirror_dir, &hash);
+		assert_eq!(r.delivery_destinations[&hash].ratchets_mirror_path.as_deref(), Some(mirror.as_str()));
+		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((Some(mirror.clone()), false)));
+
+		r.set_ratchets_frozen(true);
+		assert!(r.delivery_destinations[&hash].ratchets_frozen);
+		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((Some(mirror.clone()), true)));
+
+		r.set_ratchets_mirror_dir(None);
+		r.set_ratchets_frozen(false);
+		assert_eq!(r.delivery_destinations[&hash].ratchets_mirror_path, None);
+		assert!(!r.delivery_destinations[&hash].ratchets_frozen);
+		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((None, false)));
+		Transport::deregister_destination(&hash);
 	}
 }
