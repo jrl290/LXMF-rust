@@ -409,7 +409,7 @@
     },
     {
       "name": "str and negative keys in the map do not match",
-      "fields_msgpack_hex": "81ccd184a131d9203031323334353637383961626364656630313233343536373839616263646566a130c403426f62ffa36e6567d0ffc3",
+      "fields_msgpack_hex": "81ccd184a131d9203031323334353637383961626364656630313233343536373839616263646566a130c403426f62ffa36e6567d0fec3",
       "state": "absent",
       "display_name": null,
       "group": {

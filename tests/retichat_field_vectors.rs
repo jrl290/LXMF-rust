@@ -169,3 +169,90 @@ fn encode_vectors() {
 	}
 	assert!(failures.is_empty(), "{} failure(s):\n{}", failures.len(), failures.join("\n"));
 }
+
+/// A map key as the integer or bytes it means, whatever its msgpack width, so
+/// `ff` and `d0 ff` (both -1) compare equal.
+fn key_identity(key: &Value) -> String {
+	match key {
+		Value::Integer(i) => match (i.as_u64(), i.as_i64()) {
+			(Some(u), _) => format!("int {u}"),
+			(None, Some(n)) => format!("int {n}"),
+			_ => unreachable!(),
+		},
+		Value::String(s) => format!("str {:?}", s.as_bytes()),
+		Value::Binary(b) => format!("bin {b:?}"),
+		other => format!("other {other:?}"),
+	}
+}
+
+fn duplicate_keys(value: &Value, path: &str, found: &mut Vec<String>) {
+	match value {
+		Value::Map(entries) => {
+			let mut seen = std::collections::HashSet::new();
+			for (key, inner) in entries {
+				let id = key_identity(key);
+				if !seen.insert(id.clone()) {
+					found.push(format!("{path}: duplicate key {id}"));
+				}
+				duplicate_keys(inner, &format!("{path}/{id}"), found);
+			}
+		}
+		Value::Array(items) => items.iter().enumerate().for_each(|(i, item)| duplicate_keys(item, &format!("{path}[{i}]"), found)),
+		_ => {}
+	}
+}
+
+/// Group entry strings (old fields 0xA0-0xA8, map keys 1-9) with invalid UTF-8.
+fn invalid_group_strings(fields: &Value, found: &mut Vec<String>) {
+	let Value::Map(top) = fields else { return };
+	for (key, value) in top {
+		let Some(n) = key.as_u64() else { continue };
+		if (0xA0..=0xA8).contains(&n) && matches!(value, Value::String(s) if !s.is_str()) {
+			found.push(format!("old field {n:#x}: invalid UTF-8"));
+		}
+		if n == FIELD_RETICHAT as u64 {
+			if let Value::Map(inner) = value {
+				for (k, v) in inner {
+					if matches!(k.as_u64(), Some(1..=9)) && matches!(v, Value::String(s) if !s.is_str()) {
+						found.push(format!("0xd1 key {}: invalid UTF-8", k.as_u64().unwrap()));
+					}
+				}
+			}
+		}
+	}
+}
+
+/// The notes promise every client can agree on every vector: no duplicate key
+/// (at any width) anywhere, and no invalid UTF-8 in a group entry. Holds for
+/// this file and for display_name_vectors.json's decode_field cases.
+#[test]
+fn no_vector_holds_a_duplicate_key_or_invalid_group_utf8() {
+	let v = vectors();
+	let note = v["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("No vector holds a duplicate key"));
+	assert!(note, "the notes still make the promise this test checks");
+
+	let mut inputs: Vec<(String, String)> = Vec::new();
+	for case in v["decode"].as_array().unwrap() {
+		inputs.push((format!("decode / {}", case["name"]), case["fields_msgpack_hex"].as_str().unwrap().into()));
+	}
+	for case in v["encode"].as_array().unwrap() {
+		for form in ["start_hex", "legacy_hex", "retichat_hex"] {
+			inputs.push((format!("encode / {} / {form}", case["name"]), case[form].as_str().unwrap().into()));
+		}
+	}
+	let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/display_name_vectors.json");
+	let names: Json = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+	for case in names["decode_field"].as_array().unwrap() {
+		inputs.push((format!("display_name decode_field / {}", case["name"]), case["fields_msgpack_hex"].as_str().unwrap().into()));
+	}
+
+	let mut failures = Vec::new();
+	for (name, hex_str) in &inputs {
+		let value = read(&hex(hex_str));
+		let mut found = Vec::new();
+		duplicate_keys(&value, "", &mut found);
+		invalid_group_strings(&value, &mut found);
+		failures.extend(found.into_iter().map(|f| format!("{name}: {f}")));
+	}
+	assert!(failures.is_empty(), "{} failure(s):\n{}", failures.len(), failures.join("\n"));
+}
