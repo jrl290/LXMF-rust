@@ -13,6 +13,9 @@ use crate::lxmf::FIELD_DISPLAY_NAME;
 /// DISPLAY_NAMES.md §3 rule 5: names are cut to this many Unicode scalars.
 pub const MAX_SCALARS: usize = 64;
 
+/// The most UTF-8 bytes a cleaned name can take: 64 scalars of 4 bytes.
+pub const MAX_NAME_BYTES: usize = MAX_SCALARS * 4;
+
 /// DISPLAY_NAMES.md §4.1: a name confirmed delivered is sent again after this.
 pub const NAME_REFRESH_SECS: i64 = 30 * 24 * 60 * 60;
 

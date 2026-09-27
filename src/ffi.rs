@@ -29,6 +29,11 @@ pub struct ReceivedMessage {
     pub content: String,
     pub timestamp: f64,
     pub signature_validated: bool,
+    /// Why the signature is not validated: 0 validated, 1 source unknown (no
+    /// key for the source yet), 2 signature invalid (`LXMessage::SOURCE_UNKNOWN`
+    /// / `SIGNATURE_INVALID`). DISPLAY_NAMES.md §5.2 treats the last two
+    /// differently, so a bool is not enough.
+    pub unverified_reason: u8,
     pub attachments: Vec<(String, Vec<u8>)>,
     pub rssi: Option<f64>,
     pub snr: Option<f64>,
@@ -60,6 +65,13 @@ impl ReceivedMessage {
             content: msg.content_as_string().unwrap_or_default(),
             timestamp: msg.timestamp.unwrap_or(0.0),
             signature_validated: msg.signature_validated,
+            unverified_reason: if msg.signature_validated {
+                0
+            } else {
+                // Unpack always names the reason; were it missing, "invalid"
+                // is the answer that never lets a name through.
+                msg.unverified_reason.unwrap_or(LXMessage::SIGNATURE_INVALID)
+            },
             attachments,
             rssi: msg.rssi,
             snr: msg.snr,
@@ -163,10 +175,33 @@ pub fn router_set_announce_display_name(router_handle: u64, name: Option<&str>) 
 /// router keeps current when the Announce Display Name or the stamp cost
 /// changes (DISPLAY_NAMES.md §2.2). Any other destination is published with
 /// its own configured app_data, as before.
-pub fn publish_destination(dest_hash: &[u8], refresh_secs: f64) {
-    let app_data = crate::lxm_router::global_router()
-        .and_then(|router| router.lock().ok().and_then(|r| r.get_announce_app_data(dest_hash)));
+pub fn publish_destination(dest_hash: &[u8], refresh_secs: f64) -> Result<(), String> {
+    publish_with_router_app_data(crate::lxm_router::global_router().as_deref(), dest_hash, refresh_secs)
+}
+
+/// `publish_destination` for the router behind `router_handle`
+/// (`LxmfClient::publish`).
+pub fn router_publish_destination(router_handle: u64, dest_hash: &[u8], refresh_secs: f64) -> Result<(), String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    publish_with_router_app_data(Some(&router), dest_hash, refresh_secs)
+}
+
+/// Publish `dest_hash` with `router`'s announce app_data when it is one of
+/// its delivery destinations. The router lock is held until the entry is in
+/// Transport, so a concurrent name change (which updates the published entry
+/// under the same lock) cannot fall between reading the app_data and
+/// publishing it. A poisoned router lock is an error, never a silent publish
+/// without the name.
+pub(crate) fn publish_with_router_app_data(router: Option<&Mutex<LXMRouter>>, dest_hash: &[u8], refresh_secs: f64) -> Result<(), String> {
+    let guard = match router {
+        Some(router) => Some(router.lock().map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let app_data = guard.as_ref().and_then(|r| r.get_announce_app_data(dest_hash));
     reticulum_rust::ffi::transport_publish_destination(dest_hash, refresh_secs, app_data.as_deref());
+    drop(guard);
+    Ok(())
 }
 
 /// Register a callback that fires when an inbound message is fully received.

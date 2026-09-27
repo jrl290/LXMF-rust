@@ -629,16 +629,9 @@ impl LXMRouter {
 		// that entry current, so the next automatic announce carries a changed
 		// name (DISPLAY_NAMES.md §2.2) or stamp cost too. Transport's copy is
 		// not replaced: it holds the ratchets the daemon rotates.
-		if let Some((_, published)) = Transport::published_destinations()
-			.into_iter()
-			.find(|(hash, _)| hash.as_slice() == destination_hash)
-		{
-			Transport::publish_destination(
-				destination_hash.to_vec(),
-				published.refresh_interval.map(Duration::from_secs_f64),
-				app_data,
-			);
-		}
+		// Only an existing entry is updated, checked and written under one
+		// Transport lock: an unpublish racing this change stays unpublished.
+		Transport::update_published_app_data(destination_hash, app_data);
 	}
 
 	pub fn get_announce_app_data(&self, destination_hash: &[u8]) -> Option<Vec<u8>> {
@@ -5704,6 +5697,40 @@ mod display_name_router_tests {
 		r.set_announce_display_name(None);
 		assert_eq!(published(&hash).unwrap().app_data, Some(app_data(vec![Value::Nil, Value::Nil])));
 		Transport::unpublish_destination(&hash);
+		r.set_announce_display_name(Some("Carol"));
+		assert!(published(&hash).is_none(), "a name change after an unpublish does not republish");
+	}
+
+	/// LxmfClient::publish (iOS) and ffi::publish_destination (Android) put
+	/// the router's app_data in the published entry, so the daemon's
+	/// announces carry the Announce Display Name (§2.2).
+	#[test]
+	fn publishing_through_the_bindings_carries_the_announce_name() {
+		let (router, destination) = router("bindings", None);
+		let hash = destination.hash.clone();
+		router.lock().unwrap().set_announce_display_name(Some("Alice"));
+		let named = Some(app_data(vec![Value::Binary(b"Alice".to_vec()), Value::Nil]));
+		let published = |hash: &[u8]| {
+			Transport::published_destinations().into_iter().find(|(h, _)| h.as_slice() == hash).map(|(_, p)| p)
+		};
+
+		let handle = reticulum_rust::ffi::store_handle(router.clone());
+		crate::ffi::router_publish_destination(handle, &hash, 1800.0).unwrap();
+		let entry = published(&hash).expect("published");
+		assert_eq!(entry.app_data, named, "LxmfClient::publish");
+		assert_eq!(entry.refresh_interval, Some(1800.0));
+		Transport::unpublish_destination(&hash);
+		reticulum_rust::ffi::destroy_handle(handle);
+
+		crate::ffi::publish_with_router_app_data(Some(&*router), &hash, 0.0).unwrap();
+		assert_eq!(published(&hash).expect("published").app_data, named, "publish_destination");
+		Transport::unpublish_destination(&hash);
+
+		// Not one of the router's delivery destinations: published as before.
+		let other = Identity::get_random_hash();
+		crate::ffi::publish_with_router_app_data(Some(&*router), &other, 0.0).unwrap();
+		assert_eq!(published(&other).expect("published").app_data, None);
+		Transport::unpublish_destination(&other);
 	}
 
 	#[test]
@@ -5807,5 +5834,93 @@ mod display_name_router_tests {
 		let mut plain = outbound(&source, &recipient).lock().unwrap().propagated_copy().unwrap();
 		plain.state = LXMessage::FAILED;
 		assert!(r.released_state_callback(&plain).is_some(), "the app callback");
+	}
+
+	/// The wiring, not only the callback: a DIRECT message process_outbound
+	/// concludes as SENT and removes, whose proof lands afterwards, is
+	/// recorded in the ledger (§4.1) and reported DELIVERED to the app.
+	#[test]
+	fn a_proof_after_process_outbound_let_go_records_the_name() {
+		let (router, source) = router("released", Some("Alice"));
+		let recipient = Identity::new(true);
+		let reports: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+		let seen = reports.clone();
+		let destination = Destination::new_outbound(
+			Some(recipient.clone()), DestinationType::Single, "lxmf".into(), vec!["delivery".into()],
+		)
+		.unwrap();
+		let message = Arc::new(Mutex::new(
+			LXMessage::new(Some(destination), Some(source.clone()), Some(b"hi".to_vec()), None, None,
+				Some(LXMessage::DIRECT), None, None, None, false).unwrap(),
+		));
+		{
+			let mut r = router.lock().unwrap();
+			r.register_message_state_callback(Arc::new(move |_, state| seen.lock().unwrap().push(state)));
+			let mut lxm = message.lock().unwrap();
+			r.prepare_display_name(&mut lxm);
+			lxm.pack(false).unwrap();
+			lxm.state = LXMessage::SENT;
+			drop(lxm);
+			r.pending_outbound.push(message.clone());
+			r.process_outbound();
+			assert!(r.pending_outbound.is_empty(), "DIRECT SENT is concluded and removed");
+		}
+		let (src, dst) = {
+			let lxm = message.lock().unwrap();
+			(lxm.source_hash.clone(), lxm.destination_hash.clone())
+		};
+		assert_eq!(router.lock().unwrap().name_ledger.lookup(&src, &dst).unwrap(), None);
+
+		crate::lx_message::mark_delivered_shared(&message);
+
+		let row = router.lock().unwrap().name_ledger.lookup(&src, &dst).unwrap().expect("the late proof is recorded");
+		assert_eq!(row.name_digest, crate::display_name::digest(Some("Alice")).to_vec());
+		assert_eq!(*reports.lock().unwrap(), vec![LXMessage::SENT, LXMessage::DELIVERED]);
+	}
+
+	/// §5.2: the delivery callback's snapshot tells "source unknown" from
+	/// "invalid" on the router's own delivery path (direct, opportunistic,
+	/// propagated, ingest), not only for distro and channel posts.
+	#[test]
+	fn delivery_reports_why_a_signature_is_not_validated() {
+		let (router, own) = router("reason", None);
+		let seen: Arc<Mutex<Vec<(bool, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+		let sink = seen.clone();
+		router.lock().unwrap().register_delivery_callback(Arc::new(move |m: &LXMessage| {
+			let snapshot = crate::ffi::ReceivedMessage::from_lxmessage(m);
+			sink.lock().unwrap().push((snapshot.signature_validated, snapshot.unverified_reason));
+		}));
+		let packed = |sender: &Identity| -> (Vec<u8>, Vec<u8>) {
+			let from = Destination::new_outbound(
+				Some(sender.clone()), DestinationType::Single, "lxmf".into(), vec!["delivery".into()],
+			)
+			.unwrap();
+			let to = Destination::new_outbound(
+				own.identity.clone(), DestinationType::Single, "lxmf".into(), vec!["delivery".into()],
+			)
+			.unwrap();
+			let mut m = LXMessage::new(Some(to), Some(from.clone()), Some(b"hi".to_vec()), None, None,
+				Some(LXMessage::OPPORTUNISTIC), None, None, None, false).unwrap();
+			m.pack(false).unwrap();
+			(m.packed.clone().unwrap(), from.hash.clone())
+		};
+		let deliver = |bytes: &[u8]| {
+			assert!(router.lock().unwrap().lxmf_delivery(
+				bytes, Some(DestinationType::Single), None, None, Some(LXMessage::OPPORTUNISTIC), true, true,
+			));
+			seen.lock().unwrap().pop().expect("delivered to the callback")
+		};
+
+		let known = Identity::new(true);
+		let (genuine, known_hash) = packed(&known);
+		Identity::remember_destination(&known_hash, &known.get_public_key().unwrap(), None).unwrap();
+		assert_eq!(deliver(&genuine), (true, 0), "validated");
+
+		let mut forged = genuine.clone();
+		forged[40] ^= 0x01; // inside the signature (bytes 32..96)
+		assert_eq!(deliver(&forged), (false, LXMessage::SIGNATURE_INVALID), "invalid");
+
+		let (stranger, _) = packed(&Identity::new(true));
+		assert_eq!(deliver(&stranger), (false, LXMessage::SOURCE_UNKNOWN), "source unknown");
 	}
 }

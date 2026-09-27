@@ -284,15 +284,7 @@ impl LxmfClient {
     pub fn publish(&self, refresh_secs: f64) -> Result<(), String> {
         // The router's announce app_data (name and stamp cost), which it keeps
         // current in the published entry when either changes.
-        let router: std::sync::Arc<std::sync::Mutex<crate::lxm_router::LXMRouter>> =
-            reticulum_rust::ffi::get_handle(self.router_handle).ok_or_else(|| "invalid router handle".to_string())?;
-        let app_data = router.lock().map_err(|e| e.to_string())?.get_announce_app_data(&self.dest_hash);
-        reticulum_rust::ffi::transport_publish_destination(
-            &self.dest_hash,
-            refresh_secs,
-            app_data.as_deref(),
-        );
-        Ok(())
+        lxmf::router_publish_destination(self.router_handle, &self.dest_hash, refresh_secs)
     }
 
     /// Remove this client's delivery destination from the announce

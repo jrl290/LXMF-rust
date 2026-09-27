@@ -85,6 +85,9 @@ macro_rules! with_client {
 // =========================================================================
 
 /// Delivery callback: fired when an inbound message is fully received.
+/// `signature_valid` is 1 or 0; `unverified_reason` is 0 when validated,
+/// 1 when the source is unknown, 2 when the signature is invalid
+/// (DISPLAY_NAMES.md §5.2 treats 1 and 2 differently).
 pub type LxmfDeliveryCallback = extern "C" fn(
     context: *mut std::ffi::c_void,
     hash: *const u8,
@@ -97,6 +100,7 @@ pub type LxmfDeliveryCallback = extern "C" fn(
     content: *const c_char,
     timestamp: f64,
     signature_valid: i32,
+    unverified_reason: i32,
     fields_raw: *const u8,
     fields_len: u32,
 );
@@ -347,6 +351,7 @@ pub extern "C" fn lxmf_client_set_delivery_callback(
             content_c.as_ptr(),
             msg.timestamp,
             if msg.signature_validated { 1 } else { 0 },
+            msg.unverified_reason as i32,
             msg.fields_raw.as_ptr(),
             msg.fields_raw.len() as u32,
         );
@@ -1592,7 +1597,9 @@ pub extern "C" fn lxmf_app_link_policy(client: u64) -> u8 {
 /// written to `out_buf` (including the NUL terminator), or 0 if the announce
 /// has no name or `out_buf` is too small.
 ///
-/// The returned string is always NUL-terminated.
+/// The returned string is always NUL-terminated. A buffer of
+/// `LXMF_DISPLAY_NAME_BUF_LEN` bytes holds every name; a smaller one loses
+/// the longest names (0 cannot tell "too small" from "no name").
 #[no_mangle]
 pub extern "C" fn lxmf_client_recall_display_name(
     _client: u64,
@@ -1637,6 +1644,11 @@ pub extern "C" fn lxmf_client_recall_display_name(
 // =========================================================================
 // Display names (DISPLAY_NAMES.md)
 // =========================================================================
+
+/// Buffer size, NUL included, that holds any cleaned display name
+/// (`MAX_NAME_BYTES` + 1). Mirrored as `LXMF_DISPLAY_NAME_BUF_LEN` in
+/// CRetichatFFI.h.
+pub const LXMF_DISPLAY_NAME_BUF_LEN: u32 = crate::display_name::MAX_NAME_BYTES as u32 + 1;
 
 /// A C string argument as UTF-8: NULL or "" is `Ok(None)`; bytes that are
 /// not UTF-8 are an error (§3 rule 1 would clean them to no name, which a
@@ -2020,4 +2032,38 @@ pub extern "C" fn lxmf_client_persist(client: u64) {
     };
     let c = arc.lock().unwrap();
     c.persist();
+}
+
+#[cfg(test)]
+mod display_name_buffer_tests {
+    use super::*;
+    use reticulum_rust::identity::Identity;
+    use rmpv::Value;
+
+    /// The longest valid name is 64 four-byte scalars: 256 bytes plus the
+    /// NUL. A caller that sizes its buffer by `LXMF_DISPLAY_NAME_BUF_LEN`
+    /// gets it back; the 256-byte buffer iOS used reported "no name".
+    #[test]
+    fn the_longest_announce_name_fits_the_documented_buffer() {
+        let longest = "\u{1F600}".repeat(crate::display_name::MAX_SCALARS);
+        assert_eq!(longest.len(), crate::display_name::MAX_NAME_BYTES);
+        assert_eq!(crate::display_name::clean(longest.as_bytes()).as_deref(), Some(longest.as_str()), "§3 keeps all 64");
+
+        let identity = Identity::new(true);
+        let public_key = identity.get_public_key().unwrap();
+        let hash = crate::channel::lxmf_delivery_hash_for_public_key(&public_key).unwrap();
+        let mut app_data = Vec::new();
+        rmpv::encode::write_value(&mut app_data, &Value::Array(vec![Value::Binary(longest.as_bytes().to_vec()), Value::Nil])).unwrap();
+        Identity::remember_destination(&hash, &public_key, Some(app_data)).unwrap();
+
+        let recall = |buf_len: u32| {
+            let mut buf = vec![0 as c_char; buf_len as usize];
+            let written = lxmf_client_recall_display_name(0, hash.as_ptr(), hash.len() as u32, buf.as_mut_ptr(), buf_len);
+            (written, buf)
+        };
+        let (written, buf) = recall(LXMF_DISPLAY_NAME_BUF_LEN);
+        assert_eq!(written as u32, LXMF_DISPLAY_NAME_BUF_LEN);
+        assert_eq!(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(), longest);
+        assert_eq!(recall(256).0, 0, "one byte short loses the name");
+    }
 }
