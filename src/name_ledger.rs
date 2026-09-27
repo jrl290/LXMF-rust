@@ -538,6 +538,35 @@ mod tests {
 		assert_eq!(decode_field(&lxm.fields), NameField::Name("Alice".into()));
 	}
 
+	/// The packed field order after the router's key 0 decision, pinned
+	/// byte for byte: key 0 is removed first (dropping a 0xD1 then empty or
+	/// not a map) and set after, so such a 0xD1 moves after the other
+	/// fields. LXMF-master tests/test_display_names.py
+	/// (test_field_order_matches_lxmf_rust) pins the same four cases.
+	#[test]
+	fn the_field_order_after_key_0_is_pinned() {
+		let ledger = NameLedger::open(&temp_dir("order"));
+		let p = pair();
+		let d1 = |entries: Vec<(i64, Value)>| Value::Map(entries.into_iter().map(|(k, v)| (Value::from(k), v)).collect());
+		let one = || (Value::from(0x01), Value::Binary(b"x".to_vec()));
+		let cases = vec![
+			(vec![(Value::from(0xD1), d1(vec![(0, Value::String("Mallory".into()))])), one()], "8201c40178ccd18100c405416c696365"),
+			(vec![(Value::from(0xD1), Value::Binary(b"old".to_vec())), one()], "8201c40178ccd18100c405416c696365"),
+			(
+				vec![(Value::from(0xD1), d1(vec![(0, Value::String("Mallory".into())), (3, Value::String("Hikers".into()))])), one()],
+				"82ccd18200c405416c69636503a648696b65727301c40178",
+			),
+			(vec![one(), (Value::from(0xD1), d1(vec![(3, Value::String("Hikers".into()))]))], "8201c40178ccd18200c405416c69636503a648696b657273"),
+		];
+		for (start, packed) in cases {
+			let mut lxm = message(&p, Some(Value::Map(start)));
+			ledger.prepare_outbound(Some("Alice"), &mut lxm, 1_000);
+			let mut bytes = Vec::new();
+			rmpv::encode::write_value(&mut bytes, &lxm.fields).unwrap();
+			assert_eq!(hexrep(&bytes, false), packed);
+		}
+	}
+
 	/// The retired 0x10 is never written.
 	#[test]
 	fn no_sender_name_field_is_written() {

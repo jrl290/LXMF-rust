@@ -321,8 +321,11 @@ the code in the consistency pass of 2026-09-27.
 
 ### Shared Rust (LXMF-rust, used by iOS and Android)
 
-- Field and cleaning (§2.1, §3): `lxmf::FIELD_DISPLAY_NAME`;
-  `display_name::clean`, `clean_announce`, `digest`, `decode_field` /
+- Field and cleaning (§2.1, §3): `lxmf::FIELD_RETICHAT` (0xD1) and the
+  `retichat_field` module (key constants `RF_*`, `read_entry` / `set_entry` /
+  `remove_entry`, the §10 group helpers; vectors
+  `tests/retichat_field_vectors.json`, run by
+  `tests/retichat_field_vectors.rs`); `display_name::clean`, `clean_announce`, `digest`, `decode_field` /
   `decode_fields_bytes` (the three states as `NameField`). Vectors:
   `tests/display_name_vectors.json`, run by `tests/display_name_vectors.rs`.
 - Announce (§2.2): `LXMRouter::get_announce_app_data` and
@@ -458,16 +461,23 @@ channel send rule (it never posts).
 
 ### Python reference
 
-`LXMF-master` (local modification, not in git): `LXMF.FIELD_DISPLAY_NAME`;
-`clean_display_name` / `clean_announce_name`, a mirror of §3 run against the
-shared vectors; `display_name_from_fields` (bin or str, raw: no cleaning, no
-signature rules); `LXMRouter.register_delivery_identity(..., announce_name=None)`
-and `get_announce_app_data` announce only the cleaned `announce_name`
+`LXMF-master` (local modification, not in git): `LXMF.FIELD_RETICHAT` (0xD1),
+the key constants `RF_*`, `GROUP_ENTRIES_IN_RETICHAT_FIELD` and helpers that
+mirror `retichat_field` (`retichat_map`, `retichat_entry`,
+`group_entry_from_fields`, `set_retichat_entry`, `remove_retichat_entry`,
+`set_group_entry`); `clean_display_name` / `clean_announce_name`, a mirror of
+§3 run against the shared vectors; `display_name_from_fields` (key 0 of the
+map, bin or str, raw: no cleaning, no signature rules);
+`LXMRouter.register_delivery_identity(..., announce_name=None)` and
+`get_announce_app_data` announce only the cleaned `announce_name`
 ("Anonymous Peer" as nil); `handle_outbound` calls
-`apply_message_display_name`, which writes the cleaned Message Display Name as
-bin on every message (no ledger, so an unset name sends nothing rather than a
-clear). `lxmd` has no default `display_name`, and treats the old template's
-"Anonymous Peer" as unset. Tests: `LXMF-master/tests/test_display_names.py`.
+`apply_message_display_name`, which removes key 0 and then, when a name is
+set, writes the cleaned Message Display Name as bin in key 0 on every message,
+in the same order as `NameLedger::prepare_outbound` so the packed fields match
+byte for byte (no ledger, so an unset name sends nothing rather than a clear).
+`lxmd` has no default `display_name`, and treats the old template's
+"Anonymous Peer" as unset. Tests: `LXMF-master/tests/test_display_names.py`
+(it also runs both vectors files).
 
 ## 10. The Retichat field: all keys, and the group transition
 
