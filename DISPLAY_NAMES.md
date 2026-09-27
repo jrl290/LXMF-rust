@@ -193,8 +193,12 @@ becomes the contact's `messageName`.
 | invalid | ignore | ignore |
 
 Order: a `Name` or `Clear` is accepted only from a message whose LXMF
-timestamp is newer than `messageNameAt`; accepting one records that timestamp
-(a repeat of the current name also advances it). Messages arrive out of order
+timestamp is newer than `messageNameAt`; accepting a **validated** one records
+that timestamp (a repeat of the current name also advances it). A
+source-unknown fill leaves `messageNameAt` as it was: its timestamp is the
+sender's unverifiable claim, and recording it would let a forged far-future
+message lock out every later validated name. A timestamp that is not a finite
+number is never accepted. Messages arrive out of order
 (a propagated copy can land after a later direct one), and without this an old
 name would overwrite a new one that the sender's ledger then never resends.
 Channel names follow the same rule per `(channel, sender)` with the post
@@ -228,9 +232,12 @@ messages keep the hash and resolve it when shown.
 
 Never lose a name the user typed.
 
-Placeholders, dropped wherever the name was not typed by the user: hash forms
-(8 to 32 hex, with or without `?` or `…`), "Retichat", "Retichat Web" and
-"Anonymous Peer" (all case-insensitive). Unnamed Android and web senders used
+Placeholders, dropped wherever the name was not typed by the user:
+"Retichat", "Retichat Web", "Anonymous Peer" (case-insensitive), and hash
+forms (8 to 32 hex, with or without `?` or `…`). Where a name may have been
+typed (every iOS name, Android DM chat names, web customized names), a hash
+form counts only when it prefixes the contact's own hash; other hex such as
+"deadbeef" is kept. Unnamed Android and web senders used
 to send the first two as names, and MeshChatX, Columba and lxmd announce the
 third.
 
@@ -332,6 +339,21 @@ the code in the consistency pass of 2026-09-27.
   `nativeDistro{Unwrap,AnnouncePayload}` (`retichat-jni`).
 
 ### Per client
+
+Final pass (2026-09-27): Retichat-ios `6b5e5c7`, `c720698`, `5e7fb69`,
+`e387e51`; Retichat-android `16765e6`, `f9d8e53` and the legacy/ordering
+commits before them; Retichat-js `7fc07a5`, `f2052f8`. Ordering (§5.2):
+iOS `DisplayNames.isNewer` / `acceptMessageName(... currentAt:messageTime:)`
+(`Change.fill` for a source-unknown name), `ContactEntity.messageNameAt`;
+Android `DisplayNames.recordsMessageTime`, `NameSql.ACCEPT_MESSAGE_NAME`;
+web `acceptMessageNameAt`, `acceptChannelName`. Legacy slot (§5.1): Android
+`legacyName` column (migration 10 → 11), web `legacyName` in `ContactStore`.
+Placeholders (§5.4): iOS `DisplayNames.isPlaceholder(_:ownHash:)`, Android
+`NamesMigration.placeholderSql` / `chatNamePlaceholderSql`, web
+`isPlaceholderName` / `isOwnHashPrefill`. NSE: `chat_names.json` entries
+carry the slot and `messageNameAt` (`DisplayNames.SharedName`), channel names
+their post time (`SharedChannelName`). Web names for non-contacts: hidden
+`nameOnly` rows, invites gated by `ContactStore.mayInvite`.
 
 **Retichat-ios (app).** Pure rules in `DisplayNames` (`Retichat/Bridge/LxmfFields.swift`,
 compiled into the app and the NSE; tests `tests/DisplayNamesTests.swift`).
