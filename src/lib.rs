@@ -1,4 +1,6 @@
+pub mod channel;
 pub mod client;
+pub mod display_name;
 pub mod cffi;
 pub mod handlers;
 pub mod lx_message;
@@ -7,6 +9,7 @@ pub mod lx_stamper;
 pub mod lxmf;
 pub mod lxm_peer;
 pub mod lxm_router;
+pub mod name_ledger;
 pub mod utilities;
 pub mod version;
 pub mod cli_util;

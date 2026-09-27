@@ -26,6 +26,9 @@ use rmpv::Value;
 use reticulum_rust::destination::{Destination, DestinationType, Direction};
 use reticulum_rust::identity::{full_hash, Identity};
 
+use crate::display_name::{self, NameField};
+use crate::lx_message::LXMessage;
+
 /// Size of an LXMF signature and of an identity public key half, in bytes.
 const PUBKEY_LEN: usize = 64;
 /// `srcHash(16) || signature(64)` precedes the msgpack payload in an LXMF message.
@@ -69,6 +72,70 @@ pub struct DistroMessage {
     /// is how a client tells "sync copy with a bad 0xFC — drop and log" apart
     /// from an ordinary message, whose `sent_to` is also `None`.
     pub sent_by: Option<String>,
+    /// DISPLAY_NAMES.md §2.1 / §5.2: what field 0xD1 says about the source.
+    /// Whether the client accepts it depends on the signature fields below.
+    pub display_name: NameField,
+    /// LXMF signature check against the source's known key (§5.2): true only
+    /// when the key is known and the signature verifies.
+    pub signature_validated: bool,
+    /// `None` when validated; otherwise `LXMessage::SOURCE_UNKNOWN` (no key
+    /// for the source yet) or `LXMessage::SIGNATURE_INVALID`.
+    pub unverified_reason: Option<u8>,
+}
+
+impl DistroMessage {
+    /// The JSON both native bridges return from their distro unwrap
+    /// (`retichat_distro_unwrap`, `nativeDistroUnwrap`): one definition, so the
+    /// keys cannot drift between iOS and Android.
+    ///
+    /// Keys: `source_hash` (hex), `timestamp`, `title`, `content`,
+    /// `is_delivery_notification`, `ticket`, `distro_transfer_key`, `sent_to`,
+    /// `sent_by`, `display_name_state` (0 absent, 1 clear, 2 name),
+    /// `display_name` (null unless 2), `signature_validated`,
+    /// `unverified_reason` (0 ok, 1 source unknown, 2 signature invalid).
+    pub fn to_json(&self) -> String {
+        let opt = |v: &Option<String>| v.as_deref().map(json_string).unwrap_or_else(|| "null".into());
+        format!(
+            concat!(
+                r#"{{"source_hash":"{}","timestamp":{},"title":{},"content":{},"#,
+                r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{},"#,
+                r#""sent_to":{},"sent_by":{},"#,
+                r#""display_name_state":{},"display_name":{},"signature_validated":{},"unverified_reason":{}}}"#
+            ),
+            self.source_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            self.timestamp,
+            json_string(&self.title),
+            json_string(&self.content),
+            self.is_delivery_notification,
+            opt(&self.ticket),
+            opt(&self.distro_transfer_key),
+            opt(&self.sent_to),
+            opt(&self.sent_by),
+            self.display_name.state_byte(),
+            self.display_name.name().map(json_string).unwrap_or_else(|| "null".into()),
+            self.signature_validated,
+            self.unverified_reason.unwrap_or(0),
+        )
+    }
+}
+
+/// A JSON string literal (the escaping both bridges used before this moved here).
+pub fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 const FIELD_TICKET: u64 = 0x0C;
@@ -137,42 +204,25 @@ pub fn list_payload(distro: &Identity) -> Result<Vec<u8>, String> {
     ])))
 }
 
-/// Payload for `/rfed/distro/announce`.
+/// The app_data of a distro address's announce (RFed SPEC §17.10,
+/// DISPLAY_NAMES.md §2.2): `[announce_name, nil, [SF_RFED_DISTRO]]`.
 ///
-/// The app_data of a distro address's announce (RFed SPEC §17.10): the LXMF
-/// 0.5.0+ list `[display_name, stamp_cost, supported_functionality]` with
-/// `SF_RFED_DISTRO` in the functionality list, which is how every sender
-/// learns, once and from the announce it needs anyway, that no device answers
-/// a direct link to this address. With no caller data this is
-/// `[nil, nil, [SF_RFED_DISTRO]]`: no name (names travel inside encrypted
-/// messages), no stamp cost, no compression claim. Caller data in the list
-/// format keeps its name and cost and gains the flag; anything else is
-/// replaced, since a raw-format announce cannot carry it.
-pub fn distro_announce_app_data(app_data: Option<&[u8]>) -> Vec<u8> {
-    let flag = Value::Integer(crate::lxmf::SF_RFED_DISTRO.into());
-    let mut items: Vec<Value> = match app_data.filter(|d| !d.is_empty()) {
-        Some(data) => match read_value(&mut Cursor::new(data)) {
-            Ok(Value::Array(items)) => items,
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
-    };
-    while items.len() < 3 {
-        items.push(Value::Nil);
-    }
-    let flags = match items.get(2) {
-        Some(Value::Array(existing)) => {
-            let mut flags = existing.clone();
-            if !flags.iter().any(|f| f.as_i64() == Some(crate::lxmf::SF_RFED_DISTRO)) {
-                flags.push(flag);
-            }
-            flags
-        }
-        _ => vec![flag],
-    };
-    items[2] = Value::Array(flags);
-    items.truncate(3);
-    encode(&Value::Array(items))
+/// `announce_name` is the raw Announce Display Name; it is cleaned with the
+/// announce rules (§3) and carried as bin, or nil when there is none (the
+/// default: anonymous to other apps). No stamp cost and no compression claim.
+/// `SF_RFED_DISTRO` in the functionality list is how every sender learns,
+/// from the announce it needs anyway, that no device answers a direct link
+/// to this address.
+pub fn distro_announce_app_data(announce_name: Option<&[u8]>) -> Vec<u8> {
+    let name = announce_name
+        .and_then(display_name::clean_announce)
+        .map(|n| Value::Binary(n.into_bytes()))
+        .unwrap_or(Value::Nil);
+    encode(&Value::Array(vec![
+        name,
+        Value::Nil,
+        Value::Array(vec![Value::Integer(crate::lxmf::SF_RFED_DISTRO.into())]),
+    ]))
 }
 
 /// `msgpack [ bin value, bin(64) distro_pubkey, bin(64) sig(value) ]`
@@ -187,8 +237,11 @@ pub fn distro_announce_app_data(app_data: Option<&[u8]>) -> Vec<u8> {
 /// The destination is built OUT-bound on purpose. An IN destination would make
 /// this device claim inbound delivery for the distro address, which is exactly
 /// what must not happen — delivery arrives fanned out on `rfed.delivery`.
-pub fn announce_payload(distro: &Identity, app_data: Option<&[u8]>) -> Result<Vec<u8>, String> {
-    let app_data = distro_announce_app_data(app_data);
+///
+/// `announce_name` is the raw Announce Display Name (see
+/// `distro_announce_app_data`); `None` announces no name.
+pub fn announce_payload(distro: &Identity, announce_name: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let app_data = distro_announce_app_data(announce_name);
     let mut destination = Destination::new_outbound(
         Some(distro.clone()),
         DestinationType::Single,
@@ -271,6 +324,8 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         }
         _ => (None, None, (None, None)),
     };
+    let display_name = arr.get(3).map(display_name::decode_field).unwrap_or(NameField::Absent);
+    let signature = &plaintext[DEST_HASH_LEN..LXMF_HEADER_LEN];
 
     // RFed SPEC §17.11 receive rule 2: a sync copy is filed as the user's
     // OWN sent message, so "source = D" must be proven by D's signature, not
@@ -282,11 +337,25 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
     // from any other source is left to the clients' "not our distro" check,
     // receive rule 1.
     if sent_by.is_some() && source_hash[..] == expected[..] {
-        let signature = &plaintext[DEST_HASH_LEN..LXMF_HEADER_LEN];
         if !lxmf_signature_valid(distro, &expected, &source_hash, payload, &arr, signature) {
             return Err("§17.11 sent-copy claims the distro as source but fails the distro signature — dropped".into());
         }
     }
+
+    // DISPLAY_NAMES.md §5.2: every message reports its signature, so the
+    // client can decide whether to accept its 0xD1 — validated, source
+    // unknown (no key for the source yet) or invalid. The distro's own
+    // address is checked against the distro key this device holds.
+    let signer = if source_hash[..] == expected[..] {
+        Some(distro.clone())
+    } else {
+        Identity::recall(&source_hash)
+    };
+    let (signature_validated, unverified_reason) = match signer {
+        Some(signer) if lxmf_signature_valid(&signer, &expected, &source_hash, payload, &arr, signature) => (true, None),
+        Some(_) => (false, Some(LXMessage::SIGNATURE_INVALID)),
+        None => (false, Some(LXMessage::SOURCE_UNKNOWN)),
+    };
 
     let is_delivery_notification = ticket.is_some() && content.is_empty();
 
@@ -300,6 +369,9 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         distro_transfer_key,
         sent_to,
         sent_by,
+        display_name,
+        signature_validated,
+        unverified_reason,
     }))
 }
 
@@ -395,29 +467,43 @@ mod tests {
         Identity::new(true)
     }
 
-    /// RFed SPEC §17.10: the pre-signed announce always carries the distro
-    /// flag, whatever the caller supplied.
+    /// RFed SPEC §17.10 / DISPLAY_NAMES.md §2.2: the pre-signed announce is
+    /// `[announce_name | nil, nil, [0xD0]]`.
     #[test]
-    fn announce_app_data_always_carries_the_distro_flag() {
-        use crate::lxmf::{distro_from_app_data, compression_support_from_app_data, display_name_from_app_data, SF_COMPRESSION};
+    fn announce_app_data_carries_the_flag_and_the_announce_name() {
+        use crate::lxmf::{distro_from_app_data, compression_support_from_app_data, stamp_cost_from_app_data};
+        use crate::display_name::announce_name_from_app_data;
+        let flag = Value::Array(vec![Value::Integer(crate::lxmf::SF_RFED_DISTRO.into())]);
+
         let bare = distro_announce_app_data(None);
+        assert_eq!(bare, encode(&Value::Array(vec![Value::Nil, Value::Nil, flag.clone()])));
         assert!(distro_from_app_data(Some(&bare)));
         assert_eq!(compression_support_from_app_data(Some(&bare)), Some(false), "no compression claim");
-        assert_eq!(display_name_from_app_data(Some(&bare)), None);
+        assert_eq!(announce_name_from_app_data(Some(&bare)), None);
 
-        let named = encode(&Value::Array(vec![
+        let named = distro_announce_app_data(Some(" Alice\u{202e} ".as_bytes()));
+        assert_eq!(named, encode(&Value::Array(vec![Value::Binary(b"Alice".to_vec()), Value::Nil, flag.clone()])),
+            "cleaned, as bin");
+        assert!(distro_from_app_data(Some(&named)));
+        assert_eq!(stamp_cost_from_app_data(Some(&named)), None);
+        assert_eq!(announce_name_from_app_data(Some(&named)).as_deref(), Some("Alice"));
+
+        for anonymous in [&b"Anonymous Peer"[..], b"", b"\x00", b"\xff"] {
+            assert_eq!(distro_announce_app_data(Some(anonymous)), bare, "{anonymous:?} announces nil");
+        }
+    }
+
+    #[test]
+    fn announce_payload_carries_the_name() {
+        let distro = identity();
+        let payload = announce_payload(&distro, Some(b"Alice")).expect("build");
+        let (value, _) = verify_like_rfed(&payload).expect("rfed would accept this");
+        let app_data = encode(&Value::Array(vec![
             Value::Binary(b"Alice".to_vec()),
-            Value::Integer(8.into()),
-            Value::Array(vec![Value::Integer(SF_COMPRESSION.into())]),
+            Value::Nil,
+            Value::Array(vec![Value::Integer(crate::lxmf::SF_RFED_DISTRO.into())]),
         ]));
-        let merged = distro_announce_app_data(Some(&named));
-        assert!(distro_from_app_data(Some(&merged)));
-        assert_eq!(compression_support_from_app_data(Some(&merged)), Some(true), "existing flags kept");
-        assert_eq!(display_name_from_app_data(Some(&merged)).as_deref(), Some("Alice"));
-        assert_eq!(distro_announce_app_data(Some(&merged)), merged, "adding the flag twice changes nothing");
-
-        let raw = distro_announce_app_data(Some(b"Alice"));
-        assert!(distro_from_app_data(Some(&raw)), "the raw format is replaced");
+        assert!(value.ends_with(&app_data), "the announce data ends with the app_data");
     }
 
     /// RFed SPEC §17.9: a transfer is FIELD_CUSTOM_TYPE == DISTRO_TRANSFER_TYPE
@@ -658,6 +744,103 @@ mod tests {
         let msg = unwrap_blob(&mut distro, &foreign).unwrap().unwrap();
         assert_eq!(msg.source_hash, o);
         assert!(msg.sent_by.is_some(), "the client must still see the marker to ignore it");
+    }
+
+    fn name_fields(value: Value) -> Vec<(Value, Value)> {
+        vec![(Value::Integer(crate::lxmf::FIELD_DISPLAY_NAME.into()), value)]
+    }
+
+    /// DISPLAY_NAMES.md §5.2: an ordinary message reports its 0xD1 and its
+    /// signature: validated when the source's key is known and matches.
+    #[test]
+    fn unwrap_reports_the_name_and_a_validated_signature() {
+        let mut distro = identity();
+        let sender = identity();
+        let s = delivery_hash(&sender).unwrap();
+        Identity::remember_destination(&s, &sender.get_public_key().unwrap(), None).unwrap();
+        for stamp in [false, true] {
+            let blob = lxmf_blob(&distro, &s, &sender, name_fields(Value::Binary(b" Bob ".to_vec())), stamp);
+            let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+            assert_eq!(msg.display_name, NameField::Name("Bob".into()));
+            assert!(msg.signature_validated);
+            assert_eq!(msg.unverified_reason, None);
+        }
+        let clear = lxmf_blob(&distro, &s, &sender, name_fields(Value::String("".into())), false);
+        assert_eq!(unwrap_blob(&mut distro, &clear).unwrap().unwrap().display_name, NameField::Clear);
+        let none = lxmf_blob(&distro, &s, &sender, Vec::new(), false);
+        assert_eq!(unwrap_blob(&mut distro, &none).unwrap().unwrap().display_name, NameField::Absent);
+    }
+
+    #[test]
+    fn unwrap_reports_an_invalid_signature() {
+        let mut distro = identity();
+        let sender = identity();
+        let forger = identity();
+        let s = delivery_hash(&sender).unwrap();
+        Identity::remember_destination(&s, &sender.get_public_key().unwrap(), None).unwrap();
+        let blob = lxmf_blob(&distro, &s, &forger, name_fields(Value::Binary(b"Bob".to_vec())), false);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert_eq!(msg.display_name, NameField::Name("Bob".into()), "decoded; the client ignores it");
+        assert!(!msg.signature_validated);
+        assert_eq!(msg.unverified_reason, Some(LXMessage::SIGNATURE_INVALID));
+    }
+
+    #[test]
+    fn unwrap_reports_an_unknown_source() {
+        let mut distro = identity();
+        let stranger = identity();
+        let s = delivery_hash(&stranger).unwrap();
+        let blob = lxmf_blob(&distro, &s, &stranger, name_fields(Value::Binary(b"Bob".to_vec())), false);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert!(!msg.signature_validated);
+        assert_eq!(msg.unverified_reason, Some(LXMessage::SOURCE_UNKNOWN));
+        assert_eq!(msg.display_name, NameField::Name("Bob".into()));
+    }
+
+    /// The distro's own address is checked against the distro key held here.
+    #[test]
+    fn unwrap_validates_a_message_from_the_distro_itself() {
+        let mut distro = identity();
+        let d = delivery_hash(&distro).unwrap();
+        let signed = lxmf_blob(&distro, &d, &distro.clone(), Vec::new(), false);
+        let msg = unwrap_blob(&mut distro, &signed).unwrap().unwrap();
+        assert!(msg.signature_validated);
+        let forged = lxmf_blob(&distro, &d, &identity(), Vec::new(), false);
+        let msg = unwrap_blob(&mut distro, &forged).unwrap().unwrap();
+        assert_eq!(msg.unverified_reason, Some(LXMessage::SIGNATURE_INVALID));
+    }
+
+    #[test]
+    fn unwrap_json_carries_the_name_and_signature_keys() {
+        let msg = DistroMessage {
+            source_hash: vec![0xab; 16],
+            timestamp: 1.5,
+            title: String::new(),
+            content: "hi\n".into(),
+            is_delivery_notification: false,
+            ticket: None,
+            distro_transfer_key: None,
+            sent_to: Some("cd".repeat(16)),
+            sent_by: None,
+            display_name: NameField::Name("Bob \"B\"".into()),
+            signature_validated: false,
+            unverified_reason: Some(LXMessage::SOURCE_UNKNOWN),
+        };
+        assert_eq!(
+            msg.to_json(),
+            format!(
+                concat!(
+                    r#"{{"source_hash":"{}","timestamp":1.5,"title":"","content":"hi\n","#,
+                    r#""is_delivery_notification":false,"ticket":null,"distro_transfer_key":null,"#,
+                    r#""sent_to":"{}","sent_by":null,"#,
+                    r#""display_name_state":2,"display_name":"Bob \"B\"","signature_validated":false,"unverified_reason":1}}"#
+                ),
+                "ab".repeat(16),
+                "cd".repeat(16)
+            )
+        );
+        let validated = DistroMessage { display_name: NameField::Clear, signature_validated: true, unverified_reason: None, ..msg };
+        assert!(validated.to_json().ends_with(r#""display_name_state":1,"display_name":null,"signature_validated":true,"unverified_reason":0}"#));
     }
 
     #[test]

@@ -223,8 +223,12 @@ pub extern "C" fn lxmf_free_bytes(ptr: *mut u8, len: u32) {
 /// - `storage_path`    — LXMF storage directory
 /// - `identity_path`   — Path to identity file
 /// - `create_identity` — If non-zero and identity file missing, create one
-/// - `display_name`    — Display name (sent per-message via FIELD_SENDER_NAME;
-///                       NOT broadcast in announces — privacy-preserving)
+/// - `display_name`    — the initial Message Display Name (DISPLAY_NAMES.md
+///                       §4.1): sent inside messages (field 0xD1) by the name
+///                       ledger's rule, never announced. Empty = none. Change
+///                       it later with `lxmf_client_set_message_display_name`;
+///                       the Announce Display Name starts empty and is set
+///                       with `lxmf_client_set_announce_display_name`.
 /// - `log_level`       — 0–7 or -1 for default
 /// - `stamp_cost`      — Stamp cost for delivery endpoint (-1 = none)
 #[no_mangle]
@@ -1579,12 +1583,14 @@ pub extern "C" fn lxmf_app_link_policy(client: u64) -> u8 {
     }
 }
 
-/// Look up the cached display name for a destination hash.
+/// Look up the Announce Display Name last heard from a destination hash
+/// (DISPLAY_NAMES.md §5.1 `announceName`).
 ///
 /// Reads the announce app-data stored in the Reticulum Identity table when
-/// the announce was received, and decodes the LXMF display-name field from
-/// it.  Returns the number of bytes written to `out_buf` (including the NUL
-/// terminator), or 0 if no name is known or `out_buf` is too small.
+/// the announce was received and returns its name cleaned with the announce
+/// rules (§3: "Anonymous Peer" is no name). Returns the number of bytes
+/// written to `out_buf` (including the NUL terminator), or 0 if the announce
+/// has no name or `out_buf` is too small.
 ///
 /// The returned string is always NUL-terminated.
 #[no_mangle]
@@ -1602,11 +1608,7 @@ pub extern "C" fn lxmf_client_recall_display_name(
     };
 
     let app_data = reticulum_rust::identity::Identity::recall_app_data(hash);
-    // Fallback: extract display name from announce app_data.
-    // Since v0.6.0, announces no longer carry display names (DESIGN_PRINCIPLES.md §9).
-    // This only returns names from OLD clients that still broadcast them.
-    // New code should use sender_name_from_fields() on incoming messages instead.
-    let name = crate::lxmf::display_name_from_app_data(app_data.as_deref());
+    let name = crate::display_name::announce_name_from_app_data(app_data.as_deref());
 
     match name {
         Some(n) if !n.is_empty() => {
@@ -1630,6 +1632,129 @@ pub extern "C" fn lxmf_client_recall_display_name(
         }
         _ => 0,
     }
+}
+
+// =========================================================================
+// Display names (DISPLAY_NAMES.md)
+// =========================================================================
+
+/// A C string argument as UTF-8: NULL or "" is `Ok(None)`; bytes that are
+/// not UTF-8 are an error (§3 rule 1 would clean them to no name, which a
+/// setter must not do silently).
+unsafe fn optional_utf8(ptr: *const c_char) -> Result<Option<String>, String> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    let bytes = CStr::from_ptr(ptr).to_bytes();
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    std::str::from_utf8(bytes)
+        .map(|s| Some(s.to_string()))
+        .map_err(|_| "display name is not valid UTF-8".to_string())
+}
+
+fn set_client_name(
+    client: u64,
+    name: *const c_char,
+    set: fn(u64, Option<&str>) -> Result<Option<String>, String>,
+) -> i32 {
+    let arc: Arc<Mutex<LxmfClient>> = match get_handle(client) {
+        Some(h) => h,
+        None => {
+            set_error("invalid client handle");
+            return -1;
+        }
+    };
+    let name = match unsafe { optional_utf8(name) } {
+        Ok(name) => name,
+        Err(e) => {
+            set_error(e);
+            return -1;
+        }
+    };
+    let router_handle = arc.lock().unwrap().router_handle;
+    match set(router_handle, name.as_deref()) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Set the Message Display Name (DISPLAY_NAMES.md §4.1) at runtime: the name
+/// the router adds (field 0xD1) to outbound messages by the name-ledger rule.
+/// NULL or "" clears it; the name is cleaned (§3). Takes effect for the next
+/// message, with no restart. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_client_set_message_display_name(client: u64, name: *const c_char) -> i32 {
+    set_client_name(client, name, lxmf::router_set_message_display_name)
+}
+
+/// Set the Announce Display Name (DISPLAY_NAMES.md §2.2) at runtime: the
+/// PUBLIC name in this client's lxmf.delivery announce. NULL or "" (the
+/// default) announces nil. Cleaned with the announce rules (§3; "Anonymous
+/// Peer" is none). The next announce carries it. Returns 0 / -1.
+#[no_mangle]
+pub extern "C" fn lxmf_client_set_announce_display_name(client: u64, name: *const c_char) -> i32 {
+    set_client_name(client, name, lxmf::router_set_announce_display_name)
+}
+
+/// Clean a display name exactly as the router does (DISPLAY_NAMES.md §3), for
+/// the settings screens: `announce` non-zero applies the announce rule too
+/// ("Anonymous Peer" is no name). Returns a NUL-terminated UTF-8 string (free
+/// with `lxmf_free_string`), or NULL when the input cleans to no name. This
+/// never fails; NULL always means "no name".
+#[no_mangle]
+pub extern "C" fn lxmf_display_name_clean(raw: *const u8, raw_len: u32, announce: i32) -> *mut c_char {
+    let bytes: &[u8] = if raw.is_null() || raw_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(raw, raw_len as usize) }
+    };
+    let cleaned = if announce != 0 {
+        crate::display_name::clean_announce(bytes)
+    } else {
+        crate::display_name::clean(bytes)
+    };
+    match cleaned {
+        // A cleaned name holds no NUL (rule 3 removes C0 controls).
+        Some(name) => string_to_cstr(&name),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Decode field 0xD1 (DISPLAY_NAMES.md §2.1, §3) from the msgpack fields
+/// buffer a delivery callback hands over (`fields_raw`). Returns a heap
+/// buffer (free with `lxmf_free_bytes`), always at least 3 bytes:
+///
+/// ```text
+/// [0]      name_state  0 = absent, 1 = clear, 2 = name
+/// [1..3]   name_len    u16 BE (0 unless state is 2)
+/// [3..]    name        cleaned UTF-8
+/// ```
+///
+/// Whether to accept it depends on the message's signature (§5.2); that is
+/// the caller's rule. Returns NULL only if `out_len` is NULL.
+#[no_mangle]
+pub extern "C" fn lxmf_display_name_decode(fields_raw: *const u8, fields_len: u32, out_len: *mut u32) -> *mut u8 {
+    if out_len.is_null() {
+        set_error("out_len is NULL");
+        return std::ptr::null_mut();
+    }
+    let bytes: &[u8] = if fields_raw.is_null() || fields_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fields_raw, fields_len as usize) }
+    };
+    let trailer = crate::display_name::decode_fields_bytes(bytes).to_trailer();
+    let len = trailer.len() as u32;
+    let mut boxed = trailer.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    unsafe { *out_len = len; }
+    ptr
 }
 
 // =========================================================================

@@ -6,7 +6,8 @@ use rmpv::Value;
 use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback};
 
 use crate::lx_message::LXMessage;
-use crate::lxmf::{APP_NAME, display_name_from_app_data, pn_announce_data_is_valid, stamp_cost_from_app_data};
+use crate::display_name::announce_name_from_app_data;
+use crate::lxmf::{APP_NAME, pn_announce_data_is_valid, stamp_cost_from_app_data};
 use crate::lxm_router::LXMRouter;
 
 fn now() -> f64 {
@@ -19,7 +20,9 @@ fn now() -> f64 {
 pub fn delivery_announce_handler(router: Arc<Mutex<LXMRouter>>) -> AnnounceHandler {
 	let callback: AnnounceCallback = Arc::new(move |destination_hash, _identity, app_data, _announce_hash, _is_path_response| {
 		if let Ok(mut router) = router.lock() {
-			let display_name = display_name_from_app_data(Some(app_data));
+			// DISPLAY_NAMES.md §5.1: the contact's announceName — cleaned, with
+			// "Anonymous Peer" as none. None also when the announce has no name.
+			let display_name = announce_name_from_app_data(Some(app_data));
 
 			// Always notify external listener (e.g. iOS) about every LXMF
 			// delivery announce so peerLastSeen is populated for deliveryMethod()

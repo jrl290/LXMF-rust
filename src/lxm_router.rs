@@ -29,6 +29,8 @@ use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_
 use crate::lx_stamper;
 use crate::lxmf::{pn_announce_data_is_valid, APP_NAME, FIELD_TICKET};
 use crate::lxm_peer::LXMPeer;
+use crate::display_name;
+use crate::name_ledger::{self, NameLedger};
 
 fn now() -> f64 {
 	SystemTime::now()
@@ -101,7 +103,18 @@ pub struct LXMRouter {
 	pub backchannel_identified_links: HashMap<Vec<u8>, bool>,
 	pub delivery_destinations: HashMap<Vec<u8>, Destination>,
 	pub delivery_stamp_costs: HashMap<Vec<u8>, u32>,
-	pub delivery_display_names: HashMap<Vec<u8>, String>,
+	/// DISPLAY_NAMES.md §4.1: the Message Display Name, cleaned, or none.
+	/// Router-wide: it names every outbound message whatever its source
+	/// (device or distro). Set from `register_delivery_identity`'s
+	/// `display_name` and changed at runtime by `set_message_display_name`.
+	pub message_display_name: Option<String>,
+	/// DISPLAY_NAMES.md §2.2: the Announce Display Name, cleaned, or none
+	/// (the default: announces carry nil). Changed by
+	/// `set_announce_display_name`, which refreshes every delivery
+	/// destination's app_data at once.
+	pub announce_display_name: Option<String>,
+	/// DISPLAY_NAMES.md §4.1: who has confirmed receiving which name.
+	pub name_ledger: Arc<NameLedger>,
 
 	pub prioritised_list: Vec<Vec<u8>>,
 	pub ignored_list: Vec<Vec<u8>>,
@@ -344,7 +357,9 @@ impl LXMRouter {
 			backchannel_identified_links: HashMap::new(),
 			delivery_destinations: HashMap::new(),
 			delivery_stamp_costs: HashMap::new(),
-			delivery_display_names: HashMap::new(),
+			message_display_name: None,
+			announce_display_name: None,
+			name_ledger: Arc::new(NameLedger::open(&storagepath)),
 			prioritised_list: Vec::new(),
 			ignored_list: Vec::new(),
 			allowed_list: Vec::new(),
@@ -607,7 +622,22 @@ impl LXMRouter {
 	fn update_delivery_announce_app_data(&mut self, destination_hash: &[u8]) {
 		let app_data = self.get_announce_app_data(destination_hash);
 		if let Some(destination) = self.delivery_destinations.get_mut(destination_hash) {
-			destination.set_default_app_data(app_data);
+			destination.set_default_app_data(app_data.clone());
+		}
+		// The auto-announce daemon and path responses announce Transport's own
+		// copy of the destination, with the published entry's app_data. Keep
+		// that entry current, so the next automatic announce carries a changed
+		// name (DISPLAY_NAMES.md §2.2) or stamp cost too. Transport's copy is
+		// not replaced: it holds the ratchets the daemon rotates.
+		if let Some((_, published)) = Transport::published_destinations()
+			.into_iter()
+			.find(|(hash, _)| hash.as_slice() == destination_hash)
+		{
+			Transport::publish_destination(
+				destination_hash.to_vec(),
+				published.refresh_interval.map(Duration::from_secs_f64),
+				app_data,
+			);
 		}
 	}
 
@@ -616,12 +646,15 @@ impl LXMRouter {
 			return None;
 		}
 
-		// NEVER REMOVE: Display name is NOT broadcast in announces.
-		// It travels per-message via FIELD_SENDER_NAME for privacy.
-		// Re-adding it here is a DESIGN_PRINCIPLES.md §9 violation.
-		// The announce is heard by everyone on the network.
-		// Only message recipients should see your name.
-		let display_name = Value::Nil;
+		// DISPLAY_NAMES.md §2.2 / DESIGN_PRINCIPLES.md §9: the announce is heard
+		// by the whole network, so it carries ONLY the Announce Display Name —
+		// a separate field the user fills in explicitly, labelled as public —
+		// and nil by default. Never put the Message Display Name (or any other
+		// name) here. Upstream's format, so every LXMF client can show it.
+		let display_name = match &self.announce_display_name {
+			Some(name) => Value::Binary(name.as_bytes().to_vec()),
+			None => Value::Nil,
+		};
 
 		let stamp_cost = self
 			.delivery_stamp_costs
@@ -636,6 +669,33 @@ impl LXMRouter {
 		} else {
 			None
 		}
+	}
+
+	/// DISPLAY_NAMES.md §4.1: set the Message Display Name at runtime (no
+	/// stack restart). The name is cleaned (§3); returns what will be sent,
+	/// `None` when it cleans to nothing.
+	pub fn set_message_display_name(&mut self, name: Option<&str>) -> Option<String> {
+		self.message_display_name = name.and_then(|n| display_name::clean(n.as_bytes()));
+		self.message_display_name.clone()
+	}
+
+	/// DISPLAY_NAMES.md §2.2: set the Announce Display Name at runtime. The
+	/// name is cleaned with the announce rules (§3; "Anonymous Peer" is
+	/// none), and the app_data of every delivery destination is refreshed at
+	/// once, so the next announce carries it. Returns the stored name.
+	pub fn set_announce_display_name(&mut self, name: Option<&str>) -> Option<String> {
+		self.announce_display_name = name.and_then(|n| display_name::clean_announce(n.as_bytes()));
+		let hashes: Vec<Vec<u8>> = self.delivery_destinations.keys().cloned().collect();
+		for hash in hashes {
+			self.update_delivery_announce_app_data(&hash);
+		}
+		self.announce_display_name.clone()
+	}
+
+	/// DISPLAY_NAMES.md §4.1: decide, once, whether `lxm` carries the Message
+	/// Display Name, and write the decision into its fields.
+	pub fn prepare_display_name(&self, lxm: &mut LXMessage) {
+		self.name_ledger.prepare_outbound(self.message_display_name.as_deref(), lxm, name_ledger::unix_now());
 	}
 
 	pub fn get_propagation_node_announce_metadata(&self) -> Value {
@@ -1191,6 +1251,9 @@ impl LXMRouter {
 				}
 
 				if lxm.state == LXMessage::DELIVERED {
+					// DISPLAY_NAMES.md §4.1: the recipient has the name it carried.
+					self.name_ledger.record_delivered(&lxm, name_ledger::unix_now());
+
 					if lxm.include_ticket {
 						self.available_tickets
 							.last_deliveries
@@ -1755,7 +1818,8 @@ impl LXMRouter {
 					// A proof can still land once the router lets go (a receipt
 					// proved after its timeout counts as delivered): the
 					// message then reports DELIVERED itself.
-					lxm.release_state_reporting(self.message_state_callback.clone());
+					let released = self.released_state_callback(&lxm);
+					lxm.release_state_reporting(released);
 					self.pending_outbound.remove(index);
 				} else {
 					index += 1;
@@ -1891,16 +1955,11 @@ impl LXMRouter {
 				}
 			}
 
-			// Inject sender display name as a per-message field.
-			// This replaces the old behavior of broadcasting it in
-			// the announce app_data — now only message recipients see it.
-			// NEVER REMOVE — see DESIGN_PRINCIPLES.md §9
-			if let Some(name) = self.delivery_display_names.get(&lxm.source_hash) {
-				lxm.set_field(
-					crate::lxmf::FIELD_SENDER_NAME,
-					Value::Binary(name.as_bytes().to_vec()),
-				);
-			}
+			// DISPLAY_NAMES.md §4.1: the Message Display Name, decided once per
+			// message against the name ledger and written into the fields
+			// BEFORE the first pack, so resends and the propagated copy are
+			// byte-identical. The only writer of FIELD_DISPLAY_NAME (0xD1).
+			self.prepare_display_name(&mut lxm);
 
 			// Resolve the Destination object from the hash if needed.
 			// PROPAGATED and OPPORTUNISTIC delivery require the destination
@@ -3236,8 +3295,10 @@ impl LXMRouter {
 		}))); 
 
 		let dest_hash = delivery_destination.hash.clone();
-		if let Some(name) = display_name.clone() {
-			self.delivery_display_names.insert(dest_hash.clone(), name);
+		// DISPLAY_NAMES.md §4.1: the initial Message Display Name. It is never
+		// announced (see get_announce_app_data).
+		if let Some(name) = display_name.as_deref() {
+			self.set_message_display_name(Some(name));
 		}
 		self.delivery_destinations.insert(dest_hash.clone(), delivery_destination.clone());
 		self.set_inbound_stamp_cost(&dest_hash, stamp_cost);
@@ -3451,6 +3512,28 @@ impl LXMRouter {
 	/// new state value (one of `LXMessage::SENT`, `DELIVERED`, `FAILED`, etc.).
 	pub fn register_message_state_callback(&mut self, callback: Arc<dyn Fn(&[u8], u8) + Send + Sync>) {
 		self.message_state_callback = Some(callback);
+	}
+
+	/// The state callback a message keeps once the router lets go of it: the
+	/// app's callback, and — for a message carrying `0xD1` — the name-ledger
+	/// record a late DELIVERED owes (DISPLAY_NAMES.md §4.1: every place that
+	/// sets DELIVERED records it).
+	fn released_state_callback(&self, lxm: &LXMessage) -> Option<Arc<dyn Fn(&[u8], u8) + Send + Sync>> {
+		let app_callback = self.message_state_callback.clone();
+		let Some(record) = name_ledger::delivery_record(lxm) else { return app_callback };
+		if lxm.state == LXMessage::DELIVERED {
+			// Already recorded by the DELIVERED branch; a second proof changes nothing.
+			return app_callback;
+		}
+		let ledger = self.name_ledger.clone();
+		Some(Arc::new(move |hash: &[u8], state: u8| {
+			if state == LXMessage::DELIVERED {
+				ledger.record_delivery(&record, name_ledger::unix_now());
+			}
+			if let Some(callback) = &app_callback {
+				callback(hash, state);
+			}
+		}))
 	}
 
 	/// Fire the message-state callback, if one is registered.
@@ -5538,5 +5621,191 @@ mod tests {
 			!fragment.contains("} else {\n\t\t\t\t\t\t\t// Only acknowledge messages that were successfully processed"),
 			"success-only acknowledgment branch must not be reintroduced"
 		);
+	}
+}
+
+#[cfg(test)]
+mod display_name_router_tests {
+	use super::*;
+	use crate::display_name::{decode_field, NameField};
+
+	fn temp_storage(label: &str) -> String {
+		let mut bytes = [0u8; 8];
+		rand::thread_rng().fill(&mut bytes);
+		std::env::temp_dir()
+			.join(format!("lxmf-router-names-{label}-{}", hexrep(&bytes, false)))
+			.to_string_lossy()
+			.into_owned()
+	}
+
+	fn router(label: &str, message_name: Option<&str>) -> (Arc<Mutex<LXMRouter>>, Destination) {
+		let router = LXMRouter::new(
+			Some(Identity::new(true)), temp_storage(label), None, None, None, None, None,
+			false, false, Vec::new(), None, false, 0, 0, 0, 0, 0, None,
+		)
+		.expect("router");
+		let destination = router
+			.lock()
+			.unwrap()
+			.register_delivery_identity(Identity::new(true), message_name.map(str::to_string), None)
+			.expect("register");
+		(router, destination)
+	}
+
+	fn app_data(items: Vec<Value>) -> Vec<u8> {
+		let mut buf = Vec::new();
+		write_value(&mut buf, &Value::Array(items)).unwrap();
+		buf
+	}
+
+	/// DISPLAY_NAMES.md §2.2 / DESIGN_PRINCIPLES.md §9: the announce carries
+	/// only the Announce Display Name, nil by default — never the Message
+	/// Display Name — and a change reaches the destination's app_data at once.
+	#[test]
+	fn the_announce_carries_only_the_announce_display_name() {
+		let (router, destination) = router("announce", Some("Private Name"));
+		let mut r = router.lock().unwrap();
+		let hash = destination.hash.clone();
+		assert_eq!(r.message_display_name.as_deref(), Some("Private Name"), "register sets the initial message name");
+		assert_eq!(r.get_announce_app_data(&hash), Some(app_data(vec![Value::Nil, Value::Nil])), "nil by default");
+
+		assert_eq!(r.set_announce_display_name(Some("  Alice\u{202e} ")).as_deref(), Some("Alice"));
+		let named = app_data(vec![Value::Binary(b"Alice".to_vec()), Value::Nil]);
+		assert_eq!(r.get_announce_app_data(&hash), Some(named.clone()));
+		assert_eq!(r.delivery_destinations[&hash].default_app_data, Some(named), "app_data refreshed at once");
+
+		assert_eq!(r.set_announce_display_name(Some("anonymous PEER")), None);
+		assert_eq!(r.delivery_destinations[&hash].default_app_data, Some(app_data(vec![Value::Nil, Value::Nil])));
+
+		r.set_inbound_stamp_cost(&hash, Some(8));
+		r.set_announce_display_name(Some("Bob"));
+		assert_eq!(r.get_announce_app_data(&hash), Some(app_data(vec![Value::Binary(b"Bob".to_vec()), Value::Integer(8.into())])));
+		assert_eq!(r.message_display_name.as_deref(), Some("Private Name"), "the two names are independent");
+	}
+
+	/// The auto-announce daemon announces the published entry's app_data:
+	/// a name change must reach it, not only the router's own copy.
+	#[test]
+	fn a_name_change_reaches_the_published_announce() {
+		let (router, destination) = router("published", None);
+		let hash = destination.hash.clone();
+		let published = |hash: &[u8]| {
+			Transport::published_destinations().into_iter().find(|(h, _)| h.as_slice() == hash).map(|(_, p)| p)
+		};
+		let mut r = router.lock().unwrap();
+		r.set_announce_display_name(Some("Alice"));
+		assert!(published(&hash).is_none(), "an unpublished destination is not published by a name change");
+
+		Transport::publish_destination(hash.clone(), Some(Duration::from_secs(1800)), r.get_announce_app_data(&hash));
+		r.set_announce_display_name(Some("Bob"));
+		let entry = published(&hash).expect("still published");
+		assert_eq!(entry.app_data, Some(app_data(vec![Value::Binary(b"Bob".to_vec()), Value::Nil])));
+		assert_eq!(entry.refresh_interval, Some(1800.0), "the refresh interval is kept");
+		r.set_announce_display_name(None);
+		assert_eq!(published(&hash).unwrap().app_data, Some(app_data(vec![Value::Nil, Value::Nil])));
+		Transport::unpublish_destination(&hash);
+	}
+
+	#[test]
+	fn the_message_display_name_setter_cleans_and_clears() {
+		let (router, _) = router("setter", None);
+		let mut r = router.lock().unwrap();
+		assert_eq!(r.message_display_name, None, "none by default");
+		assert_eq!(r.set_message_display_name(Some(" Bob\t\u{200B} ")).as_deref(), Some("Bob"));
+		assert_eq!(r.set_message_display_name(Some("\u{200B}")), None);
+		assert_eq!(r.set_message_display_name(Some("Anonymous Peer")).as_deref(), Some("Anonymous Peer"),
+			"the placeholder rule is for announces only");
+		assert_eq!(r.set_message_display_name(None), None);
+	}
+
+	fn outbound(source: &Destination, recipient: &Identity) -> Arc<Mutex<LXMessage>> {
+		let destination = Destination::new_outbound(
+			Some(recipient.clone()), DestinationType::Single, "lxmf".into(), vec!["delivery".into()],
+		)
+		.unwrap();
+		// PROPAGATED keeps the message in pending_deferred_stamps: handle_outbound
+		// decides and packs it, and nothing is sent.
+		Arc::new(Mutex::new(
+			LXMessage::new(Some(destination), Some(source.clone()), Some(b"hi".to_vec()), None, None,
+				Some(LXMessage::PROPAGATED), None, None, None, false).unwrap(),
+		))
+	}
+
+	/// §4.1: handle_outbound writes the decision before the first pack, so the
+	/// packed payload carries it; the propagated clone has the same hash.
+	#[test]
+	fn handle_outbound_decides_before_packing() {
+		let (router, source) = router("outbound", Some("Alice"));
+		let recipient = Identity::new(true);
+		let message = outbound(&source, &recipient);
+		router.lock().unwrap().handle_outbound(message.clone());
+		let lxm = message.lock().unwrap();
+		assert!(lxm.packed.is_some());
+		assert_eq!(decode_field(&lxm.fields), NameField::Name("Alice".into()));
+		assert_eq!(decode_field(&lxm.payload.as_ref().unwrap()[3]), NameField::Name("Alice".into()), "inside the signed payload");
+
+		// Confirm it, change the name: a fresh decision now differs, the clone must not.
+		router.lock().unwrap().name_ledger.record_delivered(&lxm, name_ledger::unix_now());
+		router.lock().unwrap().set_message_display_name(Some("Alicia"));
+		let clone = Arc::new(Mutex::new(lxm.propagated_copy().unwrap()));
+		drop(lxm);
+		router.lock().unwrap().handle_outbound(clone.clone());
+		let (clone, original) = (clone.lock().unwrap(), message.lock().unwrap());
+		assert_eq!(clone.fields, original.fields);
+		assert_eq!(clone.hash, original.hash);
+
+		// A new message to the same recipient carries the new name.
+		let next = outbound(&source, &recipient);
+		router.lock().unwrap().handle_outbound(next.clone());
+		assert_eq!(decode_field(&next.lock().unwrap().fields), NameField::Name("Alicia".into()));
+	}
+
+	/// §4.1: DELIVERED is recorded where process_outbound sees it…
+	#[test]
+	fn process_outbound_records_a_delivered_name() {
+		let (router, source) = router("delivered", Some("Alice"));
+		let recipient = Identity::new(true);
+		let message = outbound(&source, &recipient);
+		let mut r = router.lock().unwrap();
+		{
+			let mut lxm = message.lock().unwrap();
+			r.prepare_display_name(&mut lxm);
+			lxm.state = LXMessage::DELIVERED;
+		}
+		r.pending_outbound.push(message.clone());
+		r.process_outbound();
+		assert!(r.pending_outbound.is_empty());
+		let lxm = message.lock().unwrap();
+		let row = r.name_ledger.lookup(&lxm.source_hash, &lxm.destination_hash).unwrap().expect("recorded");
+		assert_eq!(row.name_digest, crate::display_name::digest(Some("Alice")).to_vec());
+	}
+
+	/// …and where a proof lands after the router let go of the message.
+	#[test]
+	fn a_late_delivery_records_the_name_and_still_reports_to_the_app() {
+		let (router, source) = router("late", Some("Alice"));
+		let recipient = Identity::new(true);
+		let reports: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+		let seen = reports.clone();
+		let message = outbound(&source, &recipient);
+		let callback = {
+			let mut r = router.lock().unwrap();
+			r.register_message_state_callback(Arc::new(move |_, state| seen.lock().unwrap().push(state)));
+			let mut lxm = message.lock().unwrap();
+			r.prepare_display_name(&mut lxm);
+			lxm.state = LXMessage::FAILED;
+			r.released_state_callback(&lxm).expect("a callback that records")
+		};
+		let lxm = message.lock().unwrap();
+		let r = router.lock().unwrap();
+		assert_eq!(r.name_ledger.lookup(&lxm.source_hash, &lxm.destination_hash).unwrap(), None);
+		callback(&[0u8; 32], LXMessage::DELIVERED);
+		assert!(r.name_ledger.lookup(&lxm.source_hash, &lxm.destination_hash).unwrap().is_some());
+		assert_eq!(*reports.lock().unwrap(), vec![LXMessage::DELIVERED]);
+
+		// A message without 0xD1 keeps the app's callback as it was.
+		let mut plain = outbound(&source, &recipient).lock().unwrap().propagated_copy().unwrap();
+		plain.state = LXMessage::FAILED;
+		assert!(r.released_state_callback(&plain).is_some(), "the app callback");
 	}
 }

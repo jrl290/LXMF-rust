@@ -45,3 +45,10 @@ base64 = "0.22"
 data-encoding = "2.5"
 atty = "0.2"
 ctrlc = "3.4"
+# The display-name ledger (DISPLAY_NAMES.md §4.1). Same version and feature
+# as Reticulum-rust's known destinations store, so every dependent's
+# Cargo.lock keeps a single rusqlite / libsqlite3-sys.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+serde_json = "1.0"

@@ -44,7 +44,7 @@ fn main() -> Result<(), String> {
     let key_value = arg_value_flexible(&args, "--key")
         .unwrap_or_else(|| DEFAULT_KEY.to_string());
 
-    // --name: display name announced on the network
+    // --name: the Message Display Name (sent inside messages, never announced)
     let display_name = arg_value_flexible(&args, "--name")
         .unwrap_or_else(|| "Rust Receiver".to_string());
 

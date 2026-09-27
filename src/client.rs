@@ -31,7 +31,9 @@ pub struct ClientConfig {
     /// Create a new identity if the file doesn't exist.
     pub create_identity: bool,
 
-    /// Display name announced on the network (empty = anonymous).
+    /// The initial Message Display Name (DISPLAY_NAMES.md §4.1): sent inside
+    /// messages, never announced. Empty = none. The Announce Display Name
+    /// starts empty; see `LxmfClient::set_announce_display_name`.
     pub display_name: String,
 
     /// Log level (0–7, or -1 for default).
@@ -124,6 +126,18 @@ impl LxmfClient {
             dest_handle,
             dest_hash,
         })
+    }
+
+    /// DISPLAY_NAMES.md §4.1: change the Message Display Name at runtime.
+    /// Returns the cleaned name that will be sent (`None` for none).
+    pub fn set_message_display_name(&self, name: Option<&str>) -> Result<Option<String>, String> {
+        lxmf::router_set_message_display_name(self.router_handle, name)
+    }
+
+    /// DISPLAY_NAMES.md §2.2: change the Announce Display Name at runtime;
+    /// the next announce carries it. Returns the cleaned name (`None` for none).
+    pub fn set_announce_display_name(&self, name: Option<&str>) -> Result<Option<String>, String> {
+        lxmf::router_set_announce_display_name(self.router_handle, name)
     }
 
     /// Convenience: the 16-byte identity hash (delegated to ReticulumClient).
@@ -268,10 +282,15 @@ impl LxmfClient {
     /// interface to that period (30 min without one). The application's
     /// own announces are never held (Reticulum-rust PARITY-AUDIT B22).
     pub fn publish(&self, refresh_secs: f64) -> Result<(), String> {
+        // The router's announce app_data (name and stamp cost), which it keeps
+        // current in the published entry when either changes.
+        let router: std::sync::Arc<std::sync::Mutex<crate::lxm_router::LXMRouter>> =
+            reticulum_rust::ffi::get_handle(self.router_handle).ok_or_else(|| "invalid router handle".to_string())?;
+        let app_data = router.lock().map_err(|e| e.to_string())?.get_announce_app_data(&self.dest_hash);
         reticulum_rust::ffi::transport_publish_destination(
             &self.dest_hash,
             refresh_secs,
-            None,
+            app_data.as_deref(),
         );
         Ok(())
     }

@@ -19,7 +19,15 @@ pub const FIELD_TICKET: u8 = 0x0C;
 pub const FIELD_EVENT: u8 = 0x0D;
 pub const FIELD_RNR_REFS: u8 = 0x0E;
 pub const FIELD_RENDERER: u8 = 0x0F;
-pub const FIELD_SENDER_NAME: u8 = 0x10;   // sender display name (UTF-8 bytes) — per-message, not broadcast
+// 0x10 (the old FIELD_SENDER_NAME) is retired: no Retichat client sends or
+// reads it (DISPLAY_NAMES.md §2.1). MeshChatX uses field 16 for its app
+// extensions and Columba reads it as legacy reactions.
+
+/// DISPLAY_NAMES.md §2.1: the LXMF source's display name, cleaned UTF-8 as
+/// msgpack bin (receivers accept bin or str). Empty means "no name now".
+/// Only the router writes it (`LXMRouter::handle_outbound`); decode it with
+/// `crate::display_name::decode_field`.
+pub const FIELD_DISPLAY_NAME: u8 = 0xD1;
 
 pub const FIELD_CUSTOM_TYPE: u8 = 0xFB;
 pub const FIELD_CUSTOM_DATA: u8 = 0xFC;
@@ -166,24 +174,6 @@ pub fn stamp_cost_from_app_data(app_data: Option<&[u8]>) -> Option<i64> {
 		None
 	} else {
 		None
-	}
-}
-
-/// Extract the sender's display name from LXMF message fields.
-/// This is the preferred source — per-message, not broadcast.
-/// Use this instead of `display_name_from_app_data` for privacy-preserving
-/// name resolution.
-pub fn sender_name_from_fields(fields: &Value) -> Option<String> {
-	match fields {
-		Value::Map(entries) => {
-			for (key, value) in entries.iter() {
-				if value_key_matches(key, FIELD_SENDER_NAME) {
-					return value_to_utf8(value);
-				}
-			}
-			None
-		}
-		_ => None,
 	}
 }
 

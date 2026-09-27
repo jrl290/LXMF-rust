@@ -112,6 +112,10 @@ pub fn router_create(
 
 /// Register an identity for receiving messages.
 ///
+/// `display_name` is the initial Message Display Name (DISPLAY_NAMES.md
+/// §4.1): sent inside messages by the name-ledger rule, never announced.
+/// The Announce Display Name starts empty (`router_set_announce_display_name`).
+///
 /// Returns a handle to the `Destination` that was created (the delivery
 /// destination hash, useful for announcing).
 pub fn router_register_delivery(
@@ -131,6 +135,38 @@ pub fn router_register_delivery(
         .register_delivery_identity(id, display_name.map(|s| s.to_string()), stamp_cost)?;
 
     Ok(store_handle(dest))
+}
+
+/// DISPLAY_NAMES.md §4.1: set the router's Message Display Name at runtime.
+/// `None` or a name that cleans to nothing clears it. Returns the cleaned name.
+pub fn router_set_message_display_name(router_handle: u64, name: Option<&str>) -> Result<Option<String>, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let stored = router.lock().map_err(|e| e.to_string())?.set_message_display_name(name);
+    Ok(stored)
+}
+
+/// DISPLAY_NAMES.md §2.2: set the router's Announce Display Name at runtime
+/// and refresh every delivery destination's announce app_data. Returns the
+/// cleaned name (`None` for none, including "Anonymous Peer").
+pub fn router_set_announce_display_name(router_handle: u64, name: Option<&str>) -> Result<Option<String>, String> {
+    let router: Arc<Mutex<LXMRouter>> = get_handle(router_handle)
+        .ok_or_else(|| "invalid router handle".to_string())?;
+    let stored = router.lock().map_err(|e| e.to_string())?.set_announce_display_name(name);
+    Ok(stored)
+}
+
+/// Put `dest_hash` in Transport's auto-announce set (see
+/// `reticulum_rust::ffi::transport_publish_destination`). When it is a delivery
+/// destination of the process's LXMF router, the published announces carry
+/// the router's app_data — `[announce_name | nil, stamp_cost]` — which the
+/// router keeps current when the Announce Display Name or the stamp cost
+/// changes (DISPLAY_NAMES.md §2.2). Any other destination is published with
+/// its own configured app_data, as before.
+pub fn publish_destination(dest_hash: &[u8], refresh_secs: f64) {
+    let app_data = crate::lxm_router::global_router()
+        .and_then(|router| router.lock().ok().and_then(|r| r.get_announce_app_data(dest_hash)));
+    reticulum_rust::ffi::transport_publish_destination(dest_hash, refresh_secs, app_data.as_deref());
 }
 
 /// Register a callback that fires when an inbound message is fully received.
@@ -177,8 +213,9 @@ pub fn router_set_sync_complete_callback(
 
 /// Register a callback that fires when a delivery announce is received.
 ///
-/// The callback receives the 16-byte destination hash and an optional
-/// display name string extracted from the announce `app_data`.
+/// The callback receives the 16-byte destination hash and the announce's
+/// display name (DISPLAY_NAMES.md §5.1 `announceName`: cleaned, "Anonymous
+/// Peer" and no name both `None`).
 pub fn router_set_announce_callback(
     router_handle: u64,
     callback: Arc<dyn Fn(&[u8], Option<String>) + Send + Sync>,
@@ -378,6 +415,13 @@ pub fn message_add_attachment(
         .map_err(|e| e.to_string())?
         .add_file_attachment(filename, data.to_vec());
     Ok(())
+}
+
+/// An LXMF field key from a host integer. Keys are one byte: anything
+/// outside 0..=255 is an error, never truncated (a truncated 0x1D1 would
+/// alias 0xD1, FIELD_DISPLAY_NAME).
+pub fn field_key(key: i64) -> Result<u8, String> {
+    u8::try_from(key).map_err(|_| format!("LXMF field key {key} is outside 0..=255"))
 }
 
 /// Add a string-valued field to an outbound message.
@@ -1067,5 +1111,22 @@ mod tests {
 
         destroy_handle(h1);
         destroy_handle(h2);
+    }
+}
+
+#[cfg(test)]
+mod field_key_tests {
+    use super::field_key;
+
+    /// A host key above 0xFF must never alias a one-byte key.
+    #[test]
+    fn keys_outside_one_byte_are_rejected_not_truncated() {
+        assert_eq!(field_key(0), Ok(0));
+        assert_eq!(field_key(0xD1), Ok(0xD1));
+        assert_eq!(field_key(0xFF), Ok(0xFF));
+        assert!(field_key(0x1D1).is_err(), "0x1D1 must not become 0xD1");
+        assert!(field_key(0x100).is_err());
+        assert!(field_key(-1).is_err());
+        assert!(field_key(-47).is_err(), "-47 as u8 is 0xD1");
     }
 }

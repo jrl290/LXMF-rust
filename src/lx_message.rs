@@ -83,6 +83,12 @@ pub struct LXMessage {
 	/// Cleared when the message transitions to a new send attempt.
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) violation_reported: bool,
+	/// DISPLAY_NAMES.md §4.1: the router has decided whether this message
+	/// carries `FIELD_DISPLAY_NAME` and written the decision into `fields`.
+	/// Set once, in `LXMRouter::handle_outbound`, before the first pack; a
+	/// resend or a `propagated_copy` keeps the decision, so every copy of the
+	/// message has the same fields and the same hash.
+	pub display_name_decided: bool,
 	pub transport_encrypted: bool,
 	pub transport_encryption: Option<String>,
 	pub packet_representation: Option<Packet>,
@@ -259,6 +265,7 @@ impl LXMessage {
 			receipt_timed_out: false,
 			needs_prop_fallback: false,
 			violation_reported: false,
+			display_name_decided: false,
 			transport_encrypted: false,
 			transport_encryption: None,
 			packet_representation: None,
@@ -296,6 +303,7 @@ impl LXMessage {
 		)?;
 		copy.timestamp = self.timestamp;
 		copy.outbound_ticket = self.outbound_ticket.clone();
+		copy.display_name_decided = self.display_name_decided;
 		Ok(copy)
 	}
 
@@ -355,6 +363,13 @@ impl LXMessage {
 				return;
 			}
 			entries.push((key_value, value));
+		}
+	}
+
+	/// Remove every entry whose key is the integer `key`.
+	pub fn remove_field(&mut self, key: u8) {
+		if let Value::Map(entries) = &mut self.fields {
+			entries.retain(|(k, _)| !crate::display_name::key_is(k, key));
 		}
 	}
 

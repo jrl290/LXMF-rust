@@ -1,0 +1,505 @@
+{
+  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (field 0xD1), 4.1 (digest)",
+  "notes": [
+    "input_hex / fields_msgpack_hex are raw bytes as lowercase hex.",
+    "expected is the cleaned name as a JSON string, or null for None.",
+    "clean_announce applies clean() and then maps 'Anonymous Peer' (ASCII case-insensitive) to None.",
+    "decode_field: state is absent | clear | name; name is set only for state name.",
+    "digest_hex is the first 16 bytes of SHA-256 over the UTF-8 of input.",
+    "Interpretation of rule 5: after truncation, trailing U+0020 and U+200D are stripped repeatedly (see the 'trailing' vectors).",
+    "Order of rules 2 and 3: U+0085 is White_Space, so rule 2 turns it into a space before rule 3 could remove it as C1."
+  ],
+  "clean": [
+    {
+      "name": "invalid: lone 0xff",
+      "input_hex": "ff",
+      "expected": null
+    },
+    {
+      "name": "invalid: truncated two-byte sequence",
+      "input_hex": "c3",
+      "expected": null
+    },
+    {
+      "name": "invalid: bad continuation",
+      "input_hex": "c328",
+      "expected": null
+    },
+    {
+      "name": "invalid: overlong slash",
+      "input_hex": "c0af",
+      "expected": null
+    },
+    {
+      "name": "invalid: encoded surrogate",
+      "input_hex": "eda080",
+      "expected": null
+    },
+    {
+      "name": "invalid: valid prefix then 0xfe",
+      "input_hex": "416c696365fe",
+      "expected": null
+    },
+    {
+      "name": "plain ascii",
+      "input_hex": "416c696365",
+      "expected": "Alice"
+    },
+    {
+      "name": "non-latin script",
+      "input_hex": "d090d0bbd0b8d181d0b0",
+      "expected": "\u0410\u043b\u0438\u0441\u0430"
+    },
+    {
+      "name": "cjk",
+      "input_hex": "e5b08fe6988e",
+      "expected": "\u5c0f\u660e"
+    },
+    {
+      "name": "tab becomes space",
+      "input_hex": "416c69636509426f62",
+      "expected": "Alice Bob"
+    },
+    {
+      "name": "lf and cr become space then trim",
+      "input_hex": "0a416c6963650d0a",
+      "expected": "Alice"
+    },
+    {
+      "name": "vertical tab and form feed",
+      "input_hex": "410b420c43",
+      "expected": "A B C"
+    },
+    {
+      "name": "no-break space",
+      "input_hex": "416c696365c2a0426f62",
+      "expected": "Alice Bob"
+    },
+    {
+      "name": "next line U+0085 is White_Space, not removed",
+      "input_hex": "416c696365c285426f62",
+      "expected": "Alice Bob"
+    },
+    {
+      "name": "ogham space mark",
+      "input_hex": "41e19a8042",
+      "expected": "A B"
+    },
+    {
+      "name": "en quad to hair space",
+      "input_hex": "41e2808042e2808a43",
+      "expected": "A B C"
+    },
+    {
+      "name": "line and paragraph separators",
+      "input_hex": "41e280a842e280a943",
+      "expected": "A B C"
+    },
+    {
+      "name": "narrow nbsp, medium math space, ideographic space",
+      "input_hex": "41e280af42e2819f43e3808044",
+      "expected": "A B C D"
+    },
+    {
+      "name": "nul removed",
+      "input_hex": "416c69006365",
+      "expected": "Alice"
+    },
+    {
+      "name": "C0 control U+001B removed",
+      "input_hex": "416c691b6365",
+      "expected": "Alice"
+    },
+    {
+      "name": "C0 U+001F removed (not White_Space)",
+      "input_hex": "416c691f6365",
+      "expected": "Alice"
+    },
+    {
+      "name": "delete removed",
+      "input_hex": "416c697f6365",
+      "expected": "Alice"
+    },
+    {
+      "name": "C1 U+0080 removed",
+      "input_hex": "416c69c2806365",
+      "expected": "Alice"
+    },
+    {
+      "name": "C1 U+009F removed",
+      "input_hex": "416c69c29f6365",
+      "expected": "Alice"
+    },
+    {
+      "name": "bidi embeddings and overrides removed",
+      "input_hex": "e280aa41e280ab6ce280ac69e280ad63e280ae65",
+      "expected": "Alice"
+    },
+    {
+      "name": "bidi isolates removed",
+      "input_hex": "e281a641e281a76ce281a869e281a96365",
+      "expected": "Alice"
+    },
+    {
+      "name": "right-to-left override spoof removed",
+      "input_hex": "6576696ce280ae67706a2e657865",
+      "expected": "evilgpj.exe"
+    },
+    {
+      "name": "zero width space removed",
+      "input_hex": "416ce2808b696365",
+      "expected": "Alice"
+    },
+    {
+      "name": "lrm and rlm removed",
+      "input_hex": "e2808e416c696365e2808f",
+      "expected": "Alice"
+    },
+    {
+      "name": "word joiner removed",
+      "input_hex": "416c69e281a06365",
+      "expected": "Alice"
+    },
+    {
+      "name": "bom removed",
+      "input_hex": "efbbbf416c696365",
+      "expected": "Alice"
+    },
+    {
+      "name": "zwnj kept",
+      "input_hex": "61e2808c62",
+      "expected": "a\u200cb"
+    },
+    {
+      "name": "zwj kept inside a name",
+      "input_hex": "61e2808d62",
+      "expected": "a\u200db"
+    },
+    {
+      "name": "leading zwj kept",
+      "input_hex": "e2808d416c696365",
+      "expected": "\u200dAlice"
+    },
+    {
+      "name": "emoji zwj family kept whole",
+      "input_hex": "f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6",
+      "expected": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66"
+    },
+    {
+      "name": "emoji zwj rainbow flag kept (U+FE0F is not removed)",
+      "input_hex": "f09f8fb3efb88fe2808df09f8c88",
+      "expected": "\ud83c\udff3\ufe0f\u200d\ud83c\udf08"
+    },
+    {
+      "name": "emoji with skin tone kept",
+      "input_hex": "426f6220f09f918bf09f8fbd",
+      "expected": "Bob \ud83d\udc4b\ud83c\udffd"
+    },
+    {
+      "name": "collapse and trim",
+      "input_hex": "2020416c69636520202020426f622020",
+      "expected": "Alice Bob"
+    },
+    {
+      "name": "removal before collapse",
+      "input_hex": "6120e2808b2062",
+      "expected": "a b"
+    },
+    {
+      "name": "mixed whitespace collapses to one space",
+      "input_hex": "610920c2a0e3808062",
+      "expected": "a b"
+    },
+    {
+      "name": "64 scalars kept",
+      "input_hex": "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "70 scalars truncated to 64",
+      "input_hex": "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "truncation counts scalars not bytes",
+      "input_hex": "c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9",
+      "expected": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+    },
+    {
+      "name": "combining marks count as scalars",
+      "input_hex": "65cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc8165cc81",
+      "expected": "e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301"
+    },
+    {
+      "name": "truncation after collapse (spaces collapsed first)",
+      "input_hex": "6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612020202020202020202062",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa b"
+    },
+    {
+      "name": "space at the cut is trimmed",
+      "input_hex": "616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161206263",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "zwj sequence ending exactly at 64 kept",
+      "input_hex": "616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66"
+    },
+    {
+      "name": "cut right after a zwj drops the zwj",
+      "input_hex": "6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ud83d\udc68"
+    },
+    {
+      "name": "trailing zwj dropped without truncation",
+      "input_hex": "416c696365e2808d",
+      "expected": "Alice"
+    },
+    {
+      "name": "trailing space then zwj both dropped",
+      "input_hex": "416c69636520e2808d",
+      "expected": "Alice"
+    },
+    {
+      "name": "trailing zwj, space, zwj all dropped",
+      "input_hex": "416c696365e2808d20e2808d",
+      "expected": "Alice"
+    },
+    {
+      "name": "empty",
+      "input_hex": "",
+      "expected": null
+    },
+    {
+      "name": "spaces only",
+      "input_hex": "202020",
+      "expected": null
+    },
+    {
+      "name": "whitespace only",
+      "input_hex": "090d0ae38080",
+      "expected": null
+    },
+    {
+      "name": "removed characters only",
+      "input_hex": "e2808be2808eefbbbf",
+      "expected": null
+    },
+    {
+      "name": "nul only",
+      "input_hex": "00",
+      "expected": null
+    },
+    {
+      "name": "zwj only",
+      "input_hex": "e2808d",
+      "expected": null
+    },
+    {
+      "name": "zwnj only is not empty",
+      "input_hex": "e2808c",
+      "expected": "\u200c"
+    },
+    {
+      "name": "placeholder is an ordinary message name",
+      "input_hex": "416e6f6e796d6f75732050656572",
+      "expected": "Anonymous Peer"
+    }
+  ],
+  "clean_announce": [
+    {
+      "name": "plain",
+      "input_hex": "416c696365",
+      "expected": "Alice"
+    },
+    {
+      "name": "anonymous peer is none",
+      "input_hex": "416e6f6e796d6f75732050656572",
+      "expected": null
+    },
+    {
+      "name": "anonymous peer lowercase",
+      "input_hex": "616e6f6e796d6f75732070656572",
+      "expected": null
+    },
+    {
+      "name": "anonymous peer uppercase",
+      "input_hex": "414e4f4e594d4f55532050454552",
+      "expected": null
+    },
+    {
+      "name": "anonymous peer after cleaning",
+      "input_hex": "2020416e6f6e796d6f757309e2808b205065657220e2808d",
+      "expected": null
+    },
+    {
+      "name": "anonymous peers is a name",
+      "input_hex": "416e6f6e796d6f7573205065657273",
+      "expected": "Anonymous Peers"
+    },
+    {
+      "name": "anonymous alone is a name",
+      "input_hex": "416e6f6e796d6f7573",
+      "expected": "Anonymous"
+    },
+    {
+      "name": "invalid utf-8",
+      "input_hex": "ff",
+      "expected": null
+    },
+    {
+      "name": "empty",
+      "input_hex": "",
+      "expected": null
+    },
+    {
+      "name": "cleaned like a message name",
+      "input_hex": "2020416c696365e280ae2020426f6220",
+      "expected": "Alice Bob"
+    }
+  ],
+  "decode_field": [
+    {
+      "name": "empty map",
+      "fields_msgpack_hex": "80",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "not a map (nil)",
+      "fields_msgpack_hex": "c0",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "not a map (array)",
+      "fields_msgpack_hex": "90",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "bin name",
+      "fields_msgpack_hex": "81ccd1c405416c696365",
+      "state": "name",
+      "display_name": "Alice"
+    },
+    {
+      "name": "str name",
+      "fields_msgpack_hex": "81ccd1a5416c696365",
+      "state": "name",
+      "display_name": "Alice"
+    },
+    {
+      "name": "bin name is cleaned",
+      "fields_msgpack_hex": "81ccd1c40720416c69636520",
+      "state": "name",
+      "display_name": "Alice"
+    },
+    {
+      "name": "empty bin is clear",
+      "fields_msgpack_hex": "81ccd1c400",
+      "state": "clear",
+      "display_name": null
+    },
+    {
+      "name": "empty str is clear",
+      "fields_msgpack_hex": "81ccd1a0",
+      "state": "clear",
+      "display_name": null
+    },
+    {
+      "name": "nil is absent",
+      "fields_msgpack_hex": "81ccd1c0",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "int is absent",
+      "fields_msgpack_hex": "81ccd105",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "array is absent",
+      "fields_msgpack_hex": "81ccd191a141",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "map is absent",
+      "fields_msgpack_hex": "81ccd180",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "bool is absent",
+      "fields_msgpack_hex": "81ccd1c3",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "non-empty value cleaning to nothing is absent",
+      "fields_msgpack_hex": "81ccd1c403e2808b",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "whitespace-only value is absent, not clear",
+      "fields_msgpack_hex": "81ccd1a120",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "invalid utf-8 is absent",
+      "fields_msgpack_hex": "81ccd1c401ff",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "retired 0x10 is ignored",
+      "fields_msgpack_hex": "8110c405416c696365",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "key 0xD1 as uint16 matches",
+      "fields_msgpack_hex": "81cd00d1c40141",
+      "state": "name",
+      "display_name": "A"
+    },
+    {
+      "name": "key as string does not match",
+      "fields_msgpack_hex": "81a3323039c40141",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "other fields alongside",
+      "fields_msgpack_hex": "820cc0ccd1c403426f62",
+      "state": "name",
+      "display_name": "Bob"
+    }
+  ],
+  "digest": [
+    {
+      "name": "empty name",
+      "input": "",
+      "digest_hex": "e3b0c44298fc1c149afbf4c8996fb924"
+    },
+    {
+      "name": "ascii",
+      "input": "Alice",
+      "digest_hex": "3bc51062973c458d5a6f2d8d64a02324"
+    },
+    {
+      "name": "non-ascii",
+      "input": "\u0410\u043b\u0438\u0441\u0430 \ud83d\udc4b",
+      "digest_hex": "992faf024ad5b659a73fc6f644331e1c"
+    },
+    {
+      "name": "zwj family",
+      "input": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66",
+      "digest_hex": "32b7d42dae221e37043eef14ee3525ad"
+    }
+  ]
+}
