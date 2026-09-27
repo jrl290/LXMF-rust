@@ -239,9 +239,19 @@ notifications. No surface stores a resolved name in message text; system
 messages keep the hash and resolve it when shown.
 
 - Contact: `localName ?? messageName ?? announceName ?? legacyName ?? shortHash`.
-- Channel post: `channelName ?? localName ?? messageName ?? announceName ?? legacyName ?? shortHash`.
-  When the label comes from `channelName`, the 8-hex short hash is shown next to
-  it as secondary text. Channel names are public and anyone can pick any name.
+- Channel post: a main label and an optional secondary (grey) text. Channel
+  names are public and anyone can pick any name, so a channel name never stands
+  alone:
+
+  | The poster has | Main label | Secondary |
+  |---|---|---|
+  | a `channelName` and a `localName` | `localName` | `channelName` |
+  | a `channelName`, no `localName` | `channelName` | `shortHash` |
+  | no `channelName` | `localName ?? messageName ?? announceName ?? legacyName ?? shortHash` | none |
+
+  (James, 2026-09-27: the user's own name for someone is the name they know them
+  by; the channel name moves to the grey spot.) Notifications for channel posts
+  use the main label.
 - `shortHash` is the first 8 hex characters followed by `…` on every client.
 
 ### 5.4 Migrating existing data
