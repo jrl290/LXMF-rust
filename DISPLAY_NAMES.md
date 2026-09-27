@@ -313,8 +313,13 @@ migration (§5.4), and Retichat-js's own clean (§3) and channel codec.
 
 ### Python reference
 
-`LXMF-master` (local modification, not in git): `LXMF.FIELD_DISPLAY_NAME`,
-`display_name_from_fields` (bin or str; no cleaning, no signature rules);
-`LXMRouter.register_delivery_identity(..., announce_name=None)` and
-`get_announce_app_data` announce only `announce_name`; `handle_outbound`
-writes the Message Display Name as bin on every message (no ledger).
+`LXMF-master` (local modification, not in git): `LXMF.FIELD_DISPLAY_NAME`;
+`clean_display_name` / `clean_announce_name`, a mirror of §3 run against the
+shared vectors; `display_name_from_fields` (bin or str, raw: no cleaning, no
+signature rules); `LXMRouter.register_delivery_identity(..., announce_name=None)`
+and `get_announce_app_data` announce only the cleaned `announce_name`
+("Anonymous Peer" as nil); `handle_outbound` calls
+`apply_message_display_name`, which writes the cleaned Message Display Name as
+bin on every message (no ledger, so an unset name sends nothing rather than a
+clear). `lxmd` has no default `display_name`, and treats the old template's
+"Anonymous Peer" as unset. Tests: `LXMF-master/tests/test_display_names.py`.
