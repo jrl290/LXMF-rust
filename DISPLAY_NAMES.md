@@ -16,8 +16,8 @@ differently. This document is the single contract all clients implement.
 | Name | Carried in | Who can read it | Empty means |
 |---|---|---|---|
 | Announce Display Name | the `lxmf.delivery` announce (device and distro) | the whole network, including Sideband, MeshChat, NomadNet, Columba | the announce carries `nil`: anonymous to other apps |
-| Message Display Name | field `0xD1` of LXMF messages (DMs, group messages, group control) | the people you message | no name is sent |
-| Channel Display Name | field `0xD1` of the LXMF message inside an RFed channel post | anyone who can read that channel | posts carry no name. It never falls back to the Message Display Name |
+| Message Display Name | key 0 of the Retichat field `0xD1` in LXMF messages (DMs, group messages, group control) | the people you message | no name is sent |
+| Channel Display Name | key 0 of the Retichat field `0xD1` in the LXMF message inside an RFed channel post | anyone who can read that channel | posts carry no name. It never falls back to the Message Display Name |
 
 The three are independent. None defaults to another. There is no placeholder
 name ("Retichat", "Retichat Web"): unset means unset.
@@ -28,21 +28,33 @@ labelled as public.
 
 ## 2. Wire format
 
-### 2.1 Field 0xD1: `FIELD_DISPLAY_NAME`
+### 2.1 The Retichat field 0xD1 and its name entry
 
-- Key: the integer `0xD1` (msgpack `0xCC 0xD1`). Chosen next to `0xD0`
-  (`SF_RFED_DISTRO`, the distro announce flag). Upstream LXMF (1.2.0),
-  MeshChatX and Columba do not use it.
+Retichat owns **one** LXMF field number, `0xD1` (`FIELD_RETICHAT`, msgpack
+`0xCC 0xD1`), chosen next to `0xD0` (`SF_RFED_DISTRO`, the distro announce
+flag). Upstream LXMF (1.2.0), MeshChatX and Columba do not use it. Its value is
+a msgpack **map** whose keys are small non-negative integers (one byte each on
+the wire); section 10 lists them. Everything Retichat-specific that is not a
+distro marker lives there (distro markers use upstream's generic
+`FIELD_CUSTOM_*` slots, which take no field number of ours). A `0xD1` that is
+not a map is ignored whole; unknown keys inside it are ignored. A message with
+no Retichat entries carries no `0xD1` at all.
+
+The display name is **key 0** (`RF_DISPLAY_NAME`):
+
 - Value: the cleaned name (section 3) as UTF-8 bytes, msgpack **bin**.
   Receivers accept **bin or str**; any other type (map, array, int, nil) is
   treated as absent.
 - An empty value (zero-length bin or str) means "I have no name now": the
   receiver clears the name it holds for that sender (subject to section 5.2).
-- `0xD1` always names the LXMF **source** of the message that carries it (the
-  identity that signed it). It never names `GROUP_SENDER` (0xA4) or anyone else.
+- Key 0 always names the LXMF **source** of the message that carries it (the
+  identity that signed it). It never names the group sender (key 5 / 0xA4) or
+  anyone else.
 - `0x10` is retired: no Retichat client sends or reads it. MeshChatX uses field
   16 for its "app extensions" dict and Columba reads 0x10 as legacy reactions.
   No transition period.
+
+Elsewhere in this document "`0xD1`" as a name means key 0 of this field.
 
 ### 2.2 Announce
 
@@ -60,7 +72,8 @@ labelled as public.
 
 The LXMF message inside the channel envelope carries a fields map. When the
 channel rule (section 4.2) says to include the name, the map holds
-`{0xD1: <Channel Display Name or empty>}`; otherwise the message has no `0xD1`.
+`{0xD1: {0: <Channel Display Name or empty>}}`; otherwise the message has no
+`0xD1`.
 Nothing else about the envelope changes.
 
 **Key binding (required).** Channel unpack must check, before remembering any
@@ -109,7 +122,10 @@ Decoding `0xD1` yields one of three states:
 
 ### 4.1 Messages (DMs, groups, group control): the name ledger
 
-The router adds `0xD1`. Apps never set it themselves.
+The router writes key 0 of the Retichat field. Apps never set key 0; they may
+put other entries in the field (section 10), and the router merges key 0 into
+that map (adding or removing only key 0, and dropping the field when the map
+ends up empty).
 
 - The router holds one `message_display_name` (cleaned, or none), set at start
   and changed at runtime through a setter. No stack restart.
@@ -452,3 +468,46 @@ and `get_announce_app_data` announce only the cleaned `announce_name`
 bin on every message (no ledger, so an unset name sends nothing rather than a
 clear). `lxmd` has no default `display_name`, and treats the old template's
 "Anonymous Peer" as unset. Tests: `LXMF-master/tests/test_display_names.py`.
+
+## 10. The Retichat field: all keys, and the group transition
+
+Agreed 2026-09-27 (James): Retichat takes one field number instead of ten.
+Before this, groups used nine top-level fields `0xA0`–`0xA8`. Field numbers
+above `0x7F` cost two bytes each in msgpack while keys 0–127 inside a map cost
+one, so the map costs three bytes (field number plus header) and saves one per
+entry: it is no larger from three entries up.
+
+| Key | Name | Value | Was |
+|---|---|---|---|
+| 0 | `RF_DISPLAY_NAME` | bin or str, section 2.1 | (new) |
+| 1 | `RF_GROUP_ID` | str: 32-hex group id | `0xA0` |
+| 2 | `RF_GROUP_MEMBERS` | str: comma-separated hex hashes of all members (invite only) | `0xA1` |
+| 3 | `RF_GROUP_NAME` | str: group name | `0xA2` |
+| 4 | `RF_GROUP_ACTION` | str: `invite`, `accept`, `leave`, `relay_req`, `relay_done` | `0xA3` |
+| 5 | `RF_GROUP_SENDER` | str: original sender hex | `0xA4` |
+| 6 | `RF_GROUP_RELAY_SEEN` | str: comma-separated hashes already delivered to | `0xA5` |
+| 7 | `RF_GROUP_RELAY_FOR` | str: hash of the member being relayed for | `0xA6` |
+| 8 | `RF_GROUP_RELAY_DONE` | bool: relay-complete signal | `0xA7` |
+| 9 | `RF_GROUP_MEMBER_KEYS` | str: one `hash:base64-public-key` pair per invite chunk | `0xA8` |
+
+Each value keeps exactly the type it had as a top-level field, so the group
+logic itself is unchanged. Group semantics are RFed-spec `Group.md`.
+
+**Transition (group entries only; the name was never sent anywhere else):**
+
+- **Readers, now:** take each group entry from the Retichat field when present
+  there, otherwise from its old top-level field. A message may carry either
+  form.
+- **Senders, now:** keep writing group entries to `0xA0`–`0xA8`, because
+  released apps read only those. One constant per client selects the form:
+  `GROUP_ENTRIES_IN_RETICHAT_FIELD = false` (Rust/Kotlin/JS; the Swift
+  equivalent `groupEntriesInRetichatField`). Both forms are tested.
+- **The switch, around 2026-10-26**, together with the proof re-enable
+  (`DELIVERY_PACKET_PROOF = Required`), once most devices run a build that
+  reads both: set the constant to `true` in every client. Group entries then
+  go only into the Retichat field and `0xA0`–`0xA8` are free again. Readers keep
+  accepting the old numbers until a later release removes them.
+
+Released builds from before this change skip an unknown map at `0xD1` (the iOS
+decoder's `skipValue` handles maps; Android's decoder reads nested maps), so
+the name entry is harmless to them.
