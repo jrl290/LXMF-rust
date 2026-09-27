@@ -319,6 +319,28 @@ Apps: Retichat-ios `de38780`, `8e9c8d4`, `fe5f70b`; Retichat-android
 `9a39c12` to `59a9c67`; Retichat-js `9c9757a` to `9e991f1`. Checked against
 the code in the consistency pass of 2026-09-27.
 
+The one Retichat field (§2.1 map, §10): LXMF-rust `f4d0123`, `ec54084`,
+`975854d`; Retichat-ios `097b148` (FFI setters), `d1fcff4`, `8ffcd00`;
+Retichat-android `e7e69fd` (JNI setters), `98f28b1`; Retichat-js `d713728`.
+Cross-client pass of 2026-09-27: 3,007 random fields maps (both forms,
+conflicting values, wrong types, every integer width, str and negative keys,
+non-map `0xD1`) and 4,398 encoder outputs were read identically by the Rust,
+Swift, Kotlin, JS and Python readers; the Rust, Swift-via-FFI, Kotlin-via-JNI,
+JS and Python writers produced identical bytes in both forms.
+
+Every client holds the same switch constant, `false` until the switch (§10):
+LXMF-rust `retichat_field::GROUP_ENTRIES_IN_RETICHAT_FIELD`, Swift
+`RetichatField.groupEntriesInRetichatField`, Kotlin
+`LxmfFields.GROUP_ENTRIES_IN_RETICHAT_FIELD`, JS
+`GROUP_ENTRIES_IN_RETICHAT_FIELD` (`lib/retichat_field.js`), Python
+`LXMF.GROUP_ENTRIES_IN_RETICHAT_FIELD`. Each client has a test that pins it
+false, which is flipped with it. The Swift test also reads the Rust constant
+from source, so the two change together. Every client runs the shared
+vectors `LXMF-rust/tests/retichat_field_vectors.json`: Rust
+`tests/retichat_field_vectors.rs`, Swift `tests/RetichatFieldTests.swift`,
+Kotlin `bridge/RetichatFieldVectorsTest`, JS `retichat_field.test.mjs`, Python
+`tests/test_display_names.py`.
+
 ### Shared Rust (LXMF-rust, used by iOS and Android)
 
 - Field and cleaning (§2.1, §3): `lxmf::FIELD_RETICHAT` (0xD1) and the
@@ -349,13 +371,23 @@ the code in the consistency pass of 2026-09-27.
   `channel::lxmf_delivery_hash_for_public_key` before remembering the key
   (the check §2.3 attributes to `retichat_identity_remember_lxmf_delivery`)
   and reports the name only when the signature validated.
+- Retichat field writes (§10): `LXMessage::set_retichat_entry` /
+  `remove_retichat_entry`; the app setters `ffi::message_set_retichat_string`
+  / `_bool` (C `lxmf_message_set_retichat_string` / `_bool`), which take keys
+  1–127 only and give group keys their own type (`retichat_field::app_key`,
+  `check_app_entry`). The generic setters `message_add_field_string` / `_bool`
+  (C `lxmf_message_add_field` / `_bool`) refuse `0xD1`, so no app can write a
+  top-level bin or str there. Host integers never truncate onto a field number
+  (`ffi::field_key`). `NameLedger::prepare_outbound` removes key 0 and then
+  sets it, leaving the app's other entries in place.
 - Bindings: C `lxmf_client_set_message_display_name`,
   `lxmf_client_set_announce_display_name`, `lxmf_display_name_clean`,
   `lxmf_display_name_decode` (`cffi.rs`); iOS `retichat_channel_lxm_pack` /
   `_unpack`, `retichat_distro_unwrap`, `retichat_distro_announce_payload`
   (`retichat-ffi`); Android `nativeRouterSet{Message,Announce}DisplayName`,
   `nativeDisplayName{Clean,Decode}`, `nativeChannelLxm{Pack,Unpack}`,
-  `nativeDistro{Unwrap,AnnouncePayload}` (`retichat-jni`).
+  `nativeDistro{Unwrap,AnnouncePayload}`,
+  `nativeMessageSetRetichat{String,Bool}` (`retichat-jni`).
 
 ### Per client
 
@@ -397,6 +429,22 @@ compiled into the app and the NSE; tests `tests/DisplayNamesTests.swift`).
 - Migration: settings `UserPreferences.migrateDisplayName`; contacts
   `ChatRepository.migrateLegacyContactNamesIfNeeded` →
   `DisplayNames.migrateLegacyName` (flag `contact_names_migrated_v1`).
+- Retichat field (§10), in `LxmfFields.swift`: `RetichatField` (`field`,
+  `displayNameKey`, `maxKey`, `groupEntriesInRetichatField`); `GroupEntry`
+  (keys 1–9, `legacyField`, `isBool`) and `GroupValue`.
+  - Reader: `LxmfFieldsDecoder.decode` keeps the first value of each entry in
+    both forms. `resolveGroupEntries` then picks per entry: the map's value if
+    it has the right type, else the old field's. The result is in
+    `LxmfFields.groupEntries`, and the typed `group*` fields are read from it.
+    It is used by `ChatRepository.handleIncomingMessage`, `importNSEMessages`
+    and the NSE's `nseHandOffForm`.
+  - Swift never reads key 0: the name comes only from
+    `lxmf_display_name_decode`.
+  - Writer: `GroupFieldWrite.of` (the pure part) and
+    `LxmfClient.messageSetGroupEntry`, the only group writer (all
+    `GroupChatManager` sends). It calls `messageAddField[Bool]` or
+    `messageSetRetichatString` / `Bool`.
+  - Tests: `tests/RetichatFieldTests.swift`.
 
 **Retichat-ios (NSE).** Stores nothing itself: it keeps each delivery's
 `unverifiedReason` so the app's `importNSEMessages` applies §5.2. Titles:
@@ -428,13 +476,39 @@ channel send rule (it never posts).
   announce is republished).
 - Migration: settings `UserPreferences.getMessageDisplayName` /
   `migratedMessageName`; database 10 → 11 `data/db/NamesMigration`.
+- Retichat field (§10), in `bridge/LxmfFields.kt`: `FIELD_RETICHAT`,
+  `RF_DISPLAY_NAME`..`RF_GROUP_MEMBER_KEYS`,
+  `GROUP_ENTRIES_IN_RETICHAT_FIELD`, and the `GroupEntry` enum (key, old
+  field, type).
+  - Reader: `LxmfFields.group(entry)` / `groupBool(entry)`. Per entry, the
+    map's value wins if it has the right type, else the old field's. Only
+    integer keys in 0..`Int.MAX_VALUE` count. They are used by
+    `ChatRepository.onMessageReceived` and `handleGroupMessage`.
+  - Kotlin never reads key 0: the name comes only from
+    `nativeDisplayNameDecode`.
+  - Writer: `service/GroupFields.set`, the only group writer
+    (`GroupChatManager`, and the `ChatRepository` group send and leave). Its
+    `Sink` lets tests record the calls. It writes through
+    `RetichatBridge.messageAddField*` or `messageSetRetichatString` / `Bool`.
+  - Tests: `bridge/RetichatFieldVectorsTest`, `service/GroupFieldsWiringTest`.
 
 **Retichat-js.** Pure rules in `lib/display_name.js`, persistent state in
 `lib/name_ledger.js` (tests `display_names.test.mjs`,
 `display_names_wiring.test.mjs`, `lxmf_signature.test.mjs`).
 - Clean and decode (§3): `clean`, `cleanAnnounce`, `decodePayload` (reads
-  0xD1 from the raw payload bytes), `announceNameFromAppData`; run against
-  the shared vectors.
+  key 0 of the 0xD1 map from the raw payload bytes; a non-map 0xD1 gives no
+  name), `decodeField` (maps this client built), `announceNameFromAppData`;
+  run against the shared vectors. `applyToFields` writes or removes key 0
+  only (ledger, group envelope, `channelLxmPack`). `LXMF.FIELD_RETICHAT`
+  replaces `FIELD_DISPLAY_NAME`.
+- Retichat field (§10), in `lib/retichat_field.js`: `FIELD_RETICHAT`,
+  `RF_*`, `GROUP_ENTRIES_IN_RETICHAT_FIELD`, `GROUP_ENTRIES`, `keyIs`
+  (msgpackr's BigInt too), `readEntry`, `setEntry` / `removeEntry`.
+  - Reader: `readGroupEntry`, used by `LXMessage.extractGroupFields`, the
+    only group reader.
+  - Writer: `setGroupEntryAs` / `setGroupEntry`, and `applyGroupFields`,
+    which `_sendGroupEnvelope` calls for every group send.
+  - Tests: `retichat_field.test.mjs`.
 - §7 signatures: `LXMessage.verify` / `signedPayload`
   (`lib/rns/lxmf/lxmf_message.js`), giving `signatureState` validated /
   unknown / invalid.
