@@ -631,7 +631,13 @@ impl LXMRouter {
 		// not replaced: it holds the ratchets the daemon rotates.
 		// Only an existing entry is updated, checked and written under one
 		// Transport lock: an unpublish racing this change stays unpublished.
-		Transport::update_published_app_data(destination_hash, app_data);
+		Transport::update_published_app_data(destination_hash, app_data.clone());
+		// A path request for a destination that is not published is answered
+		// with Transport's copy's default app_data: the iOS notification
+		// extension runs a copy of the delivery destination it never
+		// publishes, and the app's is unpublished until its first publish.
+		// Keep that copy current too, in place (its ratchets are kept).
+		Transport::update_registered_default_app_data(destination_hash, app_data);
 	}
 
 	pub fn get_announce_app_data(&self, destination_hash: &[u8]) -> Option<Vec<u8>> {
@@ -3297,8 +3303,10 @@ impl LXMRouter {
 		}
 		self.delivery_destinations.insert(dest_hash.clone(), delivery_destination.clone());
 		self.set_inbound_stamp_cost(&dest_hash, stamp_cost);
-		self.update_delivery_announce_app_data(&dest_hash);
 		Transport::register_destination(delivery_destination.clone());
+		// After the registration, so Transport's copy gets the app_data too:
+		// it answers path requests before any publish.
+		self.update_delivery_announce_app_data(&dest_hash);
 
 		Ok(delivery_destination)
 	}
@@ -5701,6 +5709,30 @@ mod display_name_router_tests {
 		Transport::unpublish_destination(&hash);
 		r.set_announce_display_name(Some("Carol"));
 		assert!(published(&hash).is_none(), "a name change after an unpublish does not republish");
+	}
+
+	/// A path request for a delivery destination that is not published is
+	/// answered with Transport's copy's default app_data. The iOS
+	/// notification extension runs a copy of the device's delivery
+	/// destination and never publishes it: before 2026-09-27 that copy had
+	/// no app_data at all, so its path responses told peers the user had no
+	/// name (§2.2, §5.1). The copy carries the router's app_data from
+	/// registration on, and follows a name change.
+	#[test]
+	fn a_name_change_reaches_path_responses_while_unpublished() {
+		let (router, destination) = router("unpublished", None);
+		let hash = destination.hash.clone();
+		let mut r = router.lock().unwrap();
+		assert_eq!(Transport::registered_default_app_data(&hash), Some(r.get_announce_app_data(&hash)),
+			"registered with the router's app_data");
+		r.set_announce_display_name(Some("Alice"));
+		assert_eq!(Transport::registered_default_app_data(&hash),
+			Some(Some(app_data(vec![Value::Binary(b"Alice".to_vec()), Value::Nil]))));
+		assert!(!Transport::is_published(&hash), "a name change does not publish");
+		r.set_announce_display_name(None);
+		assert_eq!(Transport::registered_default_app_data(&hash),
+			Some(Some(app_data(vec![Value::Nil, Value::Nil]))));
+		Transport::deregister_destination(&hash);
 	}
 
 	/// LxmfClient::publish (iOS) and ffi::publish_destination (Android) put
