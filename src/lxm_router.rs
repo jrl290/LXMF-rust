@@ -6159,4 +6159,44 @@ mod ratchet_mirror_router_tests {
 		assert_eq!(Transport::registered_ratchet_settings(&hash), Some((None, false)));
 		Transport::deregister_destination(&hash);
 	}
+
+	/// The router's copy of a delivery destination and Transport's
+	/// registered copy share their ratchet state (they are cloned after
+	/// enable_ratchets): after Transport's copy rotates to answer a path
+	/// request, the router's announce adopts that ratchet instead of
+	/// rotating again from its own list, so the ratchet the path response
+	/// advertised stays in the file and its mirror.
+	#[test]
+	fn the_router_adopts_a_rotation_transports_copy_made() {
+		let tmp = TempDir::new("shared");
+		let mirror_dir = tmp.path("nse_ratchets");
+		std::fs::create_dir_all(&mirror_dir).unwrap();
+		let router = router(&tmp.path("storage"));
+		let mut r = router.lock().unwrap();
+		r.set_ratchets_mirror_dir(Some(mirror_dir.clone()));
+		let destination = r.register_delivery_identity(Identity::new(true), None, None).expect("register");
+		let hash = destination.hash.clone();
+		let primary = primary_file(&r, &hash);
+		let mirror = ratchets_mirror_file(&mirror_dir, &hash);
+
+		// Transport's copy answers a path request: it rotates and persists.
+		Transport::path_request(hash.clone(), false, None, None, Some(reticulum_rust::identity::Identity::get_random_hash()));
+		let load = |path: &str| {
+			let mut reader = Destination::new_inbound(
+				destination.identity.clone(), DestinationType::Single, APP_NAME.to_string(), vec!["delivery".to_string()],
+			).expect("reader");
+			reader.set_ratchets_frozen(true);
+			reader.enable_ratchets(path.to_string()).expect("load");
+			reader.ratchets.expect("ratchets")
+		};
+		let advertised = load(&primary);
+		assert_eq!(advertised.len(), 1, "the path response rotated Transport's copy");
+
+		// The router's own announce (a publish): no second rotation.
+		assert!(r.announce(&hash, None));
+		assert_eq!(r.delivery_destinations[&hash].ratchets.as_ref(), Some(&advertised), "the router adopted Transport's rotation");
+		assert_eq!(load(&primary), advertised, "the file still holds the advertised ratchet");
+		assert_eq!(load(&mirror), advertised, "and so does the mirror");
+		Transport::deregister_destination(&hash);
+	}
 }
