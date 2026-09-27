@@ -251,7 +251,9 @@ messages keep the hash and resolve it when shown.
 
   (James, 2026-09-27: the user's own name for someone is the name they know them
   by; the channel name moves to the grey spot.) Notifications for channel posts
-  use the main label.
+  name the poster the same way, main label then secondary text
+  (`Mum · Night Owl`, `Night Owl · 1a2b3c4d…`), so a channel name never stands
+  alone there either.
 - `shortHash` is the first 8 hex characters followed by `…` on every client.
 
 ### 5.4 Migrating existing data
