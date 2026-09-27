@@ -259,3 +259,62 @@ Changes take effect at once through the router setters, with no stack restart.
   sends its own.
 - Group membership of distro holders (audit H8), GROUP_SENDER trust (M13),
   link-proven identities (M15), Android's leave message (L5).
+
+## 9. Implementation
+
+Where each part of this contract lives. Recorded 2026-09-27, when the Rust
+side was committed (LXMF-rust `daa71d8`, `72458d2`) and the app phase had not
+started; the TODO lines are for the consistency pass to fill in with the
+function (not line) that implements them.
+
+### Shared Rust (LXMF-rust, used by iOS and Android)
+
+- Field and cleaning (§2.1, §3): `lxmf::FIELD_DISPLAY_NAME`;
+  `display_name::clean`, `clean_announce`, `digest`, `decode_field` /
+  `decode_fields_bytes` (the three states as `NameField`). Vectors:
+  `tests/display_name_vectors.json`, run by `tests/display_name_vectors.rs`.
+- Announce (§2.2): `LXMRouter::get_announce_app_data` and
+  `set_announce_display_name`; `distro::distro_announce_app_data` /
+  `announce_payload`; `announce_name_from_app_data` for received announces.
+- Message send rule (§4.1): `LXMRouter::prepare_display_name`, called once in
+  `handle_outbound`; `name_ledger::decide` and `NameLedger::prepare_outbound`;
+  delivery confirmation recorded by `NameLedger::record_delivered` /
+  `record_delivery`; own-devices exclusion in
+  `name_ledger::is_own_devices_message`.
+- Accept inputs (§5.2): the delivery callback carries `signature_valid` and
+  `unverified_reason` (0 validated, 1 source unknown, 2 invalid;
+  `ffi::ReceivedMessage`), plus the raw fields for the app to decode;
+  `distro::unwrap_blob` returns `display_name`, `signature_validated` and
+  `unverified_reason`. The §5.2 table itself is applied in each app.
+- Channel posts (§2.3, §5.2): `channel::pack` (writes 0xD1 from a
+  `PostName`) and `channel::unpack`, which checks the key binding with
+  `channel::lxmf_delivery_hash_for_public_key` before remembering the key
+  (the check §2.3 attributes to `retichat_identity_remember_lxmf_delivery`)
+  and reports the name only when the signature validated.
+- Bindings: C `lxmf_client_set_message_display_name`,
+  `lxmf_client_set_announce_display_name`, `lxmf_display_name_clean`,
+  `lxmf_display_name_decode` (`cffi.rs`); iOS `retichat_channel_lxm_pack` /
+  `_unpack`, `retichat_distro_unwrap`, `retichat_distro_announce_payload`
+  (`retichat-ffi`); Android `nativeRouterSet{Message,Announce}DisplayName`,
+  `nativeDisplayName{Clean,Decode}`, `nativeChannelLxm{Pack,Unpack}`,
+  `nativeDistro{Unwrap,AnnouncePayload}` (`retichat-jni`).
+
+### Per client
+
+| | Resolver (§5.3) | Accept rules (§5.2) | Channel send rule (§4.2) |
+|---|---|---|---|
+| Retichat-ios (app) | TODO | TODO | TODO |
+| Retichat-ios (NSE) | TODO | TODO | n/a |
+| Retichat-android | TODO | TODO | TODO |
+| Retichat-js | TODO | TODO (includes §7 signature validation) | TODO |
+
+Also TODO for the consistency pass: each client's settings screen (§6), its
+migration (§5.4), and Retichat-js's own clean (§3) and channel codec.
+
+### Python reference
+
+`LXMF-master` (local modification, not in git): `LXMF.FIELD_DISPLAY_NAME`,
+`display_name_from_fields` (bin or str; no cleaning, no signature rules);
+`LXMRouter.register_delivery_identity(..., announce_name=None)` and
+`get_announce_app_data` announce only `announce_name`; `handle_outbound`
+writes the Message Display Name as bin on every message (no ledger).
