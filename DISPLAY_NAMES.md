@@ -47,8 +47,9 @@ labelled as public.
 ### 2.2 Announce
 
 - Device `lxmf.delivery` announce app_data: `[announce_name, stamp_cost]`,
-  where `announce_name` is bin (cleaned UTF-8) or `nil`. This is upstream's
-  format, so upstream clients show it.
+  where `announce_name` is bin (cleaned UTF-8) or `nil`. Upstream LXMF 1.2.0
+  announces `[display_name, stamp_cost, [supported functionality]]` and every
+  upstream client reads the name from index 0, so they show it.
 - Distro announce app_data: `[announce_name, nil, [0xD0]]`, same rule.
 - Web client announce: `[announce_name, nil, []]` (its current shape with the
   first slot filled).
@@ -64,8 +65,8 @@ Nothing else about the envelope changes.
 
 **Key binding (required).** Channel unpack must check, before remembering any
 key, that the 64-byte public key in the post's prelude produces the claimed
-source hash as an `lxmf.delivery` destination (the check in
-`retichat_identity_remember_lxmf_delivery`). A post that fails is rejected.
+source hash as an `lxmf.delivery` destination (`channel::unpack`, and
+`channelLxmUnpack` in Retichat-js). A post that fails is rejected.
 Without this, anyone who knows a channel's name could post as a contact and
 overwrite that contact's stored key.
 
@@ -168,13 +169,20 @@ Per contact (keyed by the hash the messages come from), three separate slots:
 
 - `localName`: the user's own name for the contact. Nullable, and clearable
   from the rename UI (saving an empty value clears it).
-- `messageName`: from `0xD1`.
+- `messageName`: from `0xD1`, with `messageNameAt`, the LXMF timestamp of
+  the message that last set or cleared it (section 5.2).
 - `announceName`: from the contact's announce (cleaned, "Anonymous Peer" as
   none). Replaced on every announce, and set to none when an announce has no
   name.
 
+- `legacyName`: only on Android and web, holding a name migrated from before
+  this design whose origin is unknown (section 5.4). Never written afterwards,
+  and dropped as soon as a `0xD1` is accepted for the contact or an announce
+  carrying a name arrives.
+
 Per channel and sender: `channelName`, from `0xD1` in that sender's posts in
-that channel. It never becomes the contact's `messageName`.
+that channel, with the post timestamp that last set or cleared it. It never
+becomes the contact's `messageName`.
 
 ### 5.2 Accepting a 0xD1
 
@@ -184,6 +192,14 @@ that channel. It never becomes the contact's `messageName`.
 | source unknown (no key yet) | set only if `messageName` is none | ignore |
 | invalid | ignore | ignore |
 
+Order: a `Name` or `Clear` is accepted only from a message whose LXMF
+timestamp is newer than `messageNameAt`; accepting one records that timestamp
+(a repeat of the current name also advances it). Messages arrive out of order
+(a propagated copy can land after a later direct one), and without this an old
+name would overwrite a new one that the sender's ledger then never resends.
+Channel names follow the same rule per `(channel, sender)` with the post
+timestamp.
+
 This applies on every path that yields an LXMF message: direct, opportunistic,
 propagated, stream ingest, distro unwrap, iOS NSE import, group messages
 (including relayed copies, where it names the relayer, the LXMF source). The
@@ -191,6 +207,8 @@ distro unwrap must therefore return the name state and signature validity.
 
 A channel post's `0xD1` is accepted only after the key binding and signature
 checks pass, and sets or clears `channelName` for that `(channel, sender)`.
+Posts whose signature is not validated are dropped whole, as all three clients
+already did before this design.
 
 ### 5.3 Showing a name
 
@@ -200,8 +218,8 @@ contacts, pickers, chat info, system messages, in-app and background
 notifications. No surface stores a resolved name in message text; system
 messages keep the hash and resolve it when shown.
 
-- Contact: `localName ?? messageName ?? announceName ?? shortHash`.
-- Channel post: `channelName ?? localName ?? messageName ?? announceName ?? shortHash`.
+- Contact: `localName ?? messageName ?? announceName ?? legacyName ?? shortHash`.
+- Channel post: `channelName ?? localName ?? messageName ?? announceName ?? legacyName ?? shortHash`.
   When the label comes from `channelName`, the 8-hex short hash is shown next to
   it as secondary text. Channel names are public and anyone can pick any name.
 - `shortHash` is the first 8 hex characters followed by `…` on every client.
@@ -210,21 +228,31 @@ messages keep the hash and resolve it when shown.
 
 Never lose a name the user typed.
 
-- iOS has one `displayName` and no rename flag. A value that is a hash
-  placeholder is dropped. A value equal to the contact's recalled announce name
-  becomes `announceName`. Anything else becomes `localName`.
-- Android: `isNameManual` → `localName`. Otherwise `messageName`, unless it is
-  a hash placeholder, which is dropped.
-- Web: `nameCustomized` → `localName`. Otherwise `messageName`, unless it is a
-  `?hash` placeholder, which is dropped.
+Placeholders, dropped wherever the name was not typed by the user: hash forms
+(8 to 32 hex, with or without `?` or `…`), "Retichat", "Retichat Web" and
+"Anonymous Peer" (all case-insensitive). Unnamed Android and web senders used
+to send the first two as names, and MeshChatX, Columba and lxmd announce the
+third.
+
+- iOS has one `displayName` and no rename flag. A placeholder is dropped. A
+  value equal to the contact's recalled announce name becomes `announceName`.
+  Anything else becomes `localName` (it may have been typed).
+- Android: `isNameManual` → `localName`; a DM chat name the user set on a chat
+  with no manual contact name → `localName`. Otherwise `legacyName`, unless a
+  placeholder.
+- Web: `nameCustomized` → `localName`. Otherwise `legacyName`, unless a
+  placeholder.
+
+`legacyName` rather than `messageName`, because an old name may have come from
+an announce: an upstream contact never sends `0xD1`, so a stale name in
+`messageName` would outrank its current announce name for good.
 - Settings: the old display name becomes the Message Display Name. Android's
   literal "Retichat" and the web's "Retichat Web" placeholders become empty.
   The old channel display name stays the Channel Display Name. The Announce
   Display Name starts empty.
 
 The ledger starts empty, so after the update every sender includes its name
-once to each recipient. Names migrated into `messageName` are refreshed that
-way.
+once to each recipient, which replaces a `legacyName`.
 
 ## 6. Settings
 
