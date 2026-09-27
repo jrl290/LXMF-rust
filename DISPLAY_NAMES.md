@@ -262,10 +262,11 @@ Changes take effect at once through the router setters, with no stack restart.
 
 ## 9. Implementation
 
-Where each part of this contract lives. Recorded 2026-09-27, when the Rust
-side was committed (LXMF-rust `daa71d8`, `72458d2`) and the app phase had not
-started; the TODO lines are for the consistency pass to fill in with the
-function (not line) that implements them.
+Where each part of this contract lives, by function (not line). Rust side:
+LXMF-rust `daa71d8`, `72458d2`, `9a2f674` (with Reticulum-rust `c4292f3`).
+Apps: Retichat-ios `de38780`, `8e9c8d4`, `fe5f70b`; Retichat-android
+`9a39c12` to `59a9c67`; Retichat-js `9c9757a` to `9e991f1`. Checked against
+the code in the consistency pass of 2026-09-27.
 
 ### Shared Rust (LXMF-rust, used by iOS and Android)
 
@@ -276,6 +277,9 @@ function (not line) that implements them.
 - Announce (§2.2): `LXMRouter::get_announce_app_data` and
   `set_announce_display_name`; `distro::distro_announce_app_data` /
   `announce_payload`; `announce_name_from_app_data` for received announces.
+  `set_announce_display_name` also rewrites Transport's registered copy of
+  each delivery destination (`Transport::update_registered_default_app_data`),
+  so path responses for an unpublished destination (the iOS NSE) carry it.
 - Message send rule (§4.1): `LXMRouter::prepare_display_name`, called once in
   `handle_outbound`; `name_ledger::decide` and `NameLedger::prepare_outbound`;
   delivery confirmation recorded by `NameLedger::record_delivered` /
@@ -301,15 +305,90 @@ function (not line) that implements them.
 
 ### Per client
 
-| | Resolver (§5.3) | Accept rules (§5.2) | Channel send rule (§4.2) |
-|---|---|---|---|
-| Retichat-ios (app) | TODO | TODO | TODO |
-| Retichat-ios (NSE) | TODO | TODO | n/a |
-| Retichat-android | TODO | TODO | TODO |
-| Retichat-js | TODO | TODO (includes §7 signature validation) | TODO |
+**Retichat-ios (app).** Pure rules in `DisplayNames` (`Retichat/Bridge/LxmfFields.swift`,
+compiled into the app and the NSE; tests `tests/DisplayNamesTests.swift`).
+- Resolver: `DisplayNames.contactLabel` / `contactName` / `shortHash`, used
+  through `ChatRepository.contactDisplayName(for:)` and `resolvedName`;
+  channels `DisplayNames.channelLabel` via `RfedChannelClient.senderLabel`.
+  System messages keep the hash and are named by `DisplayNames.systemText`.
+- Accept (§5.2): `DisplayNames.acceptMessageName`, applied by
+  `ChatRepository.applyMessageName` from `handleIncomingMessage` (router path:
+  DMs after `allowlistDecision`, group traffic after `groupMessagePolicy`),
+  `importNSEMessages` and `handleDistroMessage` (`DisplayNames.distroReason`).
+  Announces: `handleAnnounce` and `refreshAnnounceNameFromCache`
+  (`DisplayNames.announceNameFromCache`). Channels:
+  `RfedChannelClient.noteSender` into `ChannelSenderEntity`.
+- Channel send rule: `RfedChannelClient.channelPostName(for:)` →
+  `DisplayNames.channelPostName`; recorded by `recordPostName` in
+  `ChannelEntity.nameLastDigestHex` / `nameLastIncludedAt`.
+- Settings: `SettingsView.displayNamesSection`, saved cleaned by
+  `SettingsViewModel.apply` (`LxmfClient.cleanDisplayName`), applied by
+  `ChatRepository.applyDisplayNames` (router setters; the announce name is
+  also mirrored to the App Group for the NSE).
+- Migration: settings `UserPreferences.migrateDisplayName`; contacts
+  `ChatRepository.migrateLegacyContactNamesIfNeeded` →
+  `DisplayNames.migrateLegacyName` (flag `contact_names_migrated_v1`).
 
-Also TODO for the consistency pass: each client's settings screen (§6), its
-migration (§5.4), and Retichat-js's own clean (§3) and channel codec.
+**Retichat-ios (NSE).** Stores nothing itself: it keeps each delivery's
+`unverifiedReason` so the app's `importNSEMessages` applies §5.2. Titles:
+`DisplayNames.notificationName` (the app's resolved name from
+`chat_names.json`, then the accepted 0xD1, then the recalled announce name,
+then the short hash); channels `DisplayNames.channelLabel` +
+`channelNotificationTitle`. Sets the Announce Display Name from
+`PendingNotification.readAnnounceDisplayName` after its stack starts. No
+channel send rule (it never posts).
+
+**Retichat-android.** Pure rules in `names/DisplayNames.kt` (tests
+`names/DisplayNamesTest`).
+- Resolver: `names/NameBook` (`contact`, `member`, `channelPost`) over
+  `DisplayNames.contact` / `channelPost`, built by `ChatRepository.nameBookOf`.
+- Accept (§5.2): `DisplayNames.acceptMessageName`, applied by
+  `ChatRepository.acceptMessageName` from `onMessageReceived` (after
+  `DeliveryPolicy`) and `onDistroMessageReceived` (`Signature.reason`).
+  Announces: `onAnnounceReceived` → `DisplayNames.acceptAnnounceName`.
+  Channels: `RfedChannelClient.recordChannelSender` →
+  `DisplayNames.acceptChannelName` (table `channel_senders`).
+- §7 privacy filter: `data/repository/DeliveryPolicy` (iOS's
+  `allowlistDecision` and `groupMessagePolicy`); the router's own filter is
+  turned off in `ChatRepository.primeCoreDeliveryPrivacy`.
+- Channel send rule: `RfedChannelClient.channelPostName` →
+  `DisplayNames.channelPostName`; recorded by `recordPostName` in
+  `channel_name_state`.
+- Settings: `SettingsScreen.ProfileCard` / `DisplayNameField`, saved and
+  applied by `service/DisplayNameSettings.save` (router setters; the distro
+  announce is republished).
+- Migration: settings `UserPreferences.getMessageDisplayName` /
+  `migratedMessageName`; database 10 → 11 `data/db/NamesMigration`.
+
+**Retichat-js.** Pure rules in `lib/display_name.js`, persistent state in
+`lib/name_ledger.js` (tests `display_names.test.mjs`,
+`display_names_wiring.test.mjs`, `lxmf_signature.test.mjs`).
+- Clean and decode (§3): `clean`, `cleanAnnounce`, `decodePayload` (reads
+  0xD1 from the raw payload bytes), `announceNameFromAppData`; run against
+  the shared vectors.
+- §7 signatures: `LXMessage.verify` / `signedPayload`
+  (`lib/rns/lxmf/lxmf_message.js`), giving `signatureState` validated /
+  unknown / invalid.
+- Resolver: `contactName` / `channelPosterName` / `shortHash`, through
+  `ContactStore.name` and `channelSenderLabel` in `app.js`.
+- Accept (§5.2): `acceptMessageName` via `ContactStore.acceptMessageName` in
+  the router's message handler (direct, opportunistic, link, group),
+  `_fetchPropagatedMessages` and `_handleDistroBlob`. Announces:
+  `ContactStore.updateFromAnnounce`. Channels: `ChannelSenderNames.apply`.
+- Message ledger (§4.1, the web client has no Rust router):
+  `NameLedger` + `decide`, decided once per DM in `_dispatchMessage`
+  (`_decideMessageName`) and per group member in `_sendGroupEnvelope`;
+  recorded on a direct delivery proof only (`_recordNameDelivered`,
+  `NameLedger.recordDelivered`).
+- Channel codec and send rule: `channelLxmPack` / `channelLxmUnpack`
+  (`lib/rns/rfed_channel.js`, with the key binding); `ChannelPostNames`
+  `decide` / `noteSender` / `recordIncluded` → `decideChannelPost`.
+- Announce (§2.2): `LXMRouter.setAnnounceName` / `announceAppData`
+  (`lib/rns/lxmf/lxmf_router.js`); distro `_publishDistroAnnounce`.
+- Settings: `OwnNames` and the "Names" section of the settings sheet.
+- Migration: `migrateContact` (in `ContactStore.init`),
+  `migrateOwnDisplayName` / `OwnNames.finishMigration`,
+  `GroupMsgStore.migrateLegacyNotices`.
 
 ### Python reference
 
