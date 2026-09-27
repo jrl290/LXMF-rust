@@ -84,7 +84,7 @@ pub struct LXMessage {
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) violation_reported: bool,
 	/// DISPLAY_NAMES.md §4.1: the router has decided whether this message
-	/// carries `FIELD_DISPLAY_NAME` and written the decision into `fields`.
+	/// carries the name entry (key 0 of `FIELD_RETICHAT`) and written the decision into `fields`.
 	/// Set once, in `LXMRouter::handle_outbound`, before the first pack; a
 	/// resend or a `propagated_copy` keeps the decision, so every copy of the
 	/// message has the same fields and the same hash.
@@ -355,22 +355,27 @@ impl LXMessage {
 		&self.fields
 	}
 
+	/// Set top-level field `key`: the entry with that integer key (any
+	/// msgpack width) is replaced in place, or the field is appended.
 	pub fn set_field(&mut self, key: u8, value: Value) {
-		if let Value::Map(entries) = &mut self.fields {
-			let key_value = Value::from(key as i64);
-			if let Some(existing) = entries.iter_mut().find(|(k, _)| *k == key_value) {
-				existing.1 = value;
-				return;
-			}
-			entries.push((key_value, value));
-		}
+		crate::retichat_field::set_top_level(&mut self.fields, key, value);
 	}
 
 	/// Remove every entry whose key is the integer `key`.
 	pub fn remove_field(&mut self, key: u8) {
-		if let Value::Map(entries) = &mut self.fields {
-			entries.retain(|(k, _)| !crate::display_name::key_is(k, key));
-		}
+		crate::retichat_field::remove_top_level(&mut self.fields, key);
+	}
+
+	/// Set entry `key` of the Retichat field `0xD1` (DISPLAY_NAMES.md §10),
+	/// creating the map or merging into it (`retichat_field::set_entry`).
+	pub fn set_retichat_entry(&mut self, key: u8, value: Value) {
+		crate::retichat_field::set_entry(&mut self.fields, key, value);
+	}
+
+	/// Remove entry `key` of the Retichat field, dropping `0xD1` when it is
+	/// left empty (`retichat_field::remove_entry`).
+	pub fn remove_retichat_entry(&mut self, key: u8) {
+		crate::retichat_field::remove_entry(&mut self.fields, key);
 	}
 
 	/// Human-readable name for a message state constant.

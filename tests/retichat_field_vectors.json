@@ -1,0 +1,763 @@
+{
+  "spec": "LXMF-rust/DISPLAY_NAMES.md sections 2.1 and 10: the Retichat field 0xD1 and the group transition",
+  "notes": [
+    "All *_hex values are raw msgpack bytes as lowercase hex. The same file is run by LXMF-rust (tests/retichat_field_vectors.rs), Retichat-ios, Retichat-android and Retichat-js.",
+    "keys: the Retichat field's keys. key is the integer key inside the 0xD1 map; name is the JSON name used in decode[].group; type is name | str | bool; legacy_field is the old top-level field number (decimal: 160 = 0xA0 ... 168 = 0xA8), null for key 0.",
+    "decode: state / display_name decode the name (key 0 of the 0xD1 map) exactly as display_name_vectors.json decode_field: state is absent | clear | name, display_name is set only for state name. A 0xD1 that is not a map is ignored whole.",
+    "decode: group has all nine group entries, always present; each is a JSON string (str entries), true/false (group_relay_done) or null when absent.",
+    "Reader rule (section 10): each group entry comes from the 0xD1 map when the map holds that key with the entry's type; otherwise from its old top-level field when that holds the entry's type; otherwise null. An empty str or false in the map is a value and wins.",
+    "Types are strict: a str entry is a msgpack str (bin is not a str), group_relay_done is a msgpack bool. Nil or any other type counts as not there.",
+    "Keys (top-level field numbers and keys inside the map) are integers of any msgpack width (positive fixint, uint8/16/32/64, int8/16/32/64 holding a non-negative value). String keys and negative keys never match. Unknown keys are ignored.",
+    "No vector holds a duplicate key or a str with invalid UTF-8 in a group entry: readers need not agree on those.",
+    "encode: the two send forms, starting from the fields map start_hex and setting entries in list order (key is the Retichat key, value a JSON string or bool). legacy_hex is the old form (top-level 0xA0-0xA8, appended in set order, a repeated key replaced in place); retichat_hex the new form (entries in the 0xD1 map, ascending key order, 0xD1 appended when absent). Writers emit the shortest msgpack forms. GROUP_ENTRIES_IN_RETICHAT_FIELD (Swift: groupEntriesInRetichatField) selects the form; it is false until the switch around 2026-10-26."
+  ],
+  "keys": [
+    {
+      "key": 0,
+      "name": "display_name",
+      "constant": "RF_DISPLAY_NAME",
+      "type": "name",
+      "legacy_field": null
+    },
+    {
+      "key": 1,
+      "name": "group_id",
+      "constant": "RF_GROUP_ID",
+      "type": "str",
+      "legacy_field": 160
+    },
+    {
+      "key": 2,
+      "name": "group_members",
+      "constant": "RF_GROUP_MEMBERS",
+      "type": "str",
+      "legacy_field": 161
+    },
+    {
+      "key": 3,
+      "name": "group_name",
+      "constant": "RF_GROUP_NAME",
+      "type": "str",
+      "legacy_field": 162
+    },
+    {
+      "key": 4,
+      "name": "group_action",
+      "constant": "RF_GROUP_ACTION",
+      "type": "str",
+      "legacy_field": 163
+    },
+    {
+      "key": 5,
+      "name": "group_sender",
+      "constant": "RF_GROUP_SENDER",
+      "type": "str",
+      "legacy_field": 164
+    },
+    {
+      "key": 6,
+      "name": "group_relay_seen",
+      "constant": "RF_GROUP_RELAY_SEEN",
+      "type": "str",
+      "legacy_field": 165
+    },
+    {
+      "key": 7,
+      "name": "group_relay_for",
+      "constant": "RF_GROUP_RELAY_FOR",
+      "type": "str",
+      "legacy_field": 166
+    },
+    {
+      "key": 8,
+      "name": "group_relay_done",
+      "constant": "RF_GROUP_RELAY_DONE",
+      "type": "bool",
+      "legacy_field": 167
+    },
+    {
+      "key": 9,
+      "name": "group_member_keys",
+      "constant": "RF_GROUP_MEMBER_KEYS",
+      "type": "str",
+      "legacy_field": 168
+    }
+  ],
+  "decode": [
+    {
+      "name": "empty fields",
+      "fields_msgpack_hex": "80",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "fields not a map (nil)",
+      "fields_msgpack_hex": "c0",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "all group entries in the old top-level fields 0xA0-0xA8",
+      "fields_msgpack_hex": "89cca0d9203031323334353637383961626364656630313233343536373839616263646566cca1d94131313131313131313131313131313131313131313131313131313131313131312c3232323232323232323232323232323232323232323232323232323232323232cca2a648696b657273cca3a6696e76697465cca4d9203131313131313131313131313131313131313131313131313131313131313131cca5d9203232323232323232323232323232323232323232323232323232323232323232cca6d9203232323232323232323232323232323232323232323232323232323232323232cca7c3cca8d92531313131313131313131313131313131313131313131313131313131313131313a41414543",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": "11111111111111111111111111111111,22222222222222222222222222222222",
+        "group_name": "Hikers",
+        "group_action": "invite",
+        "group_sender": "11111111111111111111111111111111",
+        "group_relay_seen": "22222222222222222222222222222222",
+        "group_relay_for": "22222222222222222222222222222222",
+        "group_relay_done": true,
+        "group_member_keys": "11111111111111111111111111111111:AAEC"
+      }
+    },
+    {
+      "name": "all group entries and the name in the Retichat field",
+      "fields_msgpack_hex": "81ccd18a00c403426f6201d920303132333435363738396162636465663031323334353637383961626364656602d94131313131313131313131313131313131313131313131313131313131313131312c323232323232323232323232323232323232323232323232323232323232323203a648696b65727304a6696e7669746505d920313131313131313131313131313131313131313131313131313131313131313106d920323232323232323232323232323232323232323232323232323232323232323207d920323232323232323232323232323232323232323232323232323232323232323208c309d92531313131313131313131313131313131313131313131313131313131313131313a41414543",
+      "state": "name",
+      "display_name": "Bob",
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": "11111111111111111111111111111111,22222222222222222222222222222222",
+        "group_name": "Hikers",
+        "group_action": "invite",
+        "group_sender": "11111111111111111111111111111111",
+        "group_relay_seen": "22222222222222222222222222222222",
+        "group_relay_for": "22222222222222222222222222222222",
+        "group_relay_done": true,
+        "group_member_keys": "11111111111111111111111111111111:AAEC"
+      }
+    },
+    {
+      "name": "name in the map, group entries in the old fields (the form senders use until the switch)",
+      "fields_msgpack_hex": "83cca0d9203031323334353637383961626364656630313233343536373839616263646566cca3a6616363657074ccd18100c403426f62",
+      "state": "name",
+      "display_name": "Bob",
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": "accept",
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "mixed forms: each entry from the map when there, else the old field",
+      "fields_msgpack_hex": "84cca0a56f6c646964cca1d9203131313131313131313131313131313131313131313131313131313131313131cca2a84f6c64206e616d65ccd18201d920303132333435363738396162636465663031323334353637383961626364656603a84e6577206e616d65",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": "11111111111111111111111111111111",
+        "group_name": "New name",
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "mixed forms, map first in the fields",
+      "fields_msgpack_hex": "83ccd18108c2cca7c3cca4d9203232323232323232323232323232323232323232323232323232323232323232",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": "22222222222222222222222222222222",
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": false,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "an empty str in the map still wins over the old field",
+      "fields_msgpack_hex": "82cca0a56f6c646964ccd18101a0",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "relay_done false in the map wins over true in the old field",
+      "fields_msgpack_hex": "82cca7c3ccd18108c2",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": false,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "a map entry of the wrong type falls back to the old field",
+      "fields_msgpack_hex": "83cca0a56f6c646964cca7c3ccd182010708a474727565",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "oldid",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": true,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "a map entry of nil falls back to the old field",
+      "fields_msgpack_hex": "82cca2a84f6c64206e616d65ccd18103c0",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": "Old name",
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "a map entry of the wrong type with no old field is null",
+      "fields_msgpack_hex": "81ccd18301c4026964080104c0",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "old fields of the wrong type are null (bin is not str, str is not bool)",
+      "fields_msgpack_hex": "83cca0c4026964cca7a474727565cca301",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "0xD1 as bin (not a map): name absent, group entries from the old fields",
+      "fields_msgpack_hex": "82ccd1c403426f62cca0d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "0xD1 as str (not a map) is ignored whole",
+      "fields_msgpack_hex": "82ccd1a3426f62cca3a56c65617665",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": "leave",
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "0xD1 as an array is ignored whole",
+      "fields_msgpack_hex": "81ccd19201d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "unknown keys in the map and unknown top-level fields are ignored",
+      "fields_msgpack_hex": "830cc0ccfba178ccd1840aa374656e01d92030313233343536373839616263646566303132333435363738396162636465667fc300c403426f62",
+      "state": "name",
+      "display_name": "Bob",
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "map keys of every integer width",
+      "fields_msgpack_hex": "81ccd187cc01d9203031323334353637383961626364656630313233343536373839616263646566cd0003a648696b657273ce00000004a56c65617665cf0000000000000005d9203131313131313131313131313131313131313131313131313131313131313131d007d9203232323232323232323232323232323232323232323232323232323232323232d10008c3d200000000c403426f62",
+      "state": "name",
+      "display_name": "Bob",
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": "Hikers",
+        "group_action": "leave",
+        "group_sender": "11111111111111111111111111111111",
+        "group_relay_seen": null,
+        "group_relay_for": "22222222222222222222222222222222",
+        "group_relay_done": true,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "field numbers of other widths: 0xD1 as uint32, 0xA2 as uint16",
+      "fields_msgpack_hex": "82ce000000d18101d9203031323334353637383961626364656630313233343536373839616263646566cd00a2a648696b657273",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": "Hikers",
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "str and negative keys in the map do not match",
+      "fields_msgpack_hex": "81ccd184a131d9203031323334353637383961626364656630313233343536373839616263646566a130c403426f62ffa36e6567d0ffc3",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as bin",
+      "fields_msgpack_hex": "81ccd18100c405416c696365",
+      "state": "name",
+      "display_name": "Alice",
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as str",
+      "fields_msgpack_hex": "81ccd18100a5416c696365",
+      "state": "name",
+      "display_name": "Alice",
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 is cleaned",
+      "fields_msgpack_hex": "81ccd18100c4092020416c6909636520",
+      "state": "name",
+      "display_name": "Ali ce",
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 empty bin is clear",
+      "fields_msgpack_hex": "81ccd18100c400",
+      "state": "clear",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 empty str is clear",
+      "fields_msgpack_hex": "81ccd18100a0",
+      "state": "clear",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 cleaning to nothing is absent",
+      "fields_msgpack_hex": "81ccd18100c403e2808b",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 invalid utf-8 bin is absent",
+      "fields_msgpack_hex": "81ccd18100c401ff",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as nil is absent, the group entry beside it still reads",
+      "fields_msgpack_hex": "81ccd18200c001d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as int is absent, the group entry beside it still reads",
+      "fields_msgpack_hex": "81ccd182000501d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as bool is absent, the group entry beside it still reads",
+      "fields_msgpack_hex": "81ccd18200c301d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as array is absent, the group entry beside it still reads",
+      "fields_msgpack_hex": "81ccd1820091a14101d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "key 0 as map is absent, the group entry beside it still reads",
+      "fields_msgpack_hex": "81ccd182008001d9203031323334353637383961626364656630313233343536373839616263646566",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": "0123456789abcdef0123456789abcdef",
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    },
+    {
+      "name": "the retired 0x10 is not a name",
+      "fields_msgpack_hex": "8110c403426f62",
+      "state": "absent",
+      "display_name": null,
+      "group": {
+        "group_id": null,
+        "group_members": null,
+        "group_name": null,
+        "group_action": null,
+        "group_sender": null,
+        "group_relay_seen": null,
+        "group_relay_for": null,
+        "group_relay_done": null,
+        "group_member_keys": null
+      }
+    }
+  ],
+  "encode": [
+    {
+      "name": "one entry",
+      "start_hex": "80",
+      "entries": [
+        {
+          "key": 1,
+          "value": "0123456789abcdef0123456789abcdef"
+        }
+      ],
+      "legacy_hex": "81cca0d9203031323334353637383961626364656630313233343536373839616263646566",
+      "retichat_hex": "81ccd18101d9203031323334353637383961626364656630313233343536373839616263646566"
+    },
+    {
+      "name": "entries set out of order: old fields in set order, map in key order",
+      "start_hex": "80",
+      "entries": [
+        {
+          "key": 8,
+          "value": true
+        },
+        {
+          "key": 4,
+          "value": "relay_done"
+        },
+        {
+          "key": 1,
+          "value": "0123456789abcdef0123456789abcdef"
+        }
+      ],
+      "legacy_hex": "83cca7c3cca3aa72656c61795f646f6e65cca0d9203031323334353637383961626364656630313233343536373839616263646566",
+      "retichat_hex": "81ccd18301d920303132333435363738396162636465663031323334353637383961626364656604aa72656c61795f646f6e6508c3"
+    },
+    {
+      "name": "an entry set twice keeps the last value in its place",
+      "start_hex": "80",
+      "entries": [
+        {
+          "key": 3,
+          "value": "a"
+        },
+        {
+          "key": 5,
+          "value": "11111111111111111111111111111111"
+        },
+        {
+          "key": 3,
+          "value": "b"
+        }
+      ],
+      "legacy_hex": "82cca2a162cca4d9203131313131313131313131313131313131313131313131313131313131313131",
+      "retichat_hex": "81ccd18203a16205d9203131313131313131313131313131313131313131313131313131313131313131"
+    },
+    {
+      "name": "merged beside the router's name entry",
+      "start_hex": "81ccd18100c403426f62",
+      "entries": [
+        {
+          "key": 4,
+          "value": "leave"
+        },
+        {
+          "key": 1,
+          "value": "0123456789abcdef0123456789abcdef"
+        }
+      ],
+      "legacy_hex": "83ccd18100c403426f62cca3a56c65617665cca0d9203031323334353637383961626364656630313233343536373839616263646566",
+      "retichat_hex": "81ccd18300c403426f6201d920303132333435363738396162636465663031323334353637383961626364656604a56c65617665"
+    },
+    {
+      "name": "every entry",
+      "start_hex": "80",
+      "entries": [
+        {
+          "key": 1,
+          "value": "0123456789abcdef0123456789abcdef"
+        },
+        {
+          "key": 2,
+          "value": "11111111111111111111111111111111,22222222222222222222222222222222"
+        },
+        {
+          "key": 3,
+          "value": "Hikers"
+        },
+        {
+          "key": 4,
+          "value": "invite"
+        },
+        {
+          "key": 5,
+          "value": "11111111111111111111111111111111"
+        },
+        {
+          "key": 6,
+          "value": "22222222222222222222222222222222"
+        },
+        {
+          "key": 7,
+          "value": "22222222222222222222222222222222"
+        },
+        {
+          "key": 8,
+          "value": true
+        },
+        {
+          "key": 9,
+          "value": "11111111111111111111111111111111:AAEC"
+        }
+      ],
+      "legacy_hex": "89cca0d9203031323334353637383961626364656630313233343536373839616263646566cca1d94131313131313131313131313131313131313131313131313131313131313131312c3232323232323232323232323232323232323232323232323232323232323232cca2a648696b657273cca3a6696e76697465cca4d9203131313131313131313131313131313131313131313131313131313131313131cca5d9203232323232323232323232323232323232323232323232323232323232323232cca6d9203232323232323232323232323232323232323232323232323232323232323232cca7c3cca8d92531313131313131313131313131313131313131313131313131313131313131313a41414543",
+      "retichat_hex": "81ccd18901d920303132333435363738396162636465663031323334353637383961626364656602d94131313131313131313131313131313131313131313131313131313131313131312c323232323232323232323232323232323232323232323232323232323232323203a648696b65727304a6696e7669746505d920313131313131313131313131313131313131313131313131313131313131313106d920323232323232323232323232323232323232323232323232323232323232323207d920323232323232323232323232323232323232323232323232323232323232323208c309d92531313131313131313131313131313131313131313131313131313131313131313a41414543"
+    }
+  ]
+}

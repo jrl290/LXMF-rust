@@ -10,6 +10,7 @@ pub mod lxmf;
 pub mod lxm_peer;
 pub mod lxm_router;
 pub mod name_ledger;
+pub mod retichat_field;
 pub mod utilities;
 pub mod version;
 pub mod cli_util;

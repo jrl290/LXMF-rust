@@ -23,11 +23,12 @@ pub const FIELD_RENDERER: u8 = 0x0F;
 // reads it (DISPLAY_NAMES.md §2.1). MeshChatX uses field 16 for its app
 // extensions and Columba reads it as legacy reactions.
 
-/// DISPLAY_NAMES.md §2.1: the LXMF source's display name, cleaned UTF-8 as
-/// msgpack bin (receivers accept bin or str). Empty means "no name now".
-/// Only the router writes it (`LXMRouter::handle_outbound`); decode it with
-/// `crate::display_name::decode_field`.
-pub const FIELD_DISPLAY_NAME: u8 = 0xD1;
+/// DISPLAY_NAMES.md §2.1 / §10: the Retichat field. Its value is a msgpack
+/// map of small integer keys (`crate::retichat_field::RF_*`): key 0 is the
+/// LXMF source's display name (router-owned, decoded by
+/// `crate::display_name::decode_field`), keys 1-9 the group entries. Read
+/// and write it only through `crate::retichat_field`.
+pub const FIELD_RETICHAT: u8 = 0xD1;
 
 pub const FIELD_CUSTOM_TYPE: u8 = 0xFB;
 pub const FIELD_CUSTOM_DATA: u8 = 0xFC;

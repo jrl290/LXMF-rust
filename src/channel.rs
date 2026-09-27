@@ -4,7 +4,7 @@
 //! (`retichat-ffi`) and the Android JNI (`retichat-jni`) bridges, which are
 //! thin wrappers over it. Until 2026-09-27 each bridge carried its own copy;
 //! the key-binding check (DISPLAY_NAMES.md §2.3) and the Channel Display Name
-//! (field 0xD1) now live here, once.
+//! (key 0 of the Retichat field 0xD1) now live here, once.
 //!
 //! ## Wire format (unchanged)
 //!
@@ -37,7 +37,7 @@ use reticulum_rust::identity::Identity;
 
 use crate::display_name::{self, NameField};
 use crate::lx_message::LXMessage;
-use crate::lxmf::FIELD_DISPLAY_NAME;
+use crate::retichat_field::RF_DISPLAY_NAME;
 
 const LXMF_APP_NAME: &str = "lxmf";
 const LXMF_DELIVERY_ASPECT: &str = "delivery";
@@ -95,7 +95,7 @@ pub fn lxmf_delivery_hash_for_public_key(public_key: &[u8]) -> Result<Vec<u8>, S
 
 /// The name a post carries (DISPLAY_NAMES.md §2.3): `Absent` puts no 0xD1
 /// in the message (and the bytes are exactly the pre-name format), `Clear`
-/// an empty 0xD1, `Name` the cleaned name.
+/// `{0xD1: {0: empty bin}}`, `Name` `{0xD1: {0: cleaned name as bin}}`.
 pub type PostName = NameField;
 
 /// Map the FFI/JNI `(state, bytes)` pair to a post name: 0 none, 1 clear,
@@ -193,7 +193,7 @@ fn pack_at(
 	)
 	.map_err(|e| format!("LXMessage::new: {e}"))?;
 	if let Some(value) = name_value {
-		msg.set_field(FIELD_DISPLAY_NAME, value);
+		msg.set_retichat_entry(RF_DISPLAY_NAME, value);
 	}
 	msg.timestamp = timestamp;
 	msg.pack(false).map_err(|e| format!("LXMessage::pack: {e}"))?;
@@ -400,15 +400,64 @@ mod tests {
 		assert_eq!(plaintext.len(), 84 + 64 + payload.len());
 	}
 
+	/// §2.3: `{0xD1: {0: bin name}}`, pinned to the byte: the whole
+	/// payload after the timestamp, not just its tail.
 	#[test]
-	fn a_named_post_carries_0xd1_as_bin() {
+	fn a_named_post_carries_key_0_of_0xd1_as_bin() {
 		let sender = Identity::new(true);
 		let ts = 1_790_000_000.5_f64;
 		let post = pack_at(CHANNEL, &sender, b"hi", b"", &NameField::Name("  Bob ".into()), Some(ts)).unwrap();
 		let plaintext = decrypt_post(CHANNEL, &post.wire);
-		assert!(plaintext.ends_with(&[0x81, 0xcc, 0xd1, 0xc4, 0x03, b'B', b'o', b'b']), "fields = {{0xD1: bin \"Bob\"}}");
+		let mut payload = vec![0x94, 0xcb];
+		payload.extend_from_slice(&ts.to_be_bytes());
+		payload.extend_from_slice(&[0xc4, 0x00, 0xc4, 0x02, b'h', b'i']);
+		payload.extend_from_slice(&[0x81, 0xcc, 0xd1, 0x81, 0x00, 0xc4, 0x03, b'B', b'o', b'b']);
+		assert_eq!(&plaintext[84 + 64..], &payload[..], "fields = {{0xD1: {{0: bin \"Bob\"}}}}");
 		let clear = pack_at(CHANNEL, &sender, b"hi", b"", &NameField::Clear, Some(ts)).unwrap();
-		assert!(decrypt_post(CHANNEL, &clear.wire).ends_with(&[0x81, 0xcc, 0xd1, 0xc4, 0x00]));
+		let plaintext = decrypt_post(CHANNEL, &clear.wire);
+		assert!(plaintext.ends_with(&[0xc4, 0x02, b'h', b'i', 0x81, 0xcc, 0xd1, 0x81, 0x00, 0xc4, 0x00]));
+	}
+
+	/// Unpack reads key 0 of the map (via `decode_field`); a post carrying
+	/// the unshipped `{0xD1: bin}` form, or other Retichat entries only,
+	/// reports no name.
+	#[test]
+	fn unpack_reads_key_0_of_the_map() {
+		let sender = Identity::new(true);
+		let sender_dest = Destination::new_outbound(
+			Some(sender.clone()),
+			DestinationType::Single,
+			LXMF_APP_NAME.to_string(),
+			vec![LXMF_DELIVERY_ASPECT.to_string()],
+		)
+		.unwrap();
+		let post_with = |fields: rmpv::Value| {
+			let mut msg = LXMessage::new(
+				Some(channel_destination(CHANNEL).unwrap()),
+				Some(sender_dest.clone()),
+				Some(b"x".to_vec()),
+				Some(Vec::new()),
+				Some(fields),
+				Some(LXMessage::PROPAGATED),
+				None,
+				None,
+				None,
+				false,
+			)
+			.unwrap();
+			msg.pack(false).unwrap();
+			let mut plaintext = PRELUDE_MAGIC.to_vec();
+			plaintext.extend_from_slice(&sender.get_public_key().unwrap());
+			plaintext.extend_from_slice(&msg.packed.unwrap()[HASH_LEN..]);
+			unpack(CHANNEL, &encrypt_post(CHANNEL, &plaintext)).unwrap()
+		};
+		use rmpv::Value;
+		let bin_form = Value::Map(vec![(Value::from(0xD1), Value::Binary(b"Bob".to_vec()))]);
+		assert_eq!(post_with(bin_form).display_name, NameField::Absent);
+		let str_key0 = Value::Map(vec![(Value::from(0xD1), Value::Map(vec![(Value::from(0), Value::String("Bob".into()))]))]);
+		assert_eq!(post_with(str_key0).display_name, NameField::Name("Bob".into()), "receivers accept str");
+		let other_only = Value::Map(vec![(Value::from(0xD1), Value::Map(vec![(Value::from(3), Value::String("g".into()))]))]);
+		assert_eq!(post_with(other_only).display_name, NameField::Absent);
 	}
 
 	#[test]

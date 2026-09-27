@@ -454,40 +454,72 @@ pub fn message_add_attachment(
 
 /// An LXMF field key from a host integer. Keys are one byte: anything
 /// outside 0..=255 is an error, never truncated (a truncated 0x1D1 would
-/// alias 0xD1, FIELD_DISPLAY_NAME).
+/// alias 0xD1, FIELD_RETICHAT).
 pub fn field_key(key: i64) -> Result<u8, String> {
     u8::try_from(key).map_err(|_| format!("LXMF field key {key} is outside 0..=255"))
 }
 
+/// The generic field setters never write the Retichat field whole: a str or
+/// bool there would replace the map (and every entry in it, the router's
+/// name included). Its entries go through `message_set_retichat_*`.
+fn generic_field_key(key: u8) -> Result<u8, String> {
+    if key == crate::lxmf::FIELD_RETICHAT {
+        return Err(
+            "field 0xD1 is the Retichat field (a map); set its entries with lxmf_message_set_retichat_string/_bool"
+                .to_string(),
+        );
+    }
+    Ok(key)
+}
+
+fn with_message(handle: u64, f: impl FnOnce(&mut LXMessage)) -> Result<(), String> {
+    let msg: Arc<Mutex<LXMessage>> =
+        get_handle(handle).ok_or_else(|| "invalid message handle".to_string())?;
+    let mut guard = msg.lock().map_err(|e| e.to_string())?;
+    f(&mut guard);
+    Ok(())
+}
+
 /// Add a string-valued field to an outbound message.
 ///
-/// `key` is an LXMF field ID (e.g. 0x08 for FIELD_THREAD).
+/// `key` is an LXMF field ID (e.g. 0x08 for FIELD_THREAD); 0xD1 is refused
+/// (see `message_set_retichat_string`).
 /// `value` is the UTF-8 string to store.
 pub fn message_add_field_string(
     handle: u64,
     key: u8,
     value: &str,
 ) -> Result<(), String> {
-    let msg: Arc<Mutex<LXMessage>> =
-        get_handle(handle).ok_or_else(|| "invalid message handle".to_string())?;
-    msg.lock()
-        .map_err(|e| e.to_string())?
-        .set_field(key, rmpv::Value::String(value.into()));
-    Ok(())
+    let key = generic_field_key(key)?;
+    with_message(handle, |m| m.set_field(key, rmpv::Value::String(value.into())))
 }
 
-/// Add a boolean-valued field to an outbound message.
+/// Add a boolean-valued field to an outbound message. 0xD1 is refused.
 pub fn message_add_field_bool(
     handle: u64,
     key: u8,
     value: bool,
 ) -> Result<(), String> {
-    let msg: Arc<Mutex<LXMessage>> =
-        get_handle(handle).ok_or_else(|| "invalid message handle".to_string())?;
-    msg.lock()
-        .map_err(|e| e.to_string())?
-        .set_field(key, rmpv::Value::Boolean(value));
-    Ok(())
+    let key = generic_field_key(key)?;
+    with_message(handle, |m| m.set_field(key, rmpv::Value::Boolean(value)))
+}
+
+/// Set a string entry of the Retichat field 0xD1 (DISPLAY_NAMES.md §10) on
+/// an outbound message: `{0xD1: {key: str}}`, merged with the entries
+/// already there. `key` must be 1..=127 (0 is the router's display name);
+/// a defined group key must be a str key (every one but 8). Returns an
+/// error, and changes nothing, otherwise.
+pub fn message_set_retichat_string(handle: u64, key: i64, value: &str) -> Result<(), String> {
+    let key = crate::retichat_field::check_app_entry(key, crate::retichat_field::EntryType::Str)?;
+    with_message(handle, |m| m.set_retichat_entry(key, rmpv::Value::String(value.into())))
+}
+
+/// Set a bool entry of the Retichat field 0xD1 (§10): as
+/// `message_set_retichat_string`; of the defined keys only 8
+/// (`RF_GROUP_RELAY_DONE`) is a bool.
+pub fn message_set_retichat_bool(handle: u64, key: i64, value: bool) -> Result<(), String> {
+    let key = crate::retichat_field::check_app_entry(key, crate::retichat_field::EntryType::Bool)?;
+    with_message(handle, |m| m.set_retichat_entry(key, rmpv::Value::Boolean(value)))
 }
 
 /// Clone an outbound message as a fresh PROPAGATED message, preserving all
@@ -1163,5 +1195,77 @@ mod field_key_tests {
         assert!(field_key(0x100).is_err());
         assert!(field_key(-1).is_err());
         assert!(field_key(-47).is_err(), "-47 as u8 is 0xD1");
+    }
+}
+
+#[cfg(test)]
+mod retichat_field_setter_tests {
+    use super::*;
+    use reticulum_rust::destination::{Destination, DestinationType};
+
+    fn message_handle() -> (u64, Arc<Mutex<LXMessage>>) {
+        let dest = |inbound: bool| {
+            let identity = Some(Identity::new(true));
+            let aspects = vec!["delivery".to_string()];
+            if inbound {
+                Destination::new_inbound(identity, DestinationType::Single, "lxmf".into(), aspects).unwrap()
+            } else {
+                Destination::new_outbound(identity, DestinationType::Single, "lxmf".into(), aspects).unwrap()
+            }
+        };
+        let msg = LXMessage::new(
+            Some(dest(false)), Some(dest(true)), Some(b"hi".to_vec()), Some(Vec::new()), None,
+            Some(LXMessage::DIRECT), None, None, None, false,
+        )
+        .unwrap();
+        let arc = Arc::new(Mutex::new(msg));
+        (store_handle(arc.clone()), arc)
+    }
+
+    fn fields_bytes(arc: &Arc<Mutex<LXMessage>>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &arc.lock().unwrap().fields).unwrap();
+        buf
+    }
+
+    /// §10: entries merge into one `{0xD1: {...}}` map, keys one byte, in
+    /// ascending order; key 0 and keys outside 1..=127 are refused and
+    /// change nothing.
+    #[test]
+    fn retichat_setters_build_the_map() {
+        let (handle, arc) = message_handle();
+        message_set_retichat_bool(handle, 8, true).unwrap();
+        message_set_retichat_string(handle, 1, "g").unwrap();
+        assert_eq!(fields_bytes(&arc), vec![0x81, 0xcc, 0xd1, 0x82, 0x01, 0xa1, b'g', 0x08, 0xc3]);
+
+        for key in [0i64, 128, -1, 0x101, 0xD1] {
+            assert!(message_set_retichat_string(handle, key, "x").is_err(), "key {key}");
+            assert!(message_set_retichat_bool(handle, key, true).is_err(), "key {key}");
+        }
+        assert!(message_set_retichat_bool(handle, 1, true).is_err(), "group id is a str");
+        assert!(message_set_retichat_string(handle, 8, "x").is_err(), "relay done is a bool");
+        message_set_retichat_string(handle, 127, "top").unwrap();
+        message_set_retichat_bool(handle, 42, false).unwrap();
+        assert_eq!(
+            fields_bytes(&arc),
+            vec![0x81, 0xcc, 0xd1, 0x84, 0x01, 0xa1, b'g', 0x08, 0xc3, 0x2a, 0xc2, 0x7f, 0xa3, b't', b'o', b'p']
+        );
+        assert!(message_set_retichat_string(0, 1, "x").is_err(), "invalid handle");
+    }
+
+    /// The generic setters cannot replace the Retichat map with a scalar.
+    #[test]
+    fn generic_setters_refuse_the_retichat_field() {
+        let (handle, arc) = message_handle();
+        message_set_retichat_string(handle, 3, "n").unwrap();
+        let before = fields_bytes(&arc);
+        assert!(message_add_field_string(handle, 0xD1, "x").is_err());
+        assert!(message_add_field_bool(handle, 0xD1, true).is_err());
+        assert_eq!(fields_bytes(&arc), before);
+        message_add_field_string(handle, 0xA0, "g").unwrap();
+        message_add_field_bool(handle, 0xA7, true).unwrap();
+        let fields = arc.lock().unwrap().fields.clone();
+        assert_eq!(crate::retichat_field::top_level(&fields, 0xA0), Some(&rmpv::Value::String("g".into())));
+        assert_eq!(crate::retichat_field::top_level(&fields, 0xA7), Some(&rmpv::Value::Boolean(true)));
     }
 }

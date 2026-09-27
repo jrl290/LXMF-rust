@@ -72,7 +72,8 @@ pub struct DistroMessage {
     /// is how a client tells "sync copy with a bad 0xFC — drop and log" apart
     /// from an ordinary message, whose `sent_to` is also `None`.
     pub sent_by: Option<String>,
-    /// DISPLAY_NAMES.md §2.1 / §5.2: what field 0xD1 says about the source.
+    /// DISPLAY_NAMES.md §2.1 / §5.2: what the name entry (key 0 of field
+    /// 0xD1) says about the source.
     /// Whether the client accepts it depends on the signature fields below.
     pub display_name: NameField,
     /// LXMF signature check against the source's known key (§5.2): true only
@@ -747,7 +748,8 @@ mod tests {
     }
 
     fn name_fields(value: Value) -> Vec<(Value, Value)> {
-        vec![(Value::Integer(crate::lxmf::FIELD_DISPLAY_NAME.into()), value)]
+        // {0xD1: {0: value}} (DISPLAY_NAMES.md §2.1).
+        vec![(Value::from(crate::lxmf::FIELD_RETICHAT), Value::Map(vec![(Value::from(0), value)]))]
     }
 
     /// DISPLAY_NAMES.md §5.2: an ordinary message reports its 0xD1 and its

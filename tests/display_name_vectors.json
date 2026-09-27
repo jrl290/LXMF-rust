@@ -1,10 +1,10 @@
 {
-  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (field 0xD1), 4.1 (digest)",
+  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (the name: key 0 of the Retichat field 0xD1, a map), 4.1 (digest)",
   "notes": [
     "input_hex / fields_msgpack_hex are raw bytes as lowercase hex.",
     "expected is the cleaned name as a JSON string, or null for None.",
     "clean_announce applies clean() and then maps 'Anonymous Peer' (ASCII case-insensitive) to None.",
-    "decode_field: state is absent | clear | name; name is set only for state name.",
+    "decode_field: the name is key 0 of the map at field 0xD1 ({0xD1: {0: name}}); a 0xD1 that is not a map is absent. state is absent | clear | name; display_name is set only for state name. More Retichat-field cases (group entries) are in retichat_field_vectors.json.",
     "digest_hex is the first 16 bytes of SHA-256 over the UTF-8 of input.",
     "Interpretation of rule 5: after truncation, trailing U+0020 and U+200D are stripped repeatedly (see the 'trailing' vectors).",
     "Order of rules 2 and 3: U+0085 is White_Space, so rule 2 turns it into a space before rule 3 could remove it as C1."
@@ -379,79 +379,79 @@
     },
     {
       "name": "bin name",
-      "fields_msgpack_hex": "81ccd1c405416c696365",
+      "fields_msgpack_hex": "81ccd18100c405416c696365",
       "state": "name",
       "display_name": "Alice"
     },
     {
       "name": "str name",
-      "fields_msgpack_hex": "81ccd1a5416c696365",
+      "fields_msgpack_hex": "81ccd18100a5416c696365",
       "state": "name",
       "display_name": "Alice"
     },
     {
       "name": "bin name is cleaned",
-      "fields_msgpack_hex": "81ccd1c40720416c69636520",
+      "fields_msgpack_hex": "81ccd18100c40720416c69636520",
       "state": "name",
       "display_name": "Alice"
     },
     {
       "name": "empty bin is clear",
-      "fields_msgpack_hex": "81ccd1c400",
+      "fields_msgpack_hex": "81ccd18100c400",
       "state": "clear",
       "display_name": null
     },
     {
       "name": "empty str is clear",
-      "fields_msgpack_hex": "81ccd1a0",
+      "fields_msgpack_hex": "81ccd18100a0",
       "state": "clear",
       "display_name": null
     },
     {
       "name": "nil is absent",
-      "fields_msgpack_hex": "81ccd1c0",
+      "fields_msgpack_hex": "81ccd18100c0",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "int is absent",
-      "fields_msgpack_hex": "81ccd105",
+      "fields_msgpack_hex": "81ccd1810005",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "array is absent",
-      "fields_msgpack_hex": "81ccd191a141",
+      "fields_msgpack_hex": "81ccd1810091a141",
       "state": "absent",
       "display_name": null
     },
     {
-      "name": "map is absent",
-      "fields_msgpack_hex": "81ccd180",
+      "name": "key 0 holding a map is absent",
+      "fields_msgpack_hex": "81ccd1810080",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "bool is absent",
-      "fields_msgpack_hex": "81ccd1c3",
+      "fields_msgpack_hex": "81ccd18100c3",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "non-empty value cleaning to nothing is absent",
-      "fields_msgpack_hex": "81ccd1c403e2808b",
+      "fields_msgpack_hex": "81ccd18100c403e2808b",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "whitespace-only value is absent, not clear",
-      "fields_msgpack_hex": "81ccd1a120",
+      "fields_msgpack_hex": "81ccd18100a120",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "invalid utf-8 is absent",
-      "fields_msgpack_hex": "81ccd1c401ff",
+      "fields_msgpack_hex": "81ccd18100c401ff",
       "state": "absent",
       "display_name": null
     },
@@ -462,22 +462,88 @@
       "display_name": null
     },
     {
-      "name": "key 0xD1 as uint16 matches",
-      "fields_msgpack_hex": "81cd00d1c40141",
+      "name": "field key 0xD1 as uint16 matches",
+      "fields_msgpack_hex": "81cd00d18100c40141",
       "state": "name",
       "display_name": "A"
     },
     {
-      "name": "key as string does not match",
-      "fields_msgpack_hex": "81a3323039c40141",
+      "name": "field key as string \"209\" does not match",
+      "fields_msgpack_hex": "81a33230398100c40141",
       "state": "absent",
       "display_name": null
     },
     {
       "name": "other fields alongside",
-      "fields_msgpack_hex": "820cc0ccd1c403426f62",
+      "fields_msgpack_hex": "820cc0ccd18100c403426f62",
       "state": "name",
       "display_name": "Bob"
+    },
+    {
+      "name": "0xD1 as bin (the unshipped non-map form) is absent",
+      "fields_msgpack_hex": "81ccd1c405416c696365",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "0xD1 as str (not a map) is absent",
+      "fields_msgpack_hex": "81ccd1a5416c696365",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "0xD1 as nil (not a map) is absent",
+      "fields_msgpack_hex": "81ccd1c0",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "empty 0xD1 map is absent",
+      "fields_msgpack_hex": "81ccd180",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "key 0 as uint8 matches",
+      "fields_msgpack_hex": "81ccd181cc00c40141",
+      "state": "name",
+      "display_name": "A"
+    },
+    {
+      "name": "key 0 as uint16 matches",
+      "fields_msgpack_hex": "81ccd181cd0000c40141",
+      "state": "name",
+      "display_name": "A"
+    },
+    {
+      "name": "key 0 as int8 matches",
+      "fields_msgpack_hex": "81ccd181d000c40141",
+      "state": "name",
+      "display_name": "A"
+    },
+    {
+      "name": "key \"0\" as string does not match",
+      "fields_msgpack_hex": "81ccd181a130c40141",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "other Retichat entries only is absent",
+      "fields_msgpack_hex": "81ccd18101a167",
+      "state": "absent",
+      "display_name": null
+    },
+    {
+      "name": "key 0 after group entries",
+      "fields_msgpack_hex": "81ccd18301a16708c300c403426f62",
+      "state": "name",
+      "display_name": "Bob"
+    },
+    {
+      "name": "key 0 clear beside an unknown key",
+      "fields_msgpack_hex": "81ccd1827fc000c400",
+      "state": "clear",
+      "display_name": null
     }
   ],
   "digest": [

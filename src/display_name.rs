@@ -1,4 +1,5 @@
-//! Display names: cleaning, the `0xD1` field, and the name digest.
+//! Display names: cleaning, the name entry (key 0 of the Retichat field
+//! `0xD1`), and the name digest.
 //!
 //! The contract is `DISPLAY_NAMES.md` in this crate. This module is the one
 //! Rust implementation of its section 3; Swift and Kotlin call it through the
@@ -8,7 +9,7 @@
 use rmpv::Value;
 use sha2::{Digest, Sha256};
 
-use crate::lxmf::FIELD_DISPLAY_NAME;
+use crate::retichat_field::{self, RF_DISPLAY_NAME};
 
 /// DISPLAY_NAMES.md §3 rule 5: names are cut to this many Unicode scalars.
 pub const MAX_SCALARS: usize = 64;
@@ -127,11 +128,11 @@ pub fn empty_digest() -> [u8; DIGEST_LEN] {
 	digest(None)
 }
 
-/// What a `0xD1` field says (§3, last table).
+/// What the name entry (key 0 of `0xD1`) says (§3, last table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameField {
-	/// No `0xD1`, a value that is not bin/str, or a non-empty value that
-	/// cleans to nothing.
+	/// No `0xD1` map, no key 0 in it, a value that is not bin/str, or a
+	/// non-empty value that cleans to nothing.
 	Absent,
 	/// A zero-length value: "I have no name now".
 	Clear,
@@ -169,7 +170,7 @@ impl NameField {
 		out
 	}
 
-	/// The `0xD1` value that says this, if any: `Absent` puts nothing in the
+	/// The key-0 value that says this, if any: `Absent` puts no entry in the
 	/// message, `Clear` an empty bin, `Name` the name as bin (§2.1).
 	pub fn to_value(&self) -> Option<Value> {
 		match self {
@@ -180,7 +181,7 @@ impl NameField {
 	}
 }
 
-/// Decode one `0xD1` value. Only bin and str count (§2.1).
+/// Decode one name-entry value. Only bin and str count (§2.1).
 pub fn decode_value(value: &Value) -> NameField {
 	let raw: &[u8] = match value {
 		Value::Binary(bytes) => bytes,
@@ -196,25 +197,15 @@ pub fn decode_value(value: &Value) -> NameField {
 	}
 }
 
-/// Whether a fields-map key is the integer `key` (any msgpack int width).
-pub(crate) fn key_is(key: &Value, target: u8) -> bool {
-	matches!(key, Value::Integer(int) if int.as_u64() == Some(target as u64))
-}
-
-/// Decode `0xD1` from an LXMF fields map. Anything that is not a map, or a
-/// map without an integer `0xD1` key, is `Absent`.
+/// Decode the name from an LXMF fields map: key 0 of the Retichat field
+/// `0xD1` (§2.1). Fields that are not a map, no `0xD1`, a `0xD1` that is not
+/// a map (including the unshipped `{0xD1: bin}` form) or a map without an
+/// integer key 0 are all `Absent`.
 pub fn decode_field(fields: &Value) -> NameField {
-	match fields {
-		Value::Map(entries) => entries
-			.iter()
-			.find(|(key, _)| key_is(key, FIELD_DISPLAY_NAME))
-			.map(|(_, value)| decode_value(value))
-			.unwrap_or(NameField::Absent),
-		_ => NameField::Absent,
-	}
+	retichat_field::read_entry(fields, RF_DISPLAY_NAME).map(decode_value).unwrap_or(NameField::Absent)
 }
 
-/// Decode `0xD1` from msgpack-encoded fields (the `fields_raw` the FFI hands
+/// Decode the name from msgpack-encoded fields (the `fields_raw` the FFI hands
 /// the apps). Bytes that are not msgpack are `Absent`.
 pub fn decode_fields_bytes(fields_raw: &[u8]) -> NameField {
 	match rmpv::decode::read_value(&mut std::io::Cursor::new(fields_raw)) {
@@ -252,17 +243,29 @@ mod tests {
 		buf
 	}
 
-	/// §2.1: the key is the integer 0xD1, encoded `0xCC 0xD1`, and the value
-	/// is bin — the way LXMessage::set_field writes it.
+	/// §2.1: `{0xD1: {0: bin}}`: the field number encoded `0xCC 0xD1`, a
+	/// map (not bin-wrapped msgpack), key 0 as one byte, the name as bin —
+	/// the way `retichat_field::set_entry` writes it.
 	#[test]
-	fn field_encodes_as_uint8_key_and_bin_value() {
-		let fields = Value::Map(vec![(
-			Value::from(FIELD_DISPLAY_NAME as i64),
-			NameField::Name("Alice".into()).to_value().unwrap(),
-		)]);
-		assert_eq!(pack(&fields), [&[0x81, 0xCC, 0xD1, 0xC4, 0x05][..], b"Alice"].concat());
+	fn field_encodes_as_a_map_with_key_0_and_a_bin_value() {
+		let mut fields = Value::Map(Vec::new());
+		retichat_field::set_entry(&mut fields, RF_DISPLAY_NAME, NameField::Name("Alice".into()).to_value().unwrap());
+		assert_eq!(pack(&fields), [&[0x81, 0xCC, 0xD1, 0x81, 0x00, 0xC4, 0x05][..], b"Alice"].concat());
+		assert_eq!(decode_field(&fields), NameField::Name("Alice".into()));
 		assert_eq!(pack(&NameField::Clear.to_value().unwrap()), vec![0xC4, 0x00]);
 		assert_eq!(NameField::Absent.to_value(), None);
+	}
+
+	/// The unshipped `{0xD1: bin}` form, and any other non-map `0xD1`, says
+	/// nothing (§2.1).
+	#[test]
+	fn a_non_map_field_is_absent() {
+		for value in [Value::Binary(b"Alice".to_vec()), Value::String("Alice".into()), Value::Nil, Value::from(5)] {
+			let fields = Value::Map(vec![(Value::from(0xD1), value.clone())]);
+			assert_eq!(decode_field(&fields), NameField::Absent, "{value:?}");
+		}
+		let map = Value::Map(vec![(Value::from(0xD1), Value::Map(vec![(Value::from(0), Value::Binary(Vec::new()))]))]);
+		assert_eq!(decode_field(&map), NameField::Clear);
 	}
 
 	#[test]

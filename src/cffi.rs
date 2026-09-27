@@ -228,7 +228,7 @@ pub extern "C" fn lxmf_free_bytes(ptr: *mut u8, len: u32) {
 /// - `identity_path`   — Path to identity file
 /// - `create_identity` — If non-zero and identity file missing, create one
 /// - `display_name`    — the initial Message Display Name (DISPLAY_NAMES.md
-///                       §4.1): sent inside messages (field 0xD1) by the name
+///                       §4.1): sent inside messages (key 0 of field 0xD1) by the name
 ///                       ledger's rule, never announced. Empty = none. Change
 ///                       it later with `lxmf_client_set_message_display_name`;
 ///                       the Announce Display Name starts empty and is set
@@ -1696,7 +1696,8 @@ fn set_client_name(
 }
 
 /// Set the Message Display Name (DISPLAY_NAMES.md §4.1) at runtime: the name
-/// the router adds (field 0xD1) to outbound messages by the name-ledger rule.
+/// the router adds (key 0 of the Retichat field 0xD1) to outbound messages
+/// by the name-ledger rule.
 /// NULL or "" clears it; the name is cleaned (§3). Takes effect for the next
 /// message, with no restart. Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -1737,7 +1738,8 @@ pub extern "C" fn lxmf_display_name_clean(raw: *const u8, raw_len: u32, announce
     }
 }
 
-/// Decode field 0xD1 (DISPLAY_NAMES.md §2.1, §3) from the msgpack fields
+/// Decode the name entry, key 0 of the Retichat field 0xD1 (DISPLAY_NAMES.md
+/// §2.1, §3; a 0xD1 that is not a map is absent), from the msgpack fields
 /// buffer a delivery callback hands over (`fields_raw`). Returns a heap
 /// buffer (free with `lxmf_free_bytes`), always at least 3 bytes:
 ///
@@ -1820,7 +1822,8 @@ pub extern "C" fn lxmf_message_new(
 }
 
 /// Add a string-valued field to a message.
-/// `key` is an LXMF field ID (e.g. 0xA0 for group ID).
+/// `key` is an LXMF field ID (e.g. 0xA0 for group ID). 0xD1, the Retichat
+/// field, is refused: set its entries with `lxmf_message_set_retichat_*`.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn lxmf_message_add_field(
@@ -1838,11 +1841,55 @@ pub extern "C" fn lxmf_message_add_field(
     }
 }
 
-/// Add a boolean-valued field to a message.
+/// Add a boolean-valued field to a message. 0xD1 is refused, as above.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn lxmf_message_add_field_bool(msg: u64, key: u8, value: i32) -> i32 {
     match lxmf::message_add_field_bool(msg, key, value != 0) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Set a string entry of the Retichat field 0xD1 (DISPLAY_NAMES.md §10):
+/// the message's fields get `{0xD1: {key: value}}`, merged with the entries
+/// already there (ascending key order; one byte per key on the wire).
+/// `key` must be 1..=127: key 0 is the display name, which only the router
+/// writes. Of the defined keys (§10 table) only 8 is not a string.
+/// `value` must be non-NULL UTF-8.
+/// Returns 0 on success, -1 on error (`lxmf_last_error`), changing nothing.
+#[no_mangle]
+pub extern "C" fn lxmf_message_set_retichat_string(msg: u64, key: i32, value: *const c_char) -> i32 {
+    if value.is_null() {
+        set_error("value is NULL");
+        return -1;
+    }
+    let value = match unsafe { CStr::from_ptr(value) }.to_str() {
+        Ok(v) => v,
+        Err(_) => {
+            set_error("value is not UTF-8");
+            return -1;
+        }
+    };
+    match lxmf::message_set_retichat_string(msg, key as i64, value) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Set a bool entry of the Retichat field 0xD1 (§10), as
+/// `lxmf_message_set_retichat_string`; of the defined keys only 8
+/// (RF_GROUP_RELAY_DONE) is a bool. `value` non-zero is true.
+/// Returns 0 on success, -1 on error (`lxmf_last_error`), changing nothing.
+#[no_mangle]
+pub extern "C" fn lxmf_message_set_retichat_bool(msg: u64, key: i32, value: i32) -> i32 {
+    match lxmf::message_set_retichat_bool(msg, key as i64, value != 0) {
         Ok(()) => 0,
         Err(e) => {
             set_error(e);
@@ -2065,5 +2112,66 @@ mod display_name_buffer_tests {
         assert_eq!(written as u32, LXMF_DISPLAY_NAME_BUF_LEN);
         assert_eq!(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(), longest);
         assert_eq!(recall(256).0, 0, "one byte short loses the name");
+    }
+}
+
+#[cfg(test)]
+mod retichat_field_export_tests {
+    use super::*;
+    use reticulum_rust::destination::{Destination, DestinationType};
+    use reticulum_rust::identity::Identity;
+
+    fn message_handle() -> (u64, Arc<Mutex<crate::LXMessage>>) {
+        let dest = |inbound: bool| {
+            let identity = Some(Identity::new(true));
+            let aspects = vec!["delivery".to_string()];
+            if inbound {
+                Destination::new_inbound(identity, DestinationType::Single, "lxmf".into(), aspects).unwrap()
+            } else {
+                Destination::new_outbound(identity, DestinationType::Single, "lxmf".into(), aspects).unwrap()
+            }
+        };
+        let msg = crate::LXMessage::new(
+            Some(dest(false)), Some(dest(true)), Some(b"hi".to_vec()), Some(Vec::new()), None,
+            Some(crate::LXMessage::DIRECT), None, None, None, false,
+        )
+        .unwrap();
+        let arc = Arc::new(Mutex::new(msg));
+        (store_handle(arc.clone()), arc)
+    }
+
+    fn last_error() -> String {
+        let ptr = lxmf_last_error();
+        assert!(!ptr.is_null(), "an error was set");
+        let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        lxmf_free_string(ptr);
+        text
+    }
+
+    #[test]
+    fn set_retichat_exports() {
+        let (handle, arc) = message_handle();
+        let g = CString::new("g").unwrap();
+        assert_eq!(lxmf_message_set_retichat_string(handle, 1, g.as_ptr()), 0);
+        assert_eq!(lxmf_message_set_retichat_bool(handle, 8, 1), 0);
+        let fields = arc.lock().unwrap().fields.clone();
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &fields).unwrap();
+        assert_eq!(bytes, vec![0x81, 0xcc, 0xd1, 0x82, 0x01, 0xa1, b'g', 0x08, 0xc3]);
+
+        assert_eq!(lxmf_message_set_retichat_string(handle, 0, g.as_ptr()), -1);
+        assert!(last_error().contains("key 0"));
+        assert_eq!(lxmf_message_set_retichat_bool(handle, 0, 1), -1);
+        assert_eq!(lxmf_message_set_retichat_string(handle, 128, g.as_ptr()), -1);
+        assert!(last_error().contains("1..=127"));
+        assert_eq!(lxmf_message_set_retichat_string(handle, 3, std::ptr::null()), -1);
+        assert!(last_error().contains("NULL"));
+        let bad = [0xffu8, 0];
+        assert_eq!(lxmf_message_set_retichat_string(handle, 3, bad.as_ptr() as *const c_char), -1);
+        assert!(last_error().contains("UTF-8"));
+        assert_eq!(lxmf_message_add_field(handle, 0xD1, g.as_ptr()), -1, "the generic setter refuses 0xD1");
+        let mut after = Vec::new();
+        rmpv::encode::write_value(&mut after, &arc.lock().unwrap().fields).unwrap();
+        assert_eq!(after, bytes, "no refused call changed the message");
     }
 }

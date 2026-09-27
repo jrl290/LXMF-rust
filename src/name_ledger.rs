@@ -6,7 +6,8 @@
 //! changed name, a 30-day refresh, or once after the name was cleared.
 //!
 //! Storage: `<storagepath>/lxmf/display_names.sqlite3`, one row per
-//! `(source, recipient)`, upserted on every DELIVERED that carried `0xD1`.
+//! `(source, recipient)`, upserted on every DELIVERED that carried the name
+//! entry (key 0 of the Retichat field `0xD1`).
 //! WAL + `synchronous=NORMAL`, as Reticulum-rust's known destinations store.
 //!
 //! If the database cannot be opened the router logs it loudly and includes
@@ -21,10 +22,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use reticulum_rust::{hexrep, log, LOG_ERROR, LOG_NOTICE};
 
-use crate::display_name::{self, key_is, NameField, DIGEST_LEN, NAME_REFRESH_SECS};
+use crate::display_name::{self, NameField, DIGEST_LEN, NAME_REFRESH_SECS};
 use crate::distro::{DISTRO_SENT_TYPE, DISTRO_TRANSFER_TYPE};
 use crate::lx_message::LXMessage;
-use crate::lxmf::{FIELD_CUSTOM_TYPE, FIELD_DISPLAY_NAME};
+use crate::lxmf::FIELD_CUSTOM_TYPE;
+use crate::retichat_field::{self, key_is, RF_DISPLAY_NAME};
 
 pub const LEDGER_FILE_NAME: &str = "display_names.sqlite3";
 
@@ -85,10 +87,10 @@ pub fn is_own_devices_message(fields: &Value) -> bool {
 }
 
 /// `(source, recipient, digest)` to upsert when this outbound message is
-/// DELIVERED: present only when it carries a bin/str `0xD1`.
+/// DELIVERED: present only when it carries a bin/str name entry (key 0 of
+/// the `0xD1` map).
 pub fn delivery_record(message: &LXMessage) -> Option<(Vec<u8>, Vec<u8>, [u8; DIGEST_LEN])> {
-	let Value::Map(entries) = &message.fields else { return None };
-	let value = entries.iter().find(|(key, _)| key_is(key, FIELD_DISPLAY_NAME)).map(|(_, v)| v)?;
+	let value = retichat_field::read_entry(&message.fields, RF_DISPLAY_NAME)?;
 	let raw: &[u8] = match value {
 		Value::Binary(bytes) => bytes,
 		Value::String(string) => string.as_bytes(),
@@ -194,8 +196,10 @@ impl NameLedger {
 		if message.packed.is_some() {
 			return;
 		}
-		// Apps never set 0xD1 themselves (§4.1): the router's decision is the only one.
-		message.remove_field(FIELD_DISPLAY_NAME);
+		// Apps never set the name entry (§4.1): the router's decision is the
+		// only one. Only key 0 is touched; the app's other Retichat entries
+		// stay, and an emptied map (or a non-map 0xD1) is dropped.
+		message.remove_retichat_entry(RF_DISPLAY_NAME);
 		if is_own_devices_message(&message.fields) {
 			return;
 		}
@@ -223,11 +227,11 @@ impl NameLedger {
 			decide(message_name, None, now)
 		};
 		if let Some(value) = decision.to_value() {
-			message.set_field(FIELD_DISPLAY_NAME, value);
+			message.set_retichat_entry(RF_DISPLAY_NAME, value);
 		}
 	}
 
-	/// §4.1: the message reached DELIVERED; if it carries `0xD1`, record it.
+	/// §4.1: the message reached DELIVERED; if it carries the name entry, record it.
 	pub fn record_delivered(&self, message: &LXMessage, now: i64) {
 		if let Some(record) = delivery_record(message) {
 			self.record_delivery(&record, now);
@@ -426,14 +430,91 @@ mod tests {
 		assert_eq!(direct.fields, before);
 	}
 
+	fn pack(value: &Value) -> Vec<u8> {
+		let mut buf = Vec::new();
+		rmpv::encode::write_value(&mut buf, value).unwrap();
+		buf
+	}
+
+	/// `{0xD1: {entries}}`, as an app would build it.
+	fn retichat(entries: Vec<(i64, Value)>) -> Value {
+		Value::Map(vec![(
+			Value::from(0xD1),
+			Value::Map(entries.into_iter().map(|(k, v)| (Value::from(k), v)).collect()),
+		)])
+	}
+
 	#[test]
 	fn a_name_set_by_the_app_is_replaced_by_the_decision() {
 		let ledger = NameLedger::open(&temp_dir("appset"));
 		let p = pair();
 		send(&ledger, &p, Some("Alice"), 1_000, true);
-		let mut lxm = message(&p, Some(Value::Map(vec![(Value::from(0xD1i64), Value::Binary(b"Mallory".to_vec()))])));
+		let mut lxm = message(&p, Some(retichat(vec![(0, Value::Binary(b"Mallory".to_vec()))])));
 		ledger.prepare_outbound(Some("Alice"), &mut lxm, 1_001);
 		assert_eq!(decode_field(&lxm.fields), NameField::Absent);
+		assert_eq!(pack(&lxm.fields), vec![0x80], "no empty 0xD1 map is left behind");
+
+		// The unshipped bin form (not a map) carries nothing and is dropped.
+		let mut lxm = message(&p, Some(Value::Map(vec![(Value::from(0xD1), Value::Binary(b"Mallory".to_vec()))])));
+		ledger.prepare_outbound(Some("Alice"), &mut lxm, 1_002);
+		assert_eq!(pack(&lxm.fields), vec![0x80]);
+	}
+
+	/// §4.1: the router adds or removes only key 0; the app's other Retichat
+	/// entries (e.g. group entries after the §10 switch) survive, and key 0
+	/// goes first in the map.
+	#[test]
+	fn app_entries_survive_the_decision() {
+		let ledger = NameLedger::open(&temp_dir("appentries"));
+		let p = pair();
+		let app = || retichat(vec![(4, Value::String("leave".into())), (0, Value::Binary(b"Mallory".to_vec()))]);
+
+		let mut named = message(&p, Some(app()));
+		ledger.prepare_outbound(Some("Alice"), &mut named, 1_000);
+		assert_eq!(
+			pack(&named.fields),
+			vec![0x81, 0xcc, 0xd1, 0x82, 0x00, 0xc4, 0x05, b'A', b'l', b'i', b'c', b'e', 0x04, 0xa5, b'l', b'e', b'a', b'v', b'e']
+		);
+		ledger.record_delivered(&named, 1_000);
+
+		// Confirmed: no name this time, the app's entry stays.
+		let mut unnamed = message(&p, Some(app()));
+		ledger.prepare_outbound(Some("Alice"), &mut unnamed, 1_001);
+		assert_eq!(pack(&unnamed.fields), vec![0x81, 0xcc, 0xd1, 0x81, 0x04, 0xa5, b'l', b'e', b'a', b'v', b'e']);
+		assert_eq!(delivery_record(&unnamed), None, "no name entry, nothing to record");
+
+		// A clear goes in beside the app's entry.
+		let mut cleared = message(&p, Some(app()));
+		ledger.prepare_outbound(None, &mut cleared, 1_002);
+		assert_eq!(pack(&cleared.fields), vec![0x81, 0xcc, 0xd1, 0x82, 0x00, 0xc4, 0x00, 0x04, 0xa5, b'l', b'e', b'a', b'v', b'e']);
+		let (_, _, digest) = delivery_record(&cleared).unwrap();
+		assert_eq!(digest, display_name::empty_digest());
+
+		// Decided once: the propagated copy of a message with app entries
+		// keeps the same map and the same hash.
+		let mut direct = message(&p, Some(app()));
+		ledger.prepare_outbound(Some("Alicia"), &mut direct, 1_003);
+		direct.pack(false).unwrap();
+		let mut clone = direct.propagated_copy().unwrap();
+		ledger.prepare_outbound(Some("Alicia"), &mut clone, 1_004);
+		assert_eq!(clone.fields, direct.fields);
+		clone.pack(false).unwrap();
+		assert_eq!(clone.hash, direct.hash);
+	}
+
+	/// §4.1: the ledger records what key 0 of the map says; a top-level
+	/// bin at 0xD1 (never shipped) is not a name.
+	#[test]
+	fn the_delivery_record_reads_key_0() {
+		let p = pair();
+		let named = message(&p, Some(retichat(vec![(0, Value::String("Alice".into()))])));
+		let (source, recipient, digest) = delivery_record(&named).unwrap();
+		assert_eq!((source, recipient), (p.source.hash.clone(), p.recipient.hash.clone()));
+		assert_eq!(digest, display_name::digest(Some("Alice")));
+		let bin_form = message(&p, Some(Value::Map(vec![(Value::from(0xD1), Value::Binary(b"Alice".to_vec()))])));
+		assert_eq!(delivery_record(&bin_form), None);
+		let other_type = message(&p, Some(retichat(vec![(0, Value::from(7))])));
+		assert_eq!(delivery_record(&other_type), None);
 	}
 
 	#[test]

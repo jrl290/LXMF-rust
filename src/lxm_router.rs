@@ -1957,9 +1957,10 @@ impl LXMRouter {
 			// DISPLAY_NAMES.md §4.1: the Message Display Name, decided once per
 			// message against the name ledger and written into the fields
 			// BEFORE the first pack, so resends and the propagated copy are
-			// byte-identical. The only writer of FIELD_DISPLAY_NAME (0xD1) on
-			// messages the router sends; a channel post's 0xD1 is written by
-			// channel::pack.
+			// byte-identical. The only writer of the name entry (key 0 of
+			// FIELD_RETICHAT, 0xD1) on messages the router sends; it merges
+			// into the app's Retichat entries. A channel post's name entry is
+			// written by channel::pack.
 			self.prepare_display_name(&mut lxm);
 
 			// Resolve the Destination object from the hash if needed.
