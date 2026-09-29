@@ -50,9 +50,10 @@ pub struct DistroMessage {
     pub timestamp: f64,
     pub title: String,
     pub content: String,
-    /// True when the message carries no content but does carry a ticket field,
-    /// i.e. it is a delivery notification rather than something to display.
-    /// Storing these produces empty message bubbles.
+    /// True when the message carries no content and no attachment
+    /// (FIELD_FILE_ATTACHMENTS, FIELD_IMAGE, FIELD_AUDIO) but does carry a
+    /// ticket field, i.e. it is a delivery notification rather than
+    /// something to display. Storing these produces empty message bubbles.
     pub is_delivery_notification: bool,
     /// FIELD_TICKET (0x0C), when present.
     pub ticket: Option<String>,
@@ -157,6 +158,9 @@ pub fn json_string(s: &str) -> String {
 }
 
 const FIELD_TICKET: u64 = 0x0C;
+const FIELD_FILE_ATTACHMENTS: u64 = crate::lxmf::FIELD_FILE_ATTACHMENTS as u64;
+const FIELD_IMAGE: u64 = crate::lxmf::FIELD_IMAGE as u64;
+const FIELD_AUDIO: u64 = crate::lxmf::FIELD_AUDIO as u64;
 /// LXMF/LXMF.py FIELD_CUSTOM_TYPE / FIELD_CUSTOM_DATA: upstream's pair for
 /// application payloads — a format identifier and the payload. Until
 /// 2026-09-24 the transfer used field 0x0D, which LXMF 1.1.1 defines as
@@ -375,7 +379,13 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         None => (false, Some(LXMessage::SOURCE_UNKNOWN)),
     };
 
-    let is_delivery_notification = ticket.is_some() && content.is_empty();
+    // A ticket with no content is a delivery notification, which the apps
+    // drop — unless the message carries an attachment: a photo sent without
+    // a caption by a sender that includes a ticket is a message to show.
+    let carries_attachment = matches!(arr.get(3), Some(Value::Map(entries)) if entries.iter().any(|(k, _)| {
+        matches!(k.as_u64(), Some(FIELD_FILE_ATTACHMENTS | FIELD_IMAGE | FIELD_AUDIO))
+    }));
+    let is_delivery_notification = ticket.is_some() && content.is_empty() && !carries_attachment;
     let fields = fields_map_bytes(payload).map(<[u8]>::to_vec);
 
     Ok(Some(DistroMessage {
@@ -903,6 +913,32 @@ mod tests {
         assert!(msg.is_delivery_notification);
         assert!(msg.ticket.is_some());
         assert_eq!(json_fields(&msg.to_json()), Some(Value::Map(ticket)));
+    }
+
+    /// The apps drop delivery notifications, so a captionless attachment from
+    /// a sender that includes a ticket (LXMF `include_ticket`) must not be
+    /// taken for one — for a file, an image or an audio message alike.
+    #[test]
+    fn a_captionless_attachment_with_a_ticket_is_a_message() {
+        let mut distro = identity();
+        let sender = identity();
+        let s = delivery_hash(&sender).unwrap();
+        let ticket = (
+            Value::from(crate::lxmf::FIELD_TICKET),
+            Value::Array(vec![Value::F64(1_792_000_000.0), Value::Binary(vec![9u8; 16])]),
+        );
+        let audio = (
+            Value::from(crate::lxmf::FIELD_AUDIO),
+            Value::Array(vec![Value::Integer(0x10.into()), Value::Binary(vec![5u8; 64])]),
+        );
+        for attachment in attachment_fields().into_iter().chain([audio]) {
+            let fields = vec![ticket.clone(), attachment.clone()];
+            let blob = lxmf_blob_with_content(&distro, &s, &sender, b"", fields.clone(), false);
+            let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+            assert!(!msg.is_delivery_notification, "field {:?} is something to show", attachment.0);
+            assert!(msg.ticket.is_some());
+            assert_eq!(json_fields(&msg.to_json()), Some(Value::Map(fields)));
+        }
     }
 
     fn sent_copy_fields() -> Vec<(Value, Value)> {
