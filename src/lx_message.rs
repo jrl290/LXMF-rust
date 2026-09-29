@@ -71,8 +71,10 @@ pub struct LXMessage {
 	/// counting the same failure (receipt-timeout teardown vs. LRREQ timeout).
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) receipt_timed_out: bool,
-	/// Set by the AppLinks Timer P callback after PROP_FALLBACK_DELAY (5 s)
-	/// without delivery.  The POB loop reads this flag and fires
+	/// Set by the AppLinks Timer P callback once the send has gone
+	/// PROP_FALLBACK_DELAY (5 s) without delivery and without transfer
+	/// progress (a Resource that keeps moving never sets it; since
+	/// 2026-09-29).  The POB loop reads this flag and fires
 	/// fire_message_state(hash, PROP_FALLBACK_REQUESTED) once, which signals
 	/// the caller (iOS/lxm_router) to start a parallel propagation send.
 	/// Cleared immediately after the signal is dispatched.
@@ -1530,7 +1532,31 @@ impl LXMessage {
 
 	fn update_transfer_progress(&mut self, resource: &mut Resource) {
 		let progress = resource.get_progress();
-		self.progress = 0.10 + (progress * 0.90);
+		self.progress = Self::transfer_progress(progress);
+	}
+
+	/// The message progress a Resource fraction stands for: 0.10 to hand
+	/// the transfer over, the other 0.90 across the Resource
+	/// (LXMF/LXMessage.py `__update_transfer_progress`:
+	/// `0.10 + resource.get_progress()*0.90`).
+	pub(crate) fn transfer_progress(fraction: f64) -> f64 {
+		0.10 + (fraction.clamp(0.0, 1.0) * 0.90)
+	}
+
+	/// A Resource fraction reported by AppLinks while it carries this
+	/// message (`AppLinks::send_with_compression` / `send_on_held_link`).
+	/// Applied only while the message is SENDING, so a late report from an
+	/// attempt that has failed, been cancelled or concluded changes nothing,
+	/// and only upward: a DIRECT send can have a Resource on each tier, each
+	/// reporting its own fraction, and the bar must not move back.
+	fn apply_transfer_fraction(&mut self, fraction: f64) {
+		if self.state != Self::SENDING {
+			return;
+		}
+		let progress = Self::transfer_progress(fraction);
+		if progress > self.progress {
+			self.progress = progress;
+		}
 	}
 }
 
@@ -1651,8 +1677,9 @@ pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
 	}
 }
 
-/// AppLinks Timer P: the direct send went 5 s without a proof (at once when
-/// the link was already DISCONNECTED). Flag the message and wake the router,
+/// AppLinks Timer P: the direct send went 5 s without a proof and without
+/// its transfer moving (at once when the link was already DISCONNECTED).
+/// Flag the message and wake the router,
 /// whose next pass reports PROP_FALLBACK_REQUESTED so the app starts the
 /// propagated copy.
 ///
@@ -1661,7 +1688,7 @@ pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
 /// often enough to matter — the router holds it for its whole pass over the
 /// message (a zero-delay Timer P fires while that pass is still in
 /// `send_with_compression`), and the FFI getters take it too. Waiting cannot
-/// deadlock: the Timer P thread (app-links `spawn_after`) holds no other lock
+/// deadlock: the Timer P thread (app-links `run_prop_timer`) holds no other lock
 /// when it calls in, and nothing that holds a message lock waits for that
 /// thread.
 /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
@@ -1709,6 +1736,25 @@ fn resource_concluded_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mute
 	}
 	drop(resource_guard);
 	report_late_delivery(late);
+}
+
+/// The progress callback the router hands AppLinks for a send of this
+/// message: each Resource fraction moves the message's progress to
+/// 0.10 + 0.90 × fraction while it is SENDING, never down
+/// (`LXMessage::apply_transfer_fraction`). Until 2026-09-29 nothing was
+/// handed over, and a message sent through AppLinks sat at 0.05 (DIRECT)
+/// or 0.50 (PROPAGATED) for its whole transfer.
+///
+/// Runs on the thread serving the receiver's request with the Resource's
+/// lock held, and waits for the message lock: Resource, then message, the
+/// same order as `update_transfer_progress_shared`.
+pub(crate) fn transfer_progress_reporter(handle: &Arc<Mutex<LXMessage>>) -> Arc<dyn Fn(f64) + Send + Sync + 'static> {
+	let handle = Arc::clone(handle);
+	Arc::new(move |fraction: f64| {
+		if let Ok(mut message) = handle.lock() {
+			message.apply_transfer_fraction(fraction);
+		}
+	})
 }
 
 fn update_transfer_progress_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mutex<Resource>>) {
@@ -1937,6 +1983,59 @@ mod tests {
 		requester.join().unwrap();
 		assert!(handle.lock().unwrap().needs_prop_fallback, "the request must reach the message");
 		assert_eq!(wake_rx.try_recv(), Ok(()), "the router must be woken to report the request");
+	}
+
+	/// LXMF/LXMessage.py `__update_transfer_progress`: 0.10 + 0.90 × the
+	/// Resource's fraction. AppLinks hands over the raw fraction; the
+	/// reporter the router passes it maps it the reference's way.
+	#[test]
+	fn a_resource_fraction_moves_a_sending_message_the_references_way() {
+		let (handle, _) = packed_direct_message(LXMessage::SENDING);
+		handle.lock().unwrap().progress = 0.05;
+		let report = transfer_progress_reporter(&handle);
+		let progress = || handle.lock().unwrap().progress;
+
+		report(0.0);
+		assert!((progress() - 0.10).abs() < 1e-9, "the transfer handed over is 0.10");
+		report(0.5);
+		assert!((progress() - 0.55).abs() < 1e-9, "0.10 + 0.90 × 0.5");
+		report(1.0);
+		assert!((progress() - 1.0).abs() < 1e-9, "all parts sent is 1.0");
+		assert_eq!(LXMessage::transfer_progress(1.7), 1.0, "a fraction never takes it past 1.0");
+	}
+
+	/// A DIRECT send may have a Resource on each tier, each reporting its
+	/// own fraction: the message only ever moves up.
+	#[test]
+	fn transfer_progress_only_moves_up() {
+		let (handle, _) = packed_direct_message(LXMessage::SENDING);
+		let report = transfer_progress_reporter(&handle);
+		report(0.6);
+		let high = handle.lock().unwrap().progress;
+		report(0.2);
+		assert_eq!(handle.lock().unwrap().progress, high, "a lower fraction from another tier must not pull it back");
+		report(0.6);
+		assert_eq!(handle.lock().unwrap().progress, high);
+	}
+
+	/// Only a SENDING message moves: a report that lands after the attempt
+	/// failed, was cancelled or concluded is late and changes nothing.
+	#[test]
+	fn transfer_progress_applies_only_while_sending() {
+		for (state, progress) in [
+			(LXMessage::OUTBOUND, 0.05),
+			(LXMessage::FAILED, 0.0),
+			(LXMessage::CANCELLED, 0.3),
+			(LXMessage::DELIVERED, 1.0),
+			(LXMessage::SENT, 1.0),
+		] {
+			let (handle, _) = packed_direct_message(state);
+			handle.lock().unwrap().progress = progress;
+			transfer_progress_reporter(&handle)(0.9);
+			let message = handle.lock().unwrap();
+			assert_eq!(message.progress, progress, "state {:#04x} must not move", state);
+			assert_eq!(message.state, state);
+		}
 	}
 
 	#[test]

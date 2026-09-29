@@ -25,7 +25,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, prettyhexrep, prettytime, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING};
 
 use crate::handlers::{delivery_announce_handler, propagation_announce_handler};
-use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared, mark_propagated_shared, propagation_packet_timed_out_shared, request_prop_fallback_shared};
+use crate::lx_message::{LXMessage, mark_delivered_shared, link_packet_timed_out_shared, mark_propagated_shared, propagation_packet_timed_out_shared, request_prop_fallback_shared, transfer_progress_reporter};
 use crate::lx_stamper;
 use crate::lxmf::{pn_announce_data_is_valid, APP_NAME, FIELD_TICKET};
 use crate::lxm_peer::LXMPeer;
@@ -42,6 +42,18 @@ fn now() -> f64 {
 // decode_hex moved to reticulum_rust::decode_hex
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
 	reticulum_rust::decode_hex(hex)
+}
+
+/// Progress of a PROPAGATED message once its payload is handed to the held
+/// propagation link, as LXMF/LXMessage.py `send` sets it: 0.50 for one link
+/// packet (the node's proof takes it to 1.0), 0.10 for a Resource, whose
+/// own progress then moves it on (`transfer_progress_reporter`). Until
+/// 2026-09-29 this was 0.50 either way.
+fn held_link_send_progress(packed_len: usize) -> f64 {
+	match rns_app_links::link_representation(packed_len) {
+		rns_app_links::LinkRepresentation::Resource => 0.10,
+		rns_app_links::LinkRepresentation::Packet => 0.50,
+	}
 }
 
 /// Process-wide weak ref to the most recently constructed `LXMRouter`.
@@ -1444,7 +1456,8 @@ impl LXMRouter {
 								remove = true;
 							}
 
-							// Timer P signal: AppLinks fired on_propagation_needed (5 s elapsed).
+							// Timer P signal: AppLinks fired on_propagation_needed (5 s without
+							// delivery and without transfer progress).
 							// Signal the caller to start a parallel propagation send while
 							// the direct send is still running.
 							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
@@ -1466,7 +1479,8 @@ impl LXMRouter {
 							// of the while loop body (which is outside this if-let block).
 							if !remove && lxm.state != LXMessage::SENDING {
 
-							// Failure: on_failed fired (tier 3 exhausted all protocol timeouts).
+							// Failure: on_failed fired (tier 3's transfer failed, or went the
+							// backstop with no outcome and no transfer activity).
 							// AppLinks::send is a one-shot 3-tier call; fail immediately.
 							// No retry (§3).
 							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3
@@ -1533,7 +1547,8 @@ impl LXMRouter {
 											mark_delivered_shared(&msg_del);
 										}),
 										Arc::new(move || {
-											// Timer P: 5 s elapsed without delivery.
+											// Timer P: 5 s without delivery and without the
+											// transfer moving (a Resource making progress defers it).
 											// Set the flag; wake POB to fire PROP_FALLBACK_REQUESTED
 											// immediately so the caller can start a parallel prop send.
 											// Waits for the message lock (this pass may still hold
@@ -1542,10 +1557,16 @@ impl LXMRouter {
 											request_prop_fallback_shared(&msg_prop, &wake_tx_prop);
 										}),
 										Arc::new(move || {
-											// on_failed: tier 3 exhausted all protocol timeouts.
+											// on_failed: tier 3's transfer failed, or went the
+											// backstop with no outcome and no transfer activity.
 											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 											link_packet_timed_out_shared(&msg_fail);
 										}),
+										// A message over the link MDU travels as a Resource:
+										// its fraction moves progress to 0.10 + 0.90 × fraction
+										// while SENDING (LXMF/LXMessage.py
+										// `__update_transfer_progress`), so the app's bar moves.
+										Some(transfer_progress_reporter(&message)),
 									);
 								}
 							}
@@ -1724,6 +1745,7 @@ impl LXMRouter {
 										// propagation_packed = msgpack([timestamp_f64, [[dest_hash | EC_encrypted(rest) | pn_stamp?]]])
 										let propagation_packed = lxm.propagation_packed.clone();
 										if let Some(pdata) = propagation_packed {
+											let start_progress = held_link_send_progress(pdata.len());
 											let msg_ok = message.clone();
 											let msg_fail = message.clone();
 											let node_fail = node_hash.clone();
@@ -1749,12 +1771,15 @@ impl LXMRouter {
 													);
 													let _ = wake_fail.send(());
 												}),
+												// A Resource's fraction moves progress on from
+												// 0.10 (LXMF/LXMessage.py PROPAGATED RESOURCE).
+												Some(transfer_progress_reporter(&message)),
 											);
 											match queued {
 												Ok(()) => {
 													log(&format!("[POB][{}] PROPAGATED queued on persistent app-link, awaiting proof", message_label), LOG_NOTICE, false, false);
 													lxm.state = LXMessage::SENDING;
-													lxm.progress = 0.50;
+													lxm.progress = start_progress;
 												}
 												Err(e) => {
 													log(&format!("[POB][{}] PROPAGATED send failed: {}", message_label, e), LOG_NOTICE, false, false);
@@ -5674,6 +5699,55 @@ mod tests {
 		assert!(
 			!prop_fragment.contains("PROPAGATED sent via persistent app-link → SENT"),
 			"a queued packet is not a sent message"
+		);
+	}
+
+	/// A PROPAGATED payload handed to the held link starts where the
+	/// reference starts it: 0.50 for one packet, 0.10 for a Resource
+	/// (LXMF/LXMessage.py `send`, PROPAGATED).
+	#[test]
+	fn a_propagated_resource_starts_at_ten_percent_and_a_packet_at_fifty() {
+		let mdu = reticulum_rust::link::MDU;
+		assert_eq!(super::held_link_send_progress(1), 0.50);
+		assert_eq!(super::held_link_send_progress(mdu), 0.50, "exactly the MDU is one packet");
+		assert_eq!(super::held_link_send_progress(mdu + 1), 0.10, "over the MDU is a Resource");
+	}
+
+	/// REGRESSION GUARD: both AppLinks sends hand over the message's
+	/// progress reporter, so a Resource's fraction reaches the message
+	/// (0.10 + 0.90 × fraction while SENDING, tested in lx_message.rs).
+	/// Until 2026-09-29 neither did: a photo sent DIRECT sat at 5 % for its
+	/// whole transfer.
+	#[test]
+	fn app_links_sends_report_transfer_progress_to_the_message() {
+		let src = include_str!("lxm_router.rs");
+		let production = src
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production source prefix must exist");
+		let call = |name: &str| -> String {
+			let start = production.find(name).unwrap_or_else(|| panic!("{} must be called", name));
+			// The call runs to its closing `);`, indented as the line it starts on.
+			let line_start = production[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+			let indent: String = production[line_start..].chars().take_while(|c| c.is_whitespace()).collect();
+			let tail = &production[start..];
+			let end = tail.find(&format!("\n{});", indent)).expect("the call must close");
+			tail[..end].to_string()
+		};
+		let direct = call("AppLinks::send_with_compression(");
+		assert!(
+			direct.contains("Some(transfer_progress_reporter(&message)),"),
+			"the DIRECT send must hand AppLinks the message's progress reporter"
+		);
+		let held = call("AppLinks::send_on_held_link(");
+		assert!(
+			held.contains("Some(transfer_progress_reporter(&message)),"),
+			"the PROPAGATED held-link send must hand AppLinks the message's progress reporter"
+		);
+		assert!(
+			production.contains("let start_progress = held_link_send_progress(pdata.len());")
+				&& production.contains("lxm.progress = start_progress;"),
+			"the PROPAGATED start progress follows the representation"
 		);
 	}
 
