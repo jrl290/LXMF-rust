@@ -19,7 +19,8 @@
 
 use std::io::Cursor;
 
-use rmpv::decode::read_value;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use rmpv::decode::{read_value, read_value_ref};
 use rmpv::encode::write_value;
 use rmpv::Value;
 
@@ -82,6 +83,13 @@ pub struct DistroMessage {
     /// `None` when validated; otherwise `LXMessage::SOURCE_UNKNOWN` (no key
     /// for the source yet) or `LXMessage::SIGNATURE_INVALID`.
     pub unverified_reason: Option<u8>,
+    /// The message's LXMF fields map (payload element 3) as msgpack, the
+    /// bytes exactly as the sender packed them: attachments
+    /// (FIELD_FILE_ATTACHMENTS 0x05, FIELD_IMAGE 0x06, FIELD_AUDIO 0x07) and
+    /// every other field, for the apps' own field decoders — the same input
+    /// they take for a direct message. `None` when the payload has no fields
+    /// map. An empty map is `Some(vec![0x80])`.
+    pub fields: Option<Vec<u8>>,
 }
 
 impl DistroMessage {
@@ -93,7 +101,13 @@ impl DistroMessage {
     /// `is_delivery_notification`, `ticket`, `distro_transfer_key`, `sent_to`,
     /// `sent_by`, `display_name_state` (0 absent, 1 clear, 2 name),
     /// `display_name` (null unless 2), `signature_validated`,
-    /// `unverified_reason` (0 ok, 1 source unknown, 2 signature invalid).
+    /// `unverified_reason` (0 ok, 1 source unknown, 2 signature invalid),
+    /// `fields`: the LXMF fields map as msgpack (`DistroMessage::fields`,
+    /// the bytes as the sender packed them), base64 with the standard
+    /// alphabet and `=` padding (RFC 4648 §4) — what iOS
+    /// `Data(base64Encoded:)` and Android `Base64.decode(_, DEFAULT)` read —
+    /// or null when the payload has no fields map. The decoded bytes go
+    /// straight to the apps' field decoders, as for a direct message.
     pub fn to_json(&self) -> String {
         let opt = |v: &Option<String>| v.as_deref().map(json_string).unwrap_or_else(|| "null".into());
         format!(
@@ -101,7 +115,8 @@ impl DistroMessage {
                 r#"{{"source_hash":"{}","timestamp":{},"title":{},"content":{},"#,
                 r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{},"#,
                 r#""sent_to":{},"sent_by":{},"#,
-                r#""display_name_state":{},"display_name":{},"signature_validated":{},"unverified_reason":{}}}"#
+                r#""display_name_state":{},"display_name":{},"signature_validated":{},"unverified_reason":{},"#,
+                r#""fields":{}}}"#
             ),
             self.source_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             self.timestamp,
@@ -116,6 +131,8 @@ impl DistroMessage {
             self.display_name.name().map(json_string).unwrap_or_else(|| "null".into()),
             self.signature_validated,
             self.unverified_reason.unwrap_or(0),
+            // Base64 needs no JSON escaping.
+            self.fields.as_deref().map(|f| format!("\"{}\"", STANDARD.encode(f))).unwrap_or_else(|| "null".into()),
         )
     }
 }
@@ -359,6 +376,7 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
     };
 
     let is_delivery_notification = ticket.is_some() && content.is_empty();
+    let fields = fields_map_bytes(payload).map(<[u8]>::to_vec);
 
     Ok(Some(DistroMessage {
         source_hash,
@@ -373,7 +391,30 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         display_name,
         signature_validated,
         unverified_reason,
+        fields,
     }))
+}
+
+/// The fields map of an LXMF payload (element 3 of the payload array), as the
+/// slice of `payload` the sender packed, or `None` when element 3 is absent
+/// or not a map. Handing on the sender's bytes rather than re-encoding the
+/// decoded map means the apps decode exactly what was sent (CHECK_THESE_
+/// THINGS_FIRST §11: the map stays a native msgpack map, never wrapped in
+/// bin). `read_value_ref` borrows strings and binaries from `payload`, so
+/// finding the map's bounds does not copy the attachments in it.
+fn fields_map_bytes(payload: &[u8]) -> Option<&[u8]> {
+    let mut rd = payload;
+    if rmp::decode::read_array_len(&mut rd).ok()? < 4 {
+        return None;
+    }
+    for _ in 0..3 {
+        read_value_ref(&mut rd).ok()?;
+    }
+    let start = payload.len() - rd.len();
+    match read_value_ref(&mut rd).ok()? {
+        rmpv::ValueRef::Map(_) => Some(&payload[start..payload.len() - rd.len()]),
+        _ => None,
+    }
 }
 
 /// RFed SPEC §17.9: the transferred distro key, when the message's
@@ -672,11 +713,22 @@ mod tests {
     /// part. `stamp` adds a 5th payload element, which LXMF excludes from the
     /// signature.
     fn lxmf_blob(distro: &Identity, src: &[u8], signer: &Identity, fields: Vec<(Value, Value)>, stamp: bool) -> Vec<u8> {
+        lxmf_blob_with_content(distro, src, signer, b"hello R", fields, stamp)
+    }
+
+    fn lxmf_blob_with_content(
+        distro: &Identity,
+        src: &[u8],
+        signer: &Identity,
+        content: &[u8],
+        fields: Vec<(Value, Value)>,
+        stamp: bool,
+    ) -> Vec<u8> {
         let dest = delivery_hash(distro).unwrap();
         let mut items = vec![
             Value::F64(1_790_000_000.5),
             Value::Binary(Vec::new()),
-            Value::Binary(b"hello R".to_vec()),
+            Value::Binary(content.to_vec()),
             Value::Map(fields),
         ];
         let mut hashed_part = [dest.clone(), src.to_vec(), encode(&Value::Array(items.clone()))].concat();
@@ -688,6 +740,169 @@ mod tests {
         }
         let plaintext = [src.to_vec(), sig, encode(&Value::Array(items))].concat();
         [dest, distro.encrypt(&plaintext).unwrap()].concat()
+    }
+
+    /// A propagated LXMF blob whose payload the test packed by hand, so it
+    /// can be packed in ways rmpv would not (a non-minimal header, no fields
+    /// map). Unstamped: LXMF signs the payload as received.
+    fn lxmf_blob_packed(distro: &Identity, src: &[u8], signer: &Identity, packed_payload: &[u8]) -> Vec<u8> {
+        let dest = delivery_hash(distro).unwrap();
+        let mut hashed_part = [dest.clone(), src.to_vec(), packed_payload.to_vec()].concat();
+        let hash = full_hash(&hashed_part);
+        hashed_part.extend_from_slice(&hash);
+        let sig = signer.sign(&hashed_part);
+        let plaintext = [src.to_vec(), sig, packed_payload.to_vec()].concat();
+        [dest, distro.encrypt(&plaintext).unwrap()].concat()
+    }
+
+    /// The first three payload elements (timestamp, title, content), packed
+    /// after an array header of `len` elements.
+    fn packed_head(len: u8, content: &[u8]) -> Vec<u8> {
+        [
+            vec![0x90 | len],
+            encode(&Value::F64(1_790_000_000.5)),
+            encode(&Value::Binary(Vec::new())),
+            encode(&Value::Binary(content.to_vec())),
+        ]
+        .concat()
+    }
+
+    /// What an app reads from the unwrap JSON's `fields`: base64 (standard
+    /// alphabet, padded) → msgpack → one value. `None` for null. The key
+    /// must be present either way.
+    fn json_fields(json: &str) -> Option<Value> {
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("the unwrap JSON parses");
+        match parsed.get("fields").expect("the fields key is always present") {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(b64) => {
+                let bytes = STANDARD.decode(b64).expect("standard padded base64");
+                let mut cur = Cursor::new(&bytes[..]);
+                let value = read_value(&mut cur).expect("msgpack");
+                assert_eq!(cur.position() as usize, bytes.len(), "exactly one msgpack value, nothing after it");
+                Some(value)
+            }
+            other => panic!("fields must be a string or null, got {other:?}"),
+        }
+    }
+
+    /// FIELD_FILE_ATTACHMENTS `[[filename, bytes]]` and FIELD_IMAGE
+    /// `[format, bytes]`, as LXMF/LXMF.py senders pack them.
+    fn attachment_fields() -> Vec<(Value, Value)> {
+        vec![
+            (
+                Value::from(crate::lxmf::FIELD_FILE_ATTACHMENTS),
+                Value::Array(vec![Value::Array(vec![
+                    Value::String("notes.txt".into()),
+                    Value::Binary(b"file bytes\n".to_vec()),
+                ])]),
+            ),
+            (
+                Value::from(crate::lxmf::FIELD_IMAGE),
+                Value::Array(vec![
+                    Value::String("webp".into()),
+                    Value::Binary((0..=255u8).cycle().take(3000).collect()),
+                ]),
+            ),
+        ]
+    }
+
+    /// The 2026-09-29 bug: a photo sent from the Pixel to the iPad's distro
+    /// address arrived as its caption only, because the unwrap dropped the
+    /// fields. The fields map must reach the JSON both bridges return, every
+    /// entry intact, stamped or not.
+    #[test]
+    fn unwrap_hands_the_attachments_to_the_apps() {
+        let mut distro = identity();
+        let sender = identity();
+        let s = delivery_hash(&sender).unwrap();
+        for stamp in [false, true] {
+            let blob = lxmf_blob(&distro, &s, &sender, attachment_fields(), stamp);
+            let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+            assert_eq!(
+                msg.fields.as_deref(),
+                Some(&encode(&Value::Map(attachment_fields()))[..]),
+                "the fields map as the sender packed it (stamp {stamp})"
+            );
+            assert_eq!(json_fields(&msg.to_json()), Some(Value::Map(attachment_fields())), "stamp {stamp}");
+            assert_eq!(msg.content, "hello R", "the caption as before");
+            assert!(!msg.is_delivery_notification);
+        }
+    }
+
+    /// The bytes handed on are the sender's, not a re-encoding of what was
+    /// decoded: a map16 header on a one-entry map and a str8 format name
+    /// survive, where rmpv would write a fixmap and a fixstr.
+    #[test]
+    fn unwrap_hands_on_the_fields_bytes_the_sender_packed() {
+        let mut distro = identity();
+        let sender = identity();
+        let s = delivery_hash(&sender).unwrap();
+        let mut fields_raw = vec![0xde, 0x00, 0x01, 0x06, 0x92, 0xd9, 0x04];
+        fields_raw.extend_from_slice(b"webp");
+        fields_raw.extend_from_slice(&[0xc4, 0x03, 1, 2, 3]);
+        let decoded = Value::Map(vec![(
+            Value::from(crate::lxmf::FIELD_IMAGE),
+            Value::Array(vec![Value::String("webp".into()), Value::Binary(vec![1, 2, 3])]),
+        )]);
+        assert_ne!(encode(&decoded), fields_raw, "the test needs bytes rmpv would not produce");
+
+        let payload = [packed_head(4, b""), fields_raw.clone()].concat();
+        let blob = lxmf_blob_packed(&distro, &s, &sender, &payload);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert_eq!(msg.fields.as_deref(), Some(&fields_raw[..]));
+        assert_eq!(json_fields(&msg.to_json()), Some(decoded));
+    }
+
+    /// A message without attachments hands on whatever fields map it has —
+    /// the 0xD1 name alone, or an empty map — and a payload without a map in
+    /// element 3 gives null.
+    #[test]
+    fn unwrap_without_attachments_hands_on_the_map_it_has() {
+        let mut distro = identity();
+        let sender = identity();
+        let s = delivery_hash(&sender).unwrap();
+
+        let named = name_fields(Value::Binary(b"Bob".to_vec()));
+        let blob = lxmf_blob(&distro, &s, &sender, named.clone(), false);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert_eq!(msg.fields.as_deref(), Some(&encode(&Value::Map(named.clone()))[..]));
+        assert_eq!(json_fields(&msg.to_json()), Some(Value::Map(named)));
+        assert_eq!(msg.content, "hello R");
+
+        let blob = lxmf_blob(&distro, &s, &sender, Vec::new(), false);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert_eq!(msg.fields.as_deref(), Some(&[0x80u8][..]), "an empty map is a map");
+        assert!(msg.to_json().ends_with(r#","fields":"gA=="}"#));
+
+        let three = packed_head(3, b"no map");
+        let blob = lxmf_blob_packed(&distro, &s, &sender, &three);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert_eq!((msg.content.as_str(), msg.fields.as_deref()), ("no map", None));
+        assert_eq!(json_fields(&msg.to_json()), None);
+
+        let nil = [packed_head(4, b"nil map"), vec![0xc0]].concat();
+        let blob = lxmf_blob_packed(&distro, &s, &sender, &nil);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert_eq!((msg.content.as_str(), msg.fields.as_deref()), ("nil map", None));
+        assert!(msg.to_json().ends_with(r#","fields":null}"#));
+    }
+
+    /// A delivery notification (a ticket and no content) is still flagged as
+    /// one, and its fields carry the ticket.
+    #[test]
+    fn a_delivery_notification_hands_on_its_ticket_field() {
+        let mut distro = identity();
+        let sender = identity();
+        let s = delivery_hash(&sender).unwrap();
+        let ticket = vec![(
+            Value::from(crate::lxmf::FIELD_TICKET),
+            Value::Array(vec![Value::F64(1_792_000_000.0), Value::Binary(vec![9u8; 16])]),
+        )];
+        let blob = lxmf_blob_with_content(&distro, &s, &sender, b"", ticket.clone(), false);
+        let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
+        assert!(msg.is_delivery_notification);
+        assert!(msg.ticket.is_some());
+        assert_eq!(json_fields(&msg.to_json()), Some(Value::Map(ticket)));
     }
 
     fn sent_copy_fields() -> Vec<(Value, Value)> {
@@ -827,6 +1042,7 @@ mod tests {
             display_name: NameField::Name("Bob \"B\"".into()),
             signature_validated: false,
             unverified_reason: Some(LXMessage::SOURCE_UNKNOWN),
+            fields: None,
         };
         assert_eq!(
             msg.to_json(),
@@ -835,14 +1051,23 @@ mod tests {
                     r#"{{"source_hash":"{}","timestamp":1.5,"title":"","content":"hi\n","#,
                     r#""is_delivery_notification":false,"ticket":null,"distro_transfer_key":null,"#,
                     r#""sent_to":"{}","sent_by":null,"#,
-                    r#""display_name_state":2,"display_name":"Bob \"B\"","signature_validated":false,"unverified_reason":1}}"#
+                    r#""display_name_state":2,"display_name":"Bob \"B\"","signature_validated":false,"unverified_reason":1,"#,
+                    r#""fields":null}}"#
                 ),
                 "ab".repeat(16),
                 "cd".repeat(16)
             )
         );
         let validated = DistroMessage { display_name: NameField::Clear, signature_validated: true, unverified_reason: None, ..msg };
-        assert!(validated.to_json().ends_with(r#""display_name_state":1,"display_name":null,"signature_validated":true,"unverified_reason":0}"#));
+        assert!(validated.to_json().ends_with(r#""display_name_state":1,"display_name":null,"signature_validated":true,"unverified_reason":0,"fields":null}"#));
+        // {0x06: ["png", bin fb ff]} = 81 06 92 a3 70 6e 67 c4 02 fb ff, whose
+        // base64 has a '+', a '/' and a '='.
+        let with_fields = DistroMessage {
+            fields: Some(vec![0x81, 0x06, 0x92, 0xa3, b'p', b'n', b'g', 0xc4, 0x02, 0xfb, 0xff]),
+            ..validated
+        };
+        assert!(with_fields.to_json().ends_with(r#""unverified_reason":0,"fields":"gQaSo3BuZ8QC+/8="}"#),
+            "standard alphabet (+ and / not - and _), padded: {}", with_fields.to_json());
     }
 
     #[test]
