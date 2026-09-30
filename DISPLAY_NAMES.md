@@ -416,7 +416,9 @@ Placeholders (§5.4): iOS `DisplayNames.isPlaceholder(_:ownHash:)`, Android
 `isPlaceholderName` / `isOwnHashPrefill`. NSE: `chat_names.json` entries
 carry the slot and `messageNameAt` (`DisplayNames.SharedName`), channel names
 their post time (`SharedChannelName`). Web names for non-contacts: hidden
-`nameOnly` rows, invites gated by `ContactStore.mayInvite`.
+rows (`nameOnly` is still written but gates nothing since Retichat-js
+`202a2f3`); invites gated by the privacy filter (`PrivacyFilter.allows`: an
+allowlisted source), which replaced `ContactStore.mayInvite`.
 
 **Retichat-ios (app).** Pure rules in `DisplayNames` (`Retichat/Bridge/LxmfFields.swift`,
 compiled into the app and the NSE; tests `tests/DisplayNamesTests.swift`).
@@ -527,9 +529,19 @@ channel send rule (it never posts).
 - Resolver: `contactName` / `channelPosterName` / `shortHash`, through
   `ContactStore.name` and `channelSenderLabel` in `app.js`.
 - Accept (§5.2): `acceptMessageName` via `ContactStore.acceptMessageName` in
-  the router's message handler (direct, opportunistic, link, group),
-  `_fetchPropagatedMessages` and `_handleDistroBlob`. Announces:
-  `ContactStore.updateFromAnnounce`. Channels: `ChannelSenderNames.apply`.
+  the router's message handler (direct, opportunistic, link, group; after
+  `PrivacyFilter`), `_fetchPropagatedMessages` and `_handleDistroBlob`.
+  Announces: `ContactStore.updateFromAnnounce`. Channels:
+  `ChannelSenderNames.apply`.
+- §7 privacy filter: `PrivacyFilter` in `app.js` (iOS's `allowlistDecision`
+  and `groupMessagePolicy`, on by default), asked by `LXMRouter.acceptsSource`
+  (the decrypted source, before the proof and the parse) and
+  `acceptsMessage` (after the parse, before the proof) in
+  `lib/rns/lxmf/lxmf_router.js`; a dropped message records no name and is
+  not proved by the router (a link Resource is proved by the Resource
+  protocol on assembly, before its source can be read). Allowlist:
+  `ContactStore.allow` / `allowlisted`. Distro fan-out (`_handleDistroBlob`)
+  is not filtered. Tests `privacy_filter.test.mjs`.
 - Message ledger (§4.1, the web client has no Rust router):
   `NameLedger` + `decide`, decided once per DM in `_dispatchMessage`
   (`_decideMessageName`) and per group member in `_sendGroupEnvelope`;
