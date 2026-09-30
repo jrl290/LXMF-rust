@@ -1479,8 +1479,13 @@ impl LXMRouter {
 							// of the while loop body (which is outside this if-let block).
 							if !remove && lxm.state != LXMessage::SENDING {
 
-							// Failure: on_failed fired (tier 3's transfer failed, or went the
-							// backstop with no outcome and no transfer activity).
+							// Failure: on_failed fired. Every tier AppLinks fired has failed on
+							// its own event, or no tier could fire (app-links SendOutcome). A
+							// packet tier fails on its receipt timeout, or the backstop when
+							// that callback never comes. A Resource tier fails only when its
+							// Resource concludes without COMPLETE, never on a clock. Until
+							// 2026-09-29 tier 3 alone decided this, while tier 1's Resource
+							// could still be moving.
 							// AppLinks::send is a one-shot 3-tier call; fail immediately.
 							// No retry (§3).
 							// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1,§3
@@ -1557,8 +1562,9 @@ impl LXMRouter {
 											request_prop_fallback_shared(&msg_prop, &wake_tx_prop);
 										}),
 										Arc::new(move || {
-											// on_failed: tier 3's transfer failed, or went the
-											// backstop with no outcome and no transfer activity.
+											// on_failed: every tier that fired has failed on its
+											// own event, or no tier could fire. Fires once; a
+											// proof after it still reaches on_delivered.
 											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 											link_packet_timed_out_shared(&msg_fail);
 										}),
