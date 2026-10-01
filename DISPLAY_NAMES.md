@@ -429,10 +429,14 @@ Changes take effect at once through the router setters, with no stack restart.
   that makes it send for someone, the relay and its `relay_done`) for a
   pending group is dropped from any source, the allowlisted inviter's
   included and with the filter off; once the user accepts, the rule above
-  applies. Anything dropped is dropped like any filtered message, with no
-  membership change, no allowlisting and no relay. An accept from an
-  allowed source makes the member it names (`GROUP_SENDER`) a member,
-  allowlisted in a group the user has accepted; in a pending one the
+  applies. Nor does it ask anything of the members a pending group lists
+  before the user accepts: opening that group's chat requests no path and
+  opens no link to them (the accept itself asks for every member's path
+  and sends the accept to each). Anything dropped is dropped like any
+  filtered message, with no membership change, no allowlisting and no
+  relay. An accept from an allowed source makes the member it names
+  (`GROUP_SENDER`) a member, allowlisted in a group the user has
+  accepted; in a pending one the
   user's accept allows it with every other member, and a decline leaves
   nobody allowed. A plain group message (no action) for a group held here
   is kept whoever sent it, and `GROUP_SENDER` names its author only when
@@ -443,12 +447,14 @@ Changes take effect at once through the router setters, with no stack restart.
   `PrivacyFilter.groupMember` (`33bc41d`, `793a959`, `47bc47d`, `33a299a`);
   `_handleGroupMessage`'s invite branch keeps keys and allows nobody
   (`07b89e2`), `PrivacyFilter.knows` counts the member lists of joined
-  groups only (`d13509f`), and `_performGroupRelay` refuses a group that is
-  not active (`33a299a`); the held groups' members are allowlisted once by
-  `allowHeldGroupMembers` (`23b2346`; a pending group's are not). iOS and
-  Android still allowlist the inviter and every listed co-member whose key
-  checks out as the invite arrives (`handleGroupInvite`; the `INVITE` branch
-  of `handleGroupMessage`), process every non-invite action for a held
+  groups only (`d13509f`), `_performGroupRelay` refuses a group that is
+  not active (`33a299a`), and `openGroupConversation` asks nothing of the
+  members of a group that is not active (`e6d5862`); the held groups'
+  members are allowlisted once by `allowHeldGroupMembers` (`23b2346`; a
+  pending group's are not). iOS and Android still allowlist the inviter
+  and every listed co-member whose key checks out as the invite arrives
+  (`handleGroupInvite`; the `INVITE` branch of `handleGroupMessage`),
+  process every non-invite action for a held
   group from any source (`groupMessagePolicy`;
   `DeliveryPolicy.groupMessage`), relay for a pending group
   (`handleGroupRelayRequest`; `RELAY_REQUEST`), and take any `GROUP_SENDER`
