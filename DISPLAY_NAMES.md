@@ -409,31 +409,47 @@ Changes take effect at once through the router setters, with no stack restart.
 - **Group trust rule** (James, 2026-10-01): "Groups start by invite. If the
   invite doesn't come from someone on the allowlist, it is ignored. If the
   invite is accepted, the other group members are considered allowed." So:
-  an invite is processed only from a source the privacy filter allows;
-  accepting it allowlists every member, creating a row where there is none.
-  A source is *allowed* for a group held here when it passes the filter or
-  is a current member (invited or accepted, not left) of a group the user
-  has accepted; a member listed in a group still pending is not. Any other
+  an invite is processed only from a source the privacy filter allows. The
+  invite itself allows nobody: the member keys it carries are kept as it
+  arrives (the accept needs every one), and its inviter and the members it
+  lists are allowed only when the user accepts it, which allowlists every
+  member, creating a row where there is none (creating a group does the
+  same). A declined or unanswered invite leaves them as they were. A source
+  is *allowed* for a group held here when it passes the filter or is a
+  current member (invited or accepted, not left) of a group the user has
+  accepted; a member listed in a group still pending is not. Any other
   group action (accept, leave, relay_req, relay_done, an unknown one) for a
   group held here is processed only when the packet's own LXMF source is
-  allowed, with one exception: a member listed in a pending group may accept
-  or leave for itself (no `GROUP_SENDER`, or its own), which records its
-  status and allows nobody. Anything else is dropped like any filtered
-  message, with no membership change, no allowlisting and no relay. An
-  accept from an allowed source makes the member it names (`GROUP_SENDER`) a
-  member, allowlisted in a group the user has accepted; in a pending one the
+  allowed, with one exception: a member listed in a pending group may
+  accept or leave for itself (no `GROUP_SENDER`, or its own), which records
+  its status and allows nobody. A client never transmits on someone's
+  behalf for a group the user has not joined: a `relay_req` (the one action
+  that makes it send for someone, the relay and its `relay_done`) for a
+  pending group is dropped from any source, the allowlisted inviter's
+  included and with the filter off; once the user accepts, the rule above
+  applies. Anything dropped is dropped like any filtered message, with no
+  membership change, no allowlisting and no relay. An accept from an
+  allowed source makes the member it names (`GROUP_SENDER`) a member,
+  allowlisted in a group the user has accepted; in a pending one the
   user's accept allows it with every other member, and a decline leaves
-  nobody allowed. A plain group message (no action) for a group held here is
-  kept whoever sent it, and `GROUP_SENDER` names its author only when its
-  source is allowed: anyone else's post is shown as its own (a departure
-  from iOS, which shows it as the member it names). Web: Retichat-js
-  `shouldProcessGroupMessage`, `groupTrustsSource`,
-  `PrivacyFilter.groupAccepts` and `PrivacyFilter.groupMember` (`33bc41d`,
-  `793a959`, `47bc47d`), with the held groups' members allowlisted once by
-  `allowHeldGroupMembers` (`23b2346`). iOS (`groupMessagePolicy`) and
-  Android (`DeliveryPolicy.groupMessage`) still process every non-invite
-  action for a held group from any source, and take any `GROUP_SENDER` as
-  the author (open follow-ups).
+  nobody allowed. A plain group message (no action) for a group held here
+  is kept whoever sent it, and `GROUP_SENDER` names its author only when
+  its source is allowed: anyone else's post is shown as its own (a
+  departure from iOS, which shows it as the member it names). Web:
+  Retichat-js `shouldProcessGroupMessage`, `groupTrustsSource`,
+  `GROUP_ACTIONS_THAT_RELAY`, `PrivacyFilter.groupAccepts` and
+  `PrivacyFilter.groupMember` (`33bc41d`, `793a959`, `47bc47d`, `33a299a`);
+  `_handleGroupMessage`'s invite branch keeps keys and allows nobody
+  (`07b89e2`), and `_performGroupRelay` refuses a group that is not active
+  (`33a299a`); the held groups' members are allowlisted once by
+  `allowHeldGroupMembers` (`23b2346`; a pending group's are not). iOS and
+  Android still allowlist the inviter and every listed co-member whose key
+  checks out as the invite arrives (`handleGroupInvite`; the `INVITE` branch
+  of `handleGroupMessage`), process every non-invite action for a held
+  group from any source (`groupMessagePolicy`;
+  `DeliveryPolicy.groupMessage`), relay for a pending group
+  (`handleGroupRelayRequest`; `RELAY_REQUEST`), and take any `GROUP_SENDER`
+  as the author (open follow-ups).
 
 ## 8. Not in scope (follow-ups)
 
