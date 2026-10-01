@@ -85,22 +85,37 @@ pub struct LXMessage {
 	/// Cleared when the message transitions to a new send attempt.
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) violation_reported: bool,
+	/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): this
+	/// attempt's payload has been handed over to go as a Resource, to
+	/// AppLinks (a DIRECT payload over the link MDU) or to a link the router
+	/// holds (`as_resource`), or a Resource carrying it has reported an
+	/// event. From then on the router's §1 assertion measures the send by
+	/// its transfers' progress (`transfer_silence`), never by its total time
+	/// (`measured_by_transfer_progress`). Before it, the send is measured
+	/// from its start like one that fits a packet: on the router's own
+	/// (non-AppLinks) DIRECT path that is its path request and link setup,
+	/// which nothing else bounds.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) transfer_by_resource: bool,
 	/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): when the
 	/// Resource carrying this send last showed progress: its advertisement
 	/// going out, each request of the receiver's it served (parts, a window,
-	/// a hashmap update), its proof. `None` until a Resource carrying the
-	/// current attempt has been advertised, and always for a send that fits
-	/// one packet. Once it is set the router's §1 assertion measures the
-	/// silence since it, never the transfer's total time
-	/// (`transfer_silence`). Until 2026-10-01 the assertion counted a
-	/// moving photo's whole transfer against 5 s: it fired on the Pixel for
-	/// a 14-part direct Resource whose part requests came every 0.5-1.3 s
-	/// (a release build logs it; a debug build panics).
+	/// a hashmap update), its proof. `None` while no Resource carrying the
+	/// current attempt is being watched: before its advertisement, after it
+	/// concluded without delivering (`note_transfer_ended`, so a tier
+	/// handover's path race and link setup are never counted as its
+	/// silence), and always for a send that fits one packet. While it is set
+	/// the router's §1 assertion measures the silence since it, never the
+	/// transfer's total time (`transfer_silence`). Until 2026-10-01 the
+	/// assertion counted a moving photo's whole transfer against 5 s: it
+	/// fired on the Pixel for a 14-part direct Resource whose part requests
+	/// came every 0.5-1.3 s (a release build logs it; a debug build panics).
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) transfer_moved_at: Option<f64>,
-	/// A silence over the §1 limit that ended (the transfer moved again, or
-	/// its proof came) before a router pass could assert it while it ran:
-	/// the router's next pass asserts it. The longest, if several did.
+	/// A silence over the §1 limit that ended (the transfer moved again, its
+	/// proof came, or its Resource concluded without delivering) before a
+	/// router pass could assert it while it ran: the router's next pass
+	/// asserts it. The longest, if several did.
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) transfer_silence_unasserted: Option<f64>,
 	/// The router has asserted the silence now running. The transfer's next
@@ -288,6 +303,7 @@ impl LXMessage {
 			receipt_timed_out: false,
 			needs_prop_fallback: false,
 			violation_reported: false,
+			transfer_by_resource: false,
 			transfer_moved_at: None,
 			transfer_silence_unasserted: None,
 			transfer_silence_asserted: false,
@@ -1418,6 +1434,11 @@ impl LXMessage {
 			None,
 		)?;
 		let resource_arc = Arc::new(Mutex::new(resource));
+		// The payload is handed over as a Resource: from here the router's
+		// §1 assertion measures the send by its transfer's progress, not by
+		// its total time (DESIGN_PRINCIPLES §1, bulk transfers).
+		// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+		self.transfer_by_resource = true;
 		match advertised {
 			// DESIGN_PRINCIPLES §1, bulk transfers: the transfer is watched
 			// from its advertisement on. The hook runs on the advertise
@@ -1505,6 +1526,11 @@ impl LXMessage {
 	}
 
 	fn resource_concluded(&mut self, resource: &Resource) {
+		if resource.status != ResourceStatus::Complete {
+			// Its Resource has ended: the §1 watch on it stops (bulk transfers).
+			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+			self.note_transfer_ended(now_seconds());
+		}
 		if resource.status == ResourceStatus::Complete {
 			self.mark_delivered();
 		} else if Self::is_success_state(self.state) {
@@ -1525,6 +1551,11 @@ impl LXMessage {
 	}
 
 	fn propagation_resource_concluded(&mut self, resource: &Resource) {
+		if resource.status != ResourceStatus::Complete {
+			// Its Resource has ended: the §1 watch on it stops (bulk transfers).
+			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+			self.note_transfer_ended(now_seconds());
+		}
 		if resource.status == ResourceStatus::Complete {
 			self.mark_propagated();
 		} else if self.state != Self::CANCELLED {
@@ -1608,28 +1639,42 @@ impl LXMessage {
 	}
 
 	/// DESIGN_PRINCIPLES §1, bulk transfers: whether the router's §1
-	/// assertion measures this send by its transfer's progress instead of by
-	/// the time since it began. True for a DIRECT payload over the link MDU,
-	/// which goes as a Resource (`app_links::link_representation`, the
-	/// boundary AppLinks sends by), and for any send a Resource has carried
-	/// in this attempt. Until its Resource is advertised such a send is not
-	/// measured by the router: its path race and link have their own §1
-	/// bounds (app-links' 5 s race, Reticulum-rust's `link.establish`
-	/// assertion), and a Resource QUEUED behind another on its link is
-	/// waiting out that one's transfer, which is watched in its own right.
-	/// A send that fits one packet keeps the assertion from the send's
-	/// start, as before.
+	/// assertion measures this send by its transfers' progress instead of by
+	/// the time since it began: once this attempt's payload has been handed
+	/// over to go as a Resource (`transfer_by_resource`). From then on each
+	/// Resource carrying it is watched from its advertisement to its end
+	/// (`transfer_silence`); before a Resource's advertisement, and between
+	/// one tier's Resource ending and the next one's advertisement, the send
+	/// is not measured by the router: on the AppLinks path its path race and
+	/// link have their own §1 bounds (app-links' 5 s race, Reticulum-rust's
+	/// `link.establish` assertion), and a Resource QUEUED behind another on
+	/// its link is waiting out that one's transfer, which is watched in its
+	/// own right. Before the hand-over (on the router's own DIRECT path: its
+	/// path request and link setup) the send is measured from its start,
+	/// like a send that fits one packet, which keeps that assertion
+	/// throughout.
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) fn measured_by_transfer_progress(&self) -> bool {
-		if self.transfer_moved_at.is_some() {
-			return true;
-		}
-		self.method == Self::DIRECT
+		self.transfer_by_resource
+	}
+
+	/// This attempt's payload has been handed to AppLinks
+	/// (`AppLinks::send_with_compression`). A DIRECT payload over the link
+	/// MDU goes as a Resource on whichever tier carries it
+	/// (`app_links::link_representation`, the boundary AppLinks sends by),
+	/// so from here it is measured by its transfers' progress
+	/// (`measured_by_transfer_progress`); one that fits a packet is not.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) fn note_handed_to_app_links(&mut self) {
+		let as_resource = self.method == Self::DIRECT
 			&& self
 				.packed
 				.as_ref()
 				.map(|packed| app_links::link_representation(packed.len()) == app_links::LinkRepresentation::Resource)
-				.unwrap_or(false)
+				.unwrap_or(false);
+		if as_resource {
+			self.transfer_by_resource = true;
+		}
 	}
 
 	/// The Resource carrying this send showed progress at `at` (unix
@@ -1645,24 +1690,55 @@ impl LXMessage {
 		if self.state != Self::SENDING {
 			return;
 		}
-		if let Some(previous) = self.transfer_moved_at {
-			let silent_for = at - previous;
-			if silent_for > reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
-				if self.transfer_silence_asserted {
-					log(
-						&format!(
-							"DESIGN_PRINCIPLES §1: {} transfer moving again after {:.2}s of silence",
-							self, silent_for,
-						),
-						LOG_NOTICE, false, false,
-					);
-				} else if self.transfer_silence_unasserted.map_or(true, |kept| silent_for > kept) {
-					self.transfer_silence_unasserted = Some(silent_for);
-				}
-			}
-		}
+		self.close_transfer_silence(at, "moving again");
+		self.transfer_by_resource = true;
 		self.transfer_silence_asserted = false;
 		self.transfer_moved_at = Some(at);
+	}
+
+	/// The Resource carrying this send concluded at `at` without
+	/// delivering it: failed (its advertisement unanswered, a request or the
+	/// proof timed out, its link closed), cancelled or rejected. Its watch
+	/// stops here, a silence it ended in is closed as one that moved again
+	/// would be, and nothing is watched until the next Resource carrying the
+	/// send is advertised: a tier handover's path race and link setup lie
+	/// between two Resources, not inside one, as Retichat-js's per-Resource
+	/// watch reads the rule (`bulkStop`). Until 2026-10-01 nothing ended the
+	/// watch, and the next tier's setup was asserted as this Resource's
+	/// silence. Only while SENDING; never changes the message's state.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) fn note_transfer_ended(&mut self, at: f64) {
+		if self.state != Self::SENDING || self.transfer_moved_at.is_none() {
+			return;
+		}
+		self.close_transfer_silence(at, "ended");
+		self.transfer_silence_asserted = false;
+		self.transfer_moved_at = None;
+	}
+
+	/// The silence of the Resource being watched, if it ran over the §1
+	/// limit, ends at `at` (`how`: moving again, or ended): one a router pass
+	/// has asserted is logged as over; one none has is kept for the next
+	/// pass (`transfer_silence_unasserted`).
+	fn close_transfer_silence(&mut self, at: f64, how: &str) {
+		let Some(previous) = self.transfer_moved_at else {
+			return;
+		};
+		let silent_for = at - previous;
+		if silent_for <= reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
+			return;
+		}
+		if self.transfer_silence_asserted {
+			log(
+				&format!(
+					"DESIGN_PRINCIPLES §1: {} transfer {} after {:.2}s of silence",
+					self, how, silent_for,
+				),
+				LOG_NOTICE, false, false,
+			);
+		} else if self.transfer_silence_unasserted.map_or(true, |kept| silent_for > kept) {
+			self.transfer_silence_unasserted = Some(silent_for);
+		}
 	}
 
 	/// The proof of the Resource carrying this send came at `at`: the last
@@ -1696,9 +1772,10 @@ impl LXMessage {
 		None
 	}
 
-	/// A new send attempt: its transfer is watched afresh, from its own
-	/// Resource's advertisement.
+	/// A new send attempt: nothing of it has been handed over yet, and its
+	/// transfer is watched afresh, from its own Resource's advertisement.
 	pub(crate) fn begin_transfer_watch(&mut self) {
+		self.transfer_by_resource = false;
 		self.transfer_moved_at = None;
 		self.transfer_silence_unasserted = None;
 		self.transfer_silence_asserted = false;
@@ -1893,26 +1970,39 @@ fn resource_concluded_shared(handle: &Arc<Mutex<LXMessage>>, resource: &Arc<Mute
 }
 
 /// The progress callback the router hands AppLinks for a send of this
-/// message: each Resource fraction moves the message's progress to
-/// 0.10 + 0.90 × fraction while it is SENDING, never down
-/// (`LXMessage::apply_transfer_fraction`). Until 2026-09-29 nothing was
-/// handed over, and a message sent through AppLinks sat at 0.05 (DIRECT)
-/// or 0.50 (PROPAGATED) for its whole transfer.
+/// message (`app_links::SendProgress`): each Resource fraction moves the
+/// message's progress to 0.10 + 0.90 × fraction while it is SENDING, never
+/// down (`LXMessage::apply_transfer_fraction`); a Resource's advertisement
+/// puts it at 0.10, where LXMF/LXMessage.py puts a Resource send. Until
+/// 2026-09-29 nothing was handed over, and a message sent through AppLinks
+/// sat at 0.05 (DIRECT) or 0.50 (PROPAGATED) for its whole transfer.
 ///
-/// Runs on the thread serving the receiver's request with the Resource's
-/// lock held, and waits for the message lock: Resource, then message, the
-/// same order as `update_transfer_progress_shared`.
-pub(crate) fn transfer_progress_reporter(handle: &Arc<Mutex<LXMessage>>) -> Arc<dyn Fn(f64) + Send + Sync + 'static> {
+/// Each report is also an event of the Resource carrying the send, for
+/// DESIGN_PRINCIPLES §1, bulk transfers: its advertisement starts the watch
+/// on it, each request served restarts the silence clock, and its end
+/// (concluded without delivering, before its tier hands over) stops the
+/// watch until the next Resource's advertisement.
+///
+/// A fraction runs on the thread serving the receiver's request, and an end
+/// on the thread concluding the Resource, with the Resource's lock held; it
+/// waits for the message lock: Resource, then message, the same order as
+/// `update_transfer_progress_shared`.
+pub(crate) fn transfer_progress_reporter(handle: &Arc<Mutex<LXMessage>>) -> app_links::SendProgressCallback {
 	let handle = Arc::clone(handle);
-	Arc::new(move |fraction: f64| {
+	Arc::new(move |event: app_links::SendProgress| {
 		if let Ok(mut message) = handle.lock() {
-			message.apply_transfer_fraction(fraction);
-			// Each report is an event of the transfer: its advertisement
-			// (0.0, app-links `TransferWatch::advertised`) or a request
-			// served. DESIGN_PRINCIPLES §1, bulk transfers, measures the
-			// silence between them.
-			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-			message.note_transfer_progress(now_seconds());
+			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1 (bulk transfers)
+			match event {
+				app_links::SendProgress::Advertised => {
+					message.apply_transfer_fraction(0.0);
+					message.note_transfer_progress(now_seconds());
+				}
+				app_links::SendProgress::Fraction(fraction) => {
+					message.apply_transfer_fraction(fraction);
+					message.note_transfer_progress(now_seconds());
+				}
+				app_links::SendProgress::Ended => message.note_transfer_ended(now_seconds()),
+			}
 		}
 	})
 }
@@ -2155,11 +2245,13 @@ mod tests {
 		let report = transfer_progress_reporter(&handle);
 		let progress = || handle.lock().unwrap().progress;
 
-		report(0.0);
+		report(app_links::SendProgress::Advertised);
 		assert!((progress() - 0.10).abs() < 1e-9, "the transfer handed over is 0.10");
-		report(0.5);
+		report(app_links::SendProgress::Fraction(0.0));
+		assert!((progress() - 0.10).abs() < 1e-9, "the transfer handed over is 0.10");
+		report(app_links::SendProgress::Fraction(0.5));
 		assert!((progress() - 0.55).abs() < 1e-9, "0.10 + 0.90 × 0.5");
-		report(1.0);
+		report(app_links::SendProgress::Fraction(1.0));
 		assert!((progress() - 1.0).abs() < 1e-9, "all parts sent is 1.0");
 		assert_eq!(LXMessage::transfer_progress(1.7), 1.0, "a fraction never takes it past 1.0");
 	}
@@ -2170,11 +2262,13 @@ mod tests {
 	fn transfer_progress_only_moves_up() {
 		let (handle, _) = packed_direct_message(LXMessage::SENDING);
 		let report = transfer_progress_reporter(&handle);
-		report(0.6);
+		report(app_links::SendProgress::Fraction(0.6));
 		let high = handle.lock().unwrap().progress;
-		report(0.2);
+		report(app_links::SendProgress::Fraction(0.2));
 		assert_eq!(handle.lock().unwrap().progress, high, "a lower fraction from another tier must not pull it back");
-		report(0.6);
+		report(app_links::SendProgress::Advertised);
+		assert_eq!(handle.lock().unwrap().progress, high, "nor the next tier's advertisement");
+		report(app_links::SendProgress::Fraction(0.6));
 		assert_eq!(handle.lock().unwrap().progress, high);
 	}
 
@@ -2191,7 +2285,7 @@ mod tests {
 		] {
 			let (handle, _) = packed_direct_message(state);
 			handle.lock().unwrap().progress = progress;
-			transfer_progress_reporter(&handle)(0.9);
+			transfer_progress_reporter(&handle)(app_links::SendProgress::Fraction(0.9));
 			let message = handle.lock().unwrap();
 			assert_eq!(message.progress, progress, "state {:#04x} must not move", state);
 			assert_eq!(message.state, state);
@@ -2238,6 +2332,7 @@ mod tests {
 	fn a_moving_thirty_second_transfer_does_not_trip_section_1() {
 		let t0 = 1_000.0;
 		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_handed_to_app_links();
 		assert!(photo.measured_by_transfer_progress(), "a Resource send is measured by its progress");
 
 		photo.note_transfer_progress(t0 + 2.0); // the advertisement went out
@@ -2296,24 +2391,87 @@ mod tests {
 		assert_eq!(photo.transfer_silence(now_seconds() + 60.0), None, "and nothing once delivered");
 	}
 
-	/// Before its Resource is advertised a Resource send is not measured by
-	/// the transfer watch (its path and link have their own §1 bounds, and
-	/// a Resource QUEUED behind another on its link waits out that one's
-	/// transfer), nor by the router's total-time assertion
-	/// (`measured_by_transfer_progress`). A send that fits one packet stays
-	/// with the total-time assertion.
+	/// Until its payload is handed over to go as a Resource a send is
+	/// measured from its start, like one that fits a packet: on the router's
+	/// own DIRECT path that is its path request and link setup, which
+	/// nothing else bounds. Once handed over (to AppLinks, whose race and
+	/// link have their own §1 bounds, or to a link the router holds) it is
+	/// measured by its transfer's progress, and not at all before its
+	/// Resource is advertised: a Resource QUEUED behind another on its link
+	/// waits out that one's transfer, which is watched in its own right. A
+	/// send that fits one packet is never handed over as a Resource.
 	#[test]
-	fn before_its_advertisement_a_resource_send_is_not_measured() {
+	fn a_resource_send_is_measured_from_its_start_until_it_is_handed_over() {
 		let t0 = 1_000.0;
 		let mut photo = photo_message(LXMessage::SENDING, t0);
-		assert!(photo.measured_by_transfer_progress());
+		assert!(!photo.measured_by_transfer_progress(), "not yet handed over: measured from its start");
+
+		photo.note_handed_to_app_links();
+		assert!(photo.measured_by_transfer_progress(), "handed to AppLinks as a Resource");
 		assert_eq!(passes(&mut photo, t0, t0 + 60.0, 0.5), vec![], "queued for a minute: not silent");
+
+		photo.begin_transfer_watch();
+		assert!(!photo.measured_by_transfer_progress(), "a new attempt has handed nothing over");
 
 		let (text, _) = packed_direct_message(LXMessage::SENDING);
 		let mut text = Arc::try_unwrap(text).ok().unwrap().into_inner().unwrap();
 		assert!(text.packed.as_ref().unwrap().len() <= reticulum_rust::link::MDU, "one packet");
+		text.note_handed_to_app_links();
 		assert!(!text.measured_by_transfer_progress(), "a packet send keeps the assertion from its start");
 		assert_eq!(passes(&mut text, t0, t0 + 60.0, 0.5), vec![], "nothing for this watch to say about it");
+	}
+
+	/// The reviewer's case of 2026-10-01: tier 1's Resource moved, then its
+	/// link closed and the Resource concluded FAILED; tier 3's path race and
+	/// link took 5.5 s before its own Resource advertised. That setup lies
+	/// between two Resources, not inside one, and is not a silence, as on a
+	/// first attempt (Retichat-js's per-Resource watch reads the rule the
+	/// same way). Tier 3's Resource is then watched from its advertisement.
+	#[test]
+	fn a_tier_handover_is_not_a_silence() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_handed_to_app_links();
+		photo.note_transfer_progress(t0 + 1.0); // tier 1 advertised
+		photo.note_transfer_progress(t0 + 2.0); // tier 1: last request served
+		photo.note_transfer_ended(t0 + 2.5); // tier 1's link closed: its Resource failed
+		assert_eq!(passes(&mut photo, t0 + 2.5, t0 + 7.9, 0.25), vec![], "tier 3's race and link are not a silence");
+		assert!(photo.measured_by_transfer_progress(), "and not measured from the send's start either");
+
+		photo.note_transfer_progress(t0 + 8.0); // tier 3 advertised
+		assert_eq!(passes(&mut photo, t0 + 8.0, t0 + 12.9, 0.25), vec![], "tier 3's Resource, watched from its advertisement");
+		assert_eq!(photo.transfer_silence(t0 + 13.1).map(|s| s.ended), Some(false), "and its own silence is asserted");
+
+		// The same race and link on a first attempt: not measured either.
+		let mut first = photo_message(LXMessage::SENDING, t0);
+		first.note_handed_to_app_links();
+		assert_eq!(first.transfer_silence(t0 + 7.6), None);
+	}
+
+	/// A silence a Resource ends in is a silence: asserted by the next pass
+	/// when none saw it run, closed with nothing more when one did. Either
+	/// way the watch stops with the Resource.
+	#[test]
+	fn a_silence_a_resource_ends_in_is_still_asserted() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_transfer_progress(t0 + 1.0);
+		photo.note_transfer_ended(t0 + 7.0); // 6 s later, no pass in between
+		assert_eq!(photo.transfer_silence(t0 + 7.5), Some(TransferSilence { seconds: 6.0, ended: true }));
+		assert_eq!(passes(&mut photo, t0 + 7.5, t0 + 30.0, 0.5), vec![], "asserted once, and the watch has stopped");
+
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_transfer_progress(t0 + 1.0);
+		assert_eq!(photo.transfer_silence(t0 + 6.5).map(|s| s.ended), Some(false), "asserted while it ran");
+		photo.note_transfer_ended(t0 + 9.0);
+		assert_eq!(passes(&mut photo, t0 + 9.0, t0 + 30.0, 0.5), vec![], "nothing more once it ended");
+
+		// A Resource that ended inside the limit leaves nothing behind.
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_transfer_progress(t0 + 1.0);
+		photo.note_transfer_ended(t0 + 4.0);
+		assert_eq!(photo.transfer_silence_unasserted, None);
+		assert_eq!(photo.transfer_moved_at, None);
 	}
 
 	/// Each send attempt is watched from its own advertisement: what an
@@ -2328,6 +2486,7 @@ mod tests {
 
 		photo.begin_transfer_watch();
 		assert_eq!(photo.transfer_moved_at, None);
+		assert!(!photo.transfer_by_resource);
 		assert_eq!(photo.transfer_silence(t0 + 100.0), None);
 	}
 
@@ -2340,43 +2499,73 @@ mod tests {
 			let mut photo = photo_message(state, t0);
 			photo.note_transfer_progress(t0 + 1.0);
 			assert_eq!(photo.transfer_moved_at, None, "state {:#04x}", state);
+			photo.transfer_moved_at = Some(t0 + 1.0);
+			photo.note_transfer_ended(t0 + 9.0);
+			assert_eq!(photo.transfer_moved_at, Some(t0 + 1.0), "state {:#04x}: a late end", state);
+			assert_eq!(photo.transfer_silence_unasserted, None, "state {:#04x}", state);
 		}
 	}
 
 	/// The message's own Resource (a DIRECT send on a link the router holds
-	/// without AppLinks) reports its advertisement and its progress to the
-	/// transfer watch too.
+	/// without AppLinks) hands the send over, and reports its advertisement,
+	/// its progress and its end to the transfer watch too.
 	#[test]
 	fn the_messages_own_resource_reports_to_the_transfer_watch() {
 		let src = include_str!("lx_message.rs");
 		let production = src.split("#[cfg(test)]").next().expect("production source");
-		let as_resource = &production[production.find("fn as_resource(").expect("as_resource")..];
-		let as_resource = &as_resource[..as_resource.find("\n\t}\n").expect("its end")];
+		let body = |name: &str| -> String {
+			let from = &production[production.find(name).unwrap_or_else(|| panic!("{}", name))..];
+			from[..from.find("\n\t}\n").expect("its end")].to_string()
+		};
+		let as_resource = body("fn as_resource(");
+		assert!(
+			as_resource.contains("self.transfer_by_resource = true;"),
+			"handing the payload over as a Resource ends the measure from the send's start"
+		);
 		assert!(
 			as_resource.contains("Some(handle) => Resource::advertise_shared_then(")
 				&& as_resource.contains("message.note_transfer_progress(now_seconds());"),
 			"the advertisement starts the watch"
 		);
-		let update = &production[production.find("fn update_transfer_progress(").expect("update_transfer_progress")..];
-		let update = &update[..update.find("\n\t}\n").expect("its end")];
+		let update = body("fn update_transfer_progress(");
 		assert!(update.contains("self.note_transfer_progress(now_seconds());"), "each request served is an event");
+		for concluded in ["fn resource_concluded(", "fn propagation_resource_concluded("] {
+			let concluded = body(concluded);
+			let ended = concluded.find("self.note_transfer_ended(now_seconds());").expect("its end stops the watch");
+			assert!(
+				ended < concluded.find("self.state =").expect("a state change"),
+				"the watch stops before the state leaves SENDING"
+			);
+		}
 	}
 
-	/// The reporter the router hands AppLinks notes each report (the
-	/// advertisement as 0.0, then each request served) as an event of the
-	/// transfer, at the time it lands.
+	/// The reporter the router hands AppLinks notes each report as an event
+	/// of the Resource carrying the send, at the time it lands: the
+	/// advertisement (0.10, as LXMessage.py) and each request served restart
+	/// the clock, the Resource's end stops the watch.
 	#[test]
 	fn the_progress_reporter_notes_each_transfer_event() {
+		use app_links::SendProgress;
 		let photo = Arc::new(Mutex::new(photo_message(LXMessage::SENDING, now_seconds())));
+		photo.lock().unwrap().note_handed_to_app_links();
 		let report = transfer_progress_reporter(&photo);
 		let before = now_seconds();
-		report(0.0);
+		report(SendProgress::Advertised);
 		let advertised = photo.lock().unwrap().transfer_moved_at.expect("the advertisement is noted");
 		assert!(advertised >= before && advertised <= now_seconds());
 		assert!((photo.lock().unwrap().progress - 0.10).abs() < 1e-9, "the advertisement is 0.10, as LXMessage.py");
 		std::thread::sleep(std::time::Duration::from_millis(5));
-		report(0.0);
-		assert!(photo.lock().unwrap().transfer_moved_at.unwrap() > advertised, "a resend-only request is an event too");
+		report(SendProgress::Fraction(0.0));
+		let moved = photo.lock().unwrap().transfer_moved_at.unwrap();
+		assert!(moved > advertised, "a resend-only request is an event too");
+		report(SendProgress::Fraction(0.5));
+		assert!((photo.lock().unwrap().progress - 0.55).abs() < 1e-9);
+
+		report(SendProgress::Ended);
+		let photo = photo.lock().unwrap();
+		assert_eq!(photo.transfer_moved_at, None, "the Resource's end stops the watch");
+		assert_eq!(photo.state, LXMessage::SENDING, "and changes nothing else: its tier's failure decides");
+		assert!(photo.measured_by_transfer_progress(), "the send is still a Resource send");
 	}
 
 	#[test]
