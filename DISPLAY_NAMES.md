@@ -261,28 +261,56 @@ messages keep the hash and resolve it when shown.
 Never lose a name the user typed.
 
 Placeholders, dropped wherever the name was not typed by the user:
-"Retichat", "Retichat Web", "Anonymous Peer" (case-insensitive), and hash
-forms (8 to 32 hex, with or without `?` or `…`). Where a name may have been
-typed (every iOS name, Android DM chat names, web customized names), a hash
-form counts only when it prefixes the contact's own hash; other hex such as
-"deadbeef" is kept. Unnamed Android and web senders used
-to send the first two as names, and MeshChatX, Columba and lxmd announce the
-third.
+"Retichat", "Retichat Web", "Anonymous Peer" (case-insensitive), hash
+forms (8 to 32 hex, with or without `?` or `…`), and the old web node
+defaults (below). Where a name may have been typed (every iOS name, Android
+DM chat names, web customized names), a hash form counts only when it
+prefixes the contact's own hash; other hex such as "deadbeef" is kept.
+Unnamed Android and web senders used to send the first two as names, and
+MeshChatX, Columba and lxmd announce the third.
+
+The old web node defaults (added 2026-09-30). Until 2026-09-30 each web
+node's `config.json` named its users "Retichat Web (retichat)" or "Retichat
+Web (selectiv)": the web's Settings field was pre-filled with it, and group
+envelopes sent it as `0x10`. Until 2026-09-23 the web announce added " (",
+the first 12 hex of the identity and ")" to the name, so contacts also hold
+"Retichat Web (retichat) (0123456789ab)", or "Retichat Web (0123456789ab)"
+from a node with no default. The rule, exactly: the name, surrounding white
+space trimmed, starts with `Retichat Web (` (ASCII case-insensitive, one
+space before the parenthesis), ends with `)`, and has at least one character
+between them. Nothing about those characters is checked, so the forms with a
+hex suffix are instances of the same rule. As a regular expression,
+`^retichat web \(.+\)$` with ASCII-only case folding; in SQLite,
+`lower(trim(name)) GLOB 'retichat web (?*)'`. An old web node default is a
+placeholder even where a name may have been typed (every iOS name, Android
+`isNameManual` names and DM chat names, web customized names): no user types
+one, and the old web rename field was pre-filled with the contact's current
+name, so Save on it untouched marked that name customized. Shared vectors:
+`tests/display_name_vectors.json`, section `placeholder` (`placeholder`
+where the name was not typed, `web_node_default` everywhere).
 
 - iOS has one `displayName` and no rename flag. A placeholder is dropped. A
   value equal to the contact's recalled announce name becomes `announceName`.
-  Anything else becomes `localName` (it may have been typed).
+  Anything else becomes `localName` (it may have been typed). Devices that
+  ran this migration before the old web node defaults were added may hold
+  one as `localName`, where it leads every label for good; a one-off second
+  pass drops a `localName` that is an old web node default.
 - Android: `isNameManual` → `localName`; a DM chat name the user set on a chat
-  with no manual contact name → `localName`. Otherwise `legacyName`, unless a
-  placeholder.
-- Web: `nameCustomized` → `localName`. Otherwise `legacyName`, unless a
+  with no manual contact name → `localName`; an old web node default is
+  dropped from both. Otherwise `legacyName`, unless a placeholder. Databases
+  already migrated before the old web node defaults were added need a pass
+  that clears a `localName` or `legacyName` holding one.
+- Web: `nameCustomized` → `localName`, unless it is this contact's own hash
+  form (what the old rename field was pre-filled with when the contact had no
+  name) or an old web node default. Otherwise `legacyName`, unless a
   placeholder.
 
 `legacyName` rather than `messageName`, because an old name may have come from
 an announce: an upstream contact never sends `0xD1`, so a stale name in
 `messageName` would outrank its current announce name for good.
 - Settings: the old display name becomes the Message Display Name. Android's
-  literal "Retichat" and the web's "Retichat Web" placeholders become empty.
+  literal "Retichat", the web's "Retichat Web" placeholder and an old web
+  node default (any node's, not only the one serving the page) become empty.
   The old channel display name stays the Channel Display Name. The Announce
   Display Name starts empty.
 
@@ -413,9 +441,13 @@ web `acceptMessageNameAt`, `acceptChannelName`. Legacy slot (§5.1): Android
 `legacyName` column (migration 10 → 11), web `legacyName` in `ContactStore`.
 Placeholders (§5.4): iOS `DisplayNames.isPlaceholder(_:ownHash:)`, Android
 `NamesMigration.placeholderSql` / `chatNamePlaceholderSql`, web
-`isPlaceholderName` / `isOwnHashPrefill`. NSE: `chat_names.json` entries
-carry the slot and `messageNameAt` (`DisplayNames.SharedName`), channel names
-their post time (`SharedChannelName`). Web names for non-contacts: hidden
+`isPlaceholderName` / `isOwnHashPrefill`. Old web node defaults: web
+`isWebNodeDefault` (used by `isPlaceholderName`, `migrateContact` and
+`migrateOwnDisplayName`, run against the shared `placeholder` vectors by
+`display_names.test.mjs`); iOS and Android not yet (open follow-ups).
+NSE: `chat_names.json` entries carry the slot and `messageNameAt`
+(`DisplayNames.SharedName`), channel names their post time
+(`SharedChannelName`). Web names for non-contacts: hidden
 rows (`nameOnly` is still written but gates nothing since Retichat-js
 `202a2f3`); invites gated by the privacy filter (`PrivacyFilter.allows`: an
 allowlisted source), which replaced `ContactStore.mayInvite`.

@@ -1,5 +1,5 @@
 {
-  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (the name: key 0 of the Retichat field 0xD1, a map), 4.1 (digest)",
+  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (the name: key 0 of the Retichat field 0xD1, a map), 4.1 (digest), 5.4 (placeholders)",
   "notes": [
     "input_hex / fields_msgpack_hex are raw bytes as lowercase hex.",
     "expected is the cleaned name as a JSON string, or null for None.",
@@ -7,7 +7,8 @@
     "decode_field: the name is key 0 of the map at field 0xD1 ({0xD1: {0: name}}); a 0xD1 that is not a map is absent. state is absent | clear | name; display_name is set only for state name. More Retichat-field cases (group entries) are in retichat_field_vectors.json.",
     "digest_hex is the first 16 bytes of SHA-256 over the UTF-8 of input.",
     "Interpretation of rule 5: after truncation, trailing U+0020 and U+200D are stripped repeatedly (see the 'trailing' vectors).",
-    "Order of rules 2 and 3: U+0085 is White_Space, so rule 2 turns it into a space before rule 3 could remove it as C1."
+    "Order of rules 2 and 3: U+0085 is White_Space, so rule 2 turns it into a space before rule 3 could remove it as C1.",
+    "placeholder (DISPLAY_NAMES.md 5.4): input is a stored name, own_hash the contact's hash. placeholder is the test where the name was not typed: 'Retichat', 'Retichat Web', 'Anonymous Peer' (case-insensitive), hash forms (8 to 32 hex, with or without '?' before or U+2026 after) and the old web node defaults. web_node_default is the old web node default alone ('Retichat Web (' + one or more characters + ')', ASCII case-insensitive, surrounding white space trimmed), which is dropped even where a name may have been typed. Where a name may have been typed, a hash form counts only when it prefixes own_hash (5.4)."
   ],
   "clean": [
     {
@@ -566,6 +567,274 @@
       "name": "zwj family",
       "input": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66",
       "digest_hex": "32b7d42dae221e37043eef14ee3525ad"
+    }
+  ],
+  "placeholder": [
+    {
+      "name": "app placeholder",
+      "input": "Retichat",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "app placeholder, any case",
+      "input": "RETICHAT",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "web placeholder",
+      "input": "Retichat Web",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "web placeholder, any case",
+      "input": "retichat WEB",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "upstream announce placeholder",
+      "input": "Anonymous Peer",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "upstream announce placeholder, any case",
+      "input": "anonymous peer",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "surrounding white space is ignored",
+      "input": "  Retichat  ",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "web node default: retichat.com",
+      "input": "Retichat Web (retichat)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default: selectiv",
+      "input": "Retichat Web (selectiv)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default as announced until 2026-09-23",
+      "input": "Retichat Web (retichat) (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default with another identity's hex",
+      "input": "Retichat Web (selectiv) (fedcba9876543210)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default with a 32-hex suffix",
+      "input": "Retichat Web (retichat) (fedcba9876543210fedcba9876543210)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "announce of a node with no config default",
+      "input": "Retichat Web (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default: staging",
+      "input": "Retichat Web (E2E)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default, any case",
+      "input": "retichat web (RETICHAT)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default, one character inside",
+      "input": "Retichat Web (x)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default, surrounding white space",
+      "input": "  Retichat Web (selectiv) ",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "web node default: anything inside the parentheses",
+      "input": "Retichat Web (Bob's laptop)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
+    },
+    {
+      "name": "not a default: nothing inside the parentheses",
+      "input": "Retichat Web ()",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: no space before the parenthesis",
+      "input": "Retichat Web(retichat)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: unclosed",
+      "input": "Retichat Web (retichat",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: text after the closing parenthesis",
+      "input": "Retichat Web (retichat) x",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: text before",
+      "input": "My Retichat Web (retichat)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: another word",
+      "input": "Retichat Webber (x)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: no Web",
+      "input": "Retichat (retichat)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a default: a non-ASCII i is not folded",
+      "input": "Ret\u0131chat Web (x)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "hash form: own hash, 16 hex",
+      "input": "0123456789abcdef",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "hash form: own hash, ? and 8 hex",
+      "input": "?01234567",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "hash form: own hash, 8 hex and ellipsis",
+      "input": "01234567\u2026",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "hash form: own hash, 32 hex, any case, ? and ellipsis",
+      "input": "?0123456789ABCDEF0123456789abcdef\u2026",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "hash form: another hash",
+      "input": "deadbeef",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "hash form: another hash with ?",
+      "input": "?cafebabe",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "not a hash form: 7 hex",
+      "input": "0123abc",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "not a hash form: 33 hex",
+      "input": "0123456789abcdef0123456789abcdef0",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "a name",
+      "input": "Bob",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "a name containing Retichat",
+      "input": "Retichat User",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "short all-hex name",
+      "input": "Bea",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
+    },
+    {
+      "name": "Anonymous alone",
+      "input": "Anonymous",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": false,
+      "web_node_default": false
     }
   ]
 }
