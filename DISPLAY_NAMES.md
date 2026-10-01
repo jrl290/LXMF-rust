@@ -410,21 +410,30 @@ Changes take effect at once through the router setters, with no stack restart.
   invite doesn't come from someone on the allowlist, it is ignored. If the
   invite is accepted, the other group members are considered allowed." So:
   an invite is processed only from a source the privacy filter allows;
-  accepting it allowlists every member, creating a row where there is none;
-  any other group action (accept, leave, relay_req, relay_done, an unknown
-  one) for a group held here is processed only when the packet's own LXMF
-  source is allowed, that is passes the filter or is a current member
-  (invited or accepted, not left) of that group, and is otherwise dropped
-  like any filtered message, with no membership change, no allowlisting and
-  no relay; an accept from an allowed source makes the member it names
-  (`GROUP_SENDER`) a member and allowlists it; a plain group message (no
-  action) for a group held here is kept whoever sent it. Web: Retichat-js
-  `shouldProcessGroupMessage` and `PrivacyFilter.groupAccepts` (`33bc41d`),
-  with the held groups' members allowlisted once by `allowHeldGroupMembers`
-  (`23b2346`). iOS
-  (`groupMessagePolicy`) and Android (`DeliveryPolicy.groupMessage`) still
-  process every non-invite action for a held group from any source (open
-  follow-ups).
+  accepting it allowlists every member, creating a row where there is none.
+  A source is *allowed* for a group held here when it passes the filter or
+  is a current member (invited or accepted, not left) of a group the user
+  has accepted; a member listed in a group still pending is not. Any other
+  group action (accept, leave, relay_req, relay_done, an unknown one) for a
+  group held here is processed only when the packet's own LXMF source is
+  allowed, with one exception: a member listed in a pending group may accept
+  or leave for itself (no `GROUP_SENDER`, or its own), which records its
+  status and allows nobody. Anything else is dropped like any filtered
+  message, with no membership change, no allowlisting and no relay. An
+  accept from an allowed source makes the member it names (`GROUP_SENDER`) a
+  member, allowlisted in a group the user has accepted; in a pending one the
+  user's accept allows it with every other member, and a decline leaves
+  nobody allowed. A plain group message (no action) for a group held here is
+  kept whoever sent it, and `GROUP_SENDER` names its author only when its
+  source is allowed: anyone else's post is shown as its own (a departure
+  from iOS, which shows it as the member it names). Web: Retichat-js
+  `shouldProcessGroupMessage`, `groupTrustsSource`,
+  `PrivacyFilter.groupAccepts` and `PrivacyFilter.groupMember` (`33bc41d`,
+  `793a959`, `47bc47d`), with the held groups' members allowlisted once by
+  `allowHeldGroupMembers` (`23b2346`). iOS (`groupMessagePolicy`) and
+  Android (`DeliveryPolicy.groupMessage`) still process every non-invite
+  action for a held group from any source, and take any `GROUP_SENDER` as
+  the author (open follow-ups).
 
 ## 8. Not in scope (follow-ups)
 
@@ -432,7 +441,9 @@ Changes take effect at once through the router setters, with no stack restart.
   receiver's own contacts through 0xA4.
 - Syncing one Message Display Name across a distro's devices. Each device
   sends its own.
-- Group membership of distro holders (audit H8), GROUP_SENDER trust (M13),
+- Group membership of distro holders (audit H8), GROUP_SENDER trust (M13:
+  on the web, since `47bc47d`, only an allowed source's `GROUP_SENDER` is
+  believed, §7; an allowed member can still name any author),
   link-proven identities (M15), Android's leave message (L5).
 
 ## 9. Implementation
