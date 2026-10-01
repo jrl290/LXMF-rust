@@ -353,10 +353,20 @@ the name after the rule, the input itself when it does not apply).
   `trim(x, WS)`.
 - Web: `nameCustomized` → `localName`, unless it is this contact's own hash
   form (what the old rename field was pre-filled with when the contact had no
-  name) or an old web node default. Otherwise `legacyName`, unless a
-  placeholder. Either then loses the old web announce suffix. Rows migrated
-  before the suffix rule lose it from `localName`, `announceName` and
-  `legacyName` in a one-off pass.
+  name), an old web node default, or a name that carries the old web
+  announce suffix. Otherwise `legacyName`, unless a placeholder. Either then
+  loses the old web announce suffix. The rename field was pre-filled with
+  the contact's current name, which carried the suffix when it came from an
+  announce, so Save on it untouched marked an announced name customized:
+  such a name is no name the user typed, and as a `localName` it would
+  outrank the name the contact now sends for good. What is left of it is a
+  `legacyName`, which the contact's first `0xD1` or named announce replaces
+  (decided 2026-10-01). Rows migrated before the suffix rule lose it from
+  `localName`, `announceName` and `legacyName` in a one-off pass, and there
+  a `localName` that carried it becomes the `legacyName` too, unless the row
+  holds a `legacyName`, or a `0xD1` has been accepted (`messageName` or
+  `messageNameAt` set) or an announce with a name heard (`announceName` set)
+  since, any of which would have dropped it (§5.1).
 - Every client strips the old web announce suffix from a received
   `lxmf.delivery` announce name (the announcing hash is the contact's own).
 
@@ -396,6 +406,25 @@ Changes take effect at once through the router setters, with no stack restart.
   with an allowlist nothing filled, so it dropped every router-delivered
   message, contacts' included. Android now accepts exactly what iOS accepts:
   allowlisted contacts, plus group traffic under iOS's group message policy.
+- **Group trust rule** (James, 2026-10-01): "Groups start by invite. If the
+  invite doesn't come from someone on the allowlist, it is ignored. If the
+  invite is accepted, the other group members are considered allowed." So:
+  an invite is processed only from a source the privacy filter allows;
+  accepting it allowlists every member, creating a row where there is none;
+  any other group action (accept, leave, relay_req, relay_done, an unknown
+  one) for a group held here is processed only when the packet's own LXMF
+  source is allowed, that is passes the filter or is a current member
+  (invited or accepted, not left) of that group, and is otherwise dropped
+  like any filtered message, with no membership change, no allowlisting and
+  no relay; an accept from an allowed source makes the member it names
+  (`GROUP_SENDER`) a member and allowlists it; a plain group message (no
+  action) for a group held here is kept whoever sent it. Web: Retichat-js
+  `shouldProcessGroupMessage` and `PrivacyFilter.groupAccepts` (`33bc41d`),
+  with the held groups' members allowlisted once by `allowHeldGroupMembers`
+  (`23b2346`). iOS
+  (`groupMessagePolicy`) and Android (`DeliveryPolicy.groupMessage`) still
+  process every non-invite action for a held group from any source (open
+  follow-ups).
 
 ## 8. Not in scope (follow-ups)
 
@@ -631,14 +660,16 @@ channel send rule (it never posts).
   and `groupMessagePolicy`, on by default), asked by `LXMRouter.acceptsSource`
   (the decrypted source, before the proof and the parse; a source that is
   neither allowlisted nor a member here is read only as far as its group id
-  and action, `LXMessage.peekGroupFields`, and kept only as a group message
-  for a group held here, as iOS keeps it) and
+  and action, `LXMessage.peekGroupFields`, and kept only as a plain group
+  message, with no action, for a group held here, as iOS keeps it: §7's
+  group trust rule) and
   `acceptsMessage` (after the parse, before the proof) in
   `lib/rns/lxmf/lxmf_router.js`; a dropped message records no name and is
   not proved by the router (a link Resource is proved by the Resource
   protocol on assembly, before its source can be read). Allowlist:
-  `ContactStore.allow` / `allowlisted`; members of groups held before the
-  filter, once, by `ContactStore.allowHeldGroupMembers`. Distro fan-out
+  `ContactStore.allow` / `allowlisted`; members of groups held as active
+  before the filter, once, by `ContactStore.allowHeldGroupMembers` (every
+  row kind, and a row for a member with none, since 2026-10-01). Distro fan-out
   (`_handleDistroBlob`) is not filtered. Tests `privacy_filter.test.mjs`.
 - Message ledger (§4.1, the web client has no Rust router):
   `NameLedger` + `decide`, decided once per DM in `_dispatchMessage`
