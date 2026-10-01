@@ -1,5 +1,5 @@
 {
-  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (the name: key 0 of the Retichat field 0xD1, a map), 4.1 (digest), 5.4 (placeholders)",
+  "spec": "LXMF-rust/DISPLAY_NAMES.md section 3 (cleaning), 2.1 (the name: key 0 of the Retichat field 0xD1, a map), 4.1 (digest), 5.4 (placeholders, the old web announce suffix)",
   "notes": [
     "input_hex / fields_msgpack_hex are raw bytes as lowercase hex.",
     "expected is the cleaned name as a JSON string, or null for None.",
@@ -8,7 +8,8 @@
     "digest_hex is the first 16 bytes of SHA-256 over the UTF-8 of input.",
     "Interpretation of rule 5: after truncation, trailing U+0020 and U+200D are stripped repeatedly (see the 'trailing' vectors).",
     "Order of rules 2 and 3: U+0085 is White_Space, so rule 2 turns it into a space before rule 3 could remove it as C1.",
-    "placeholder (DISPLAY_NAMES.md 5.4): input is a stored name, own_hash the contact's hash. placeholder is the test where the name was not typed: 'Retichat', 'Retichat Web', 'Anonymous Peer' (case-insensitive), hash forms (8 to 32 hex, with or without '?' before or U+2026 after) and the old web node defaults. web_node_default is the old web node default alone ('Retichat Web (' + one or more characters + ')', ASCII case-insensitive, surrounding white space trimmed), which is dropped even where a name may have been typed. Where a name may have been typed, a hash form counts only when it prefixes own_hash (5.4)."
+    "placeholder (DISPLAY_NAMES.md 5.4): input is a stored name, own_hash the contact's hash. placeholder is the test where the name was not typed: 'Retichat', 'Retichat Web', 'Anonymous Peer' (case-insensitive), hash forms (8 to 32 hex, with or without '?' before or U+2026 after) and the old web node defaults. web_node_default is the old web node default alone ('Retichat Web (' + one or more characters + ')', ASCII case-insensitive, surrounding white space trimmed), which is dropped even where a name may have been typed. Where a name may have been typed, a hash form counts only when it prefixes own_hash (5.4).",
+    "own_hash_suffix (DISPLAY_NAMES.md 5.4): until 2026-09-23 the web announced '<name> (' + the first 12 hex of its lxmf.delivery hash + ')'. input is a stored or announced name, own_hash the contact's hash. A trailing ' (' + exactly 12 hex + ')' is stripped only when those 12 hex are the first 12 of own_hash (ASCII case-insensitive), after surrounding white space is trimmed and with at least one character before ' ('; expected is what is left, trimmed. Anything else is returned unchanged (expected equals input). One suffix only. What is left then meets the placeholder rules like any name."
   ],
   "clean": [
     {
@@ -835,6 +836,128 @@
       "own_hash": "0123456789abcdef0123456789abcdef",
       "placeholder": false,
       "web_node_default": false
+    }
+  ],
+  "own_hash_suffix": [
+    {
+      "name": "as the web announced it until 2026-09-23",
+      "input": "Alice (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "hex in any case",
+      "input": "Alice (0123456789AB)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "surrounding white space",
+      "input": "  Alice (0123456789ab) ",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "what is left is trimmed",
+      "input": "Alice  (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "parentheses in the name are kept",
+      "input": "Bob (work) (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Bob (work)"
+    },
+    {
+      "name": "one suffix, the last",
+      "input": "Alice (0123456789ab) (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (0123456789ab)"
+    },
+    {
+      "name": "a non-ASCII name",
+      "input": "\u00c5sa (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "\u00c5sa"
+    },
+    {
+      "name": "what is left can be a placeholder",
+      "input": "Retichat (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Retichat"
+    },
+    {
+      "name": "an old web node default keeps its node",
+      "input": "Retichat Web (retichat) (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Retichat Web (retichat)"
+    },
+    {
+      "name": "not stripped: another identity's hex",
+      "input": "Alice (fedcba987654)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (fedcba987654)"
+    },
+    {
+      "name": "not stripped: 11 hex",
+      "input": "Alice (0123456789a)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (0123456789a)"
+    },
+    {
+      "name": "not stripped: 13 hex",
+      "input": "Alice (0123456789abc)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (0123456789abc)"
+    },
+    {
+      "name": "not stripped: 16 hex",
+      "input": "Alice (0123456789abcdef)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (0123456789abcdef)"
+    },
+    {
+      "name": "not stripped: no space before the parenthesis",
+      "input": "Alice(0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice(0123456789ab)"
+    },
+    {
+      "name": "not stripped: text after it",
+      "input": "Alice (0123456789ab) x",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (0123456789ab) x"
+    },
+    {
+      "name": "not stripped: other brackets",
+      "input": "Alice [0123456789ab]",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice [0123456789ab]"
+    },
+    {
+      "name": "not stripped: nothing before it",
+      "input": "(0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "(0123456789ab)"
+    },
+    {
+      "name": "not stripped: only white space before it",
+      "input": " (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": " (0123456789ab)"
+    },
+    {
+      "name": "not stripped: a parenthesised word",
+      "input": "Bob (work)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Bob (work)"
+    },
+    {
+      "name": "not stripped: no suffix",
+      "input": "Alice",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
     }
   ]
 }

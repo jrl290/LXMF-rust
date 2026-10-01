@@ -289,21 +289,56 @@ name, so Save on it untouched marked that name customized. Shared vectors:
 `tests/display_name_vectors.json`, section `placeholder` (`placeholder`
 where the name was not typed, `web_node_default` everywhere).
 
+The old web announce suffix (added 2026-09-30). The same pre-09-23 announce
+added the suffix to every web user's name, not only to the node defaults:
+a web user who called herself "Alice" was announced, and stored by every
+client that heard her, as "Alice (0123456789ab)", the 12 hex being the
+first 12 of her `lxmf.delivery` hash. Left alone, such a stored name (an
+iOS `localName`, an Android `legacyName` or `isNameManual` name, a web
+customized name) leads her label for good and hides the name she now sends.
+The rule, exactly: trim surrounding white space; if what remains ends with
+a space, `(`, exactly 12 hex digits and `)`, has at least one character
+before that space, and the 12 hex are the first 12 hex of the contact's own
+hash (ASCII case-insensitive), the name becomes what comes before the
+space, trimmed. Only then: a user may have parentheses in a name, but not
+their own hash's prefix, so "Bob (work)" and "Alice (fedcba987654)" stay as
+they are. One suffix, the last. As a regular expression on the trimmed
+name, `^(.+) \(([0-9a-f]{12})\)$` (ASCII case folding, `.` matching any
+character), keeping group 1 when group 2 equals the hash's first 12 hex;
+in SQLite, `length(trim(n)) > 15 AND lower(substr(trim(n), -15)) = ' (' ||
+lower(substr(hash, 1, 12)) || ')'`, keeping `trim(substr(trim(n), 1,
+length(trim(n)) - 15))`. A stored name that lost the suffix came from an
+announce, whatever slot holds it: what is left is then judged by the
+placeholder list above as a name that was not typed, even in a slot where
+names may have been ("Retichat (0123456789ab)" is dropped, not kept as
+"Retichat"). Strip it from every stored name that may hold it, once, and
+from every received announce name (an old web build can still announce
+it); a received announce name only loses the suffix, and is otherwise
+cleaned as §5.1 says. Shared vectors:
+`tests/display_name_vectors.json`, section `own_hash_suffix` (`expected` is
+the name after the rule, the input itself when it does not apply).
+
 - iOS has one `displayName` and no rename flag. A placeholder is dropped. A
   value equal to the contact's recalled announce name becomes `announceName`.
   Anything else becomes `localName` (it may have been typed). Devices that
   ran this migration before the old web node defaults were added may hold
   one as `localName`, where it leads every label for good; a one-off second
-  pass drops a `localName` that is an old web node default.
+  pass drops a `localName` that is an old web node default, and strips the
+  old web announce suffix from a `localName` or `announceName`.
 - Android: `isNameManual` → `localName`; a DM chat name the user set on a chat
   with no manual contact name → `localName`; an old web node default is
   dropped from both. Otherwise `legacyName`, unless a placeholder. Databases
   already migrated before the old web node defaults were added need a pass
-  that clears a `localName` or `legacyName` holding one.
+  that clears a `localName` or `legacyName` holding one, and strips the old
+  web announce suffix from a `localName`, `legacyName` or `announceName`.
 - Web: `nameCustomized` → `localName`, unless it is this contact's own hash
   form (what the old rename field was pre-filled with when the contact had no
   name) or an old web node default. Otherwise `legacyName`, unless a
-  placeholder.
+  placeholder. Either then loses the old web announce suffix. Rows migrated
+  before the suffix rule lose it from `localName`, `announceName` and
+  `legacyName` in a one-off pass.
+- Every client strips the old web announce suffix from a received
+  `lxmf.delivery` announce name (the announcing hash is the contact's own).
 
 `legacyName` rather than `messageName`, because an old name may have come from
 an announce: an upstream contact never sends `0xD1`, so a stale name in
@@ -444,7 +479,12 @@ Placeholders (§5.4): iOS `DisplayNames.isPlaceholder(_:ownHash:)`, Android
 `isPlaceholderName` / `isOwnHashPrefill`. Old web node defaults: web
 `isWebNodeDefault` (used by `isPlaceholderName`, `migrateContact` and
 `migrateOwnDisplayName`, run against the shared `placeholder` vectors by
-`display_names.test.mjs`); iOS and Android not yet (open follow-ups).
+`display_names.test.mjs`); iOS and Android not yet (open follow-ups). Old
+web announce suffix: web `stripOwnHashSuffix` (used by `migrateContact`, its
+one-off `ownHashSuffixPass` run once by `ContactStore.init`, and
+`LXMF.displayNameFromAppData` for announces), run against the shared
+`own_hash_suffix` vectors by `display_names.test.mjs`; iOS and Android not
+yet (open follow-ups).
 NSE: `chat_names.json` entries carry the slot and `messageNameAt`
 (`DisplayNames.SharedName`), channel names their post time
 (`SharedChannelName`). Web names for non-contacts: hidden
@@ -567,13 +607,17 @@ channel send rule (it never posts).
   `ChannelSenderNames.apply`.
 - §7 privacy filter: `PrivacyFilter` in `app.js` (iOS's `allowlistDecision`
   and `groupMessagePolicy`, on by default), asked by `LXMRouter.acceptsSource`
-  (the decrypted source, before the proof and the parse) and
+  (the decrypted source, before the proof and the parse; a source that is
+  neither allowlisted nor a member here is read only as far as its group id
+  and action, `LXMessage.peekGroupFields`, and kept only as a group message
+  for a group held here, as iOS keeps it) and
   `acceptsMessage` (after the parse, before the proof) in
   `lib/rns/lxmf/lxmf_router.js`; a dropped message records no name and is
   not proved by the router (a link Resource is proved by the Resource
   protocol on assembly, before its source can be read). Allowlist:
-  `ContactStore.allow` / `allowlisted`. Distro fan-out (`_handleDistroBlob`)
-  is not filtered. Tests `privacy_filter.test.mjs`.
+  `ContactStore.allow` / `allowlisted`; members of groups held before the
+  filter, once, by `ContactStore.allowHeldGroupMembers`. Distro fan-out
+  (`_handleDistroBlob`) is not filtered. Tests `privacy_filter.test.mjs`.
 - Message ledger (§4.1, the web client has no Rust router):
   `NameLedger` + `decide`, decided once per DM in `_dispatchMessage`
   (`_decideMessageName`) and per group member in `_sendGroupEnvelope`;
