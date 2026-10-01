@@ -1235,6 +1235,49 @@ impl LXMRouter {
 				// Do not add any "graceful" handling. Do not add a retry.
 				// Do not silently downgrade method. If §1 fires we
 				// change the code, not the behavior.
+				//
+				// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): a
+				// send whose payload goes as a Resource is NOT measured by
+				// its total time: a photo legitimately takes minutes. From
+				// its Resource's advertisement on, the transfer must show
+				// progress (a request served, its proof) at least every
+				// 5 s; a longer silence is the §1 violation, asserted here
+				// as above (panic in debug, [SEND-ASSERT] + log in release)
+				// and never used to fail the send: the Resource's own
+				// events (concluded, failed, link closed) decide it.
+				// `transfer_silence` hands each silence over once, whether
+				// it is still running or ended between two passes; the
+				// progress comes from `transfer_progress_reporter` (AppLinks)
+				// and the Resource's own callbacks (LXMessage::as_resource).
+				// Until 2026-10-01 the assertion below measured these sends
+				// too, and a moving 14-part photo on the Pixel tripped it at
+				// 5.23 s, 0.8 s after its last part request.
+				// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+				if let Some(silence) = lxm.transfer_silence(now()) {
+					let msg = format!(
+						"DESIGN_PRINCIPLES §1 VIOLATION: POB message [{}] \
+						 Resource transfer silent for {:.2}s{} (limit {:.1}s \
+						 between progress events; total time is not measured) \
+						 — method={} state={} progress={:.2} — FIX THE CODE.",
+						message_label, silence.seconds,
+						if silence.ended { ", then moved again" } else { "" },
+						reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS,
+						lxm.method, lxm.state, lxm.progress,
+					);
+					#[cfg(debug_assertions)]
+					{
+						log(&msg, LOG_ERROR, false, false);
+						panic!("{}", msg);
+					}
+					#[cfg(not(debug_assertions))]
+					{
+						eprintln!("[SEND-ASSERT] {}", msg);
+						log(&msg, LOG_ERROR, false, false);
+						// Intentionally no state change: the silence is
+						// never used to fail the send (§1, bulk transfers).
+					}
+				}
+
 				if !LXMessage::is_success_state(lxm.state)
 					&& lxm.state != LXMessage::CANCELLED
 					&& lxm.state != LXMessage::REJECTED
@@ -1246,6 +1289,10 @@ impl LXMRouter {
 					// the correct guardrail is MAX_DELIVERY_ATTEMPTS (link-cycle count),
 					// which is enforced below in the PROPAGATED branch.
 					&& lxm.method != LXMessage::PROPAGATED
+					// §1, bulk transfers: a payload that goes as a Resource is
+					// measured by its progress, above, not by its total time.
+					// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+					&& !lxm.measured_by_transfer_progress()
 				{
 					if let Some(ts) = lxm.timestamp {
 						let elapsed = now() - ts;
@@ -1536,6 +1583,7 @@ impl LXMRouter {
 								if !remove {
 									lxm.state = LXMessage::SENDING;
 									lxm.violation_reported = false; // reset for this new send attempt — NEVER REMOVE EVER §1
+									lxm.begin_transfer_watch(); // §1, bulk transfers: watched from this attempt's own advertisement
 									lxm.progress = 0.05;
 									log(&format!("[POB][{}] DIRECT AppLinks::send starting", message_label), LOG_NOTICE, false, false);
 
@@ -1759,6 +1807,9 @@ impl LXMRouter {
 											let wake_fail = self.outbound_wake_tx.clone();
 											let label_ok = message_label.to_string();
 											let label_fail = message_label.to_string();
+											// A new attempt: its Resource, if it goes as one, is
+											// watched from its own advertisement (§1, bulk transfers).
+											lxm.begin_transfer_watch();
 											let queued = AppLinks::send_on_held_link(
 												&node_hash,
 												pdata,
@@ -5755,6 +5806,22 @@ mod tests {
 				&& production.contains("lxm.progress = start_progress;"),
 			"the PROPAGATED start progress follows the representation"
 		);
+		// DESIGN_PRINCIPLES §1, bulk transfers: each attempt's transfer is
+		// watched afresh, from its own Resource's advertisement.
+		let before = |call: &str| -> String {
+			let at = production.find(call).unwrap_or_else(|| panic!("{} must be called", call));
+			// The few lines leading up to the call.
+			let from = production[..at].rmatch_indices('\n').nth(12).map(|(i, _)| i).unwrap_or(0);
+			production[from..at].to_string()
+		};
+		assert!(
+			before("AppLinks::send_with_compression(").contains("lxm.begin_transfer_watch();"),
+			"the DIRECT AppLinks attempt starts a fresh transfer watch"
+		);
+		assert!(
+			before("AppLinks::send_on_held_link(").contains("lxm.begin_transfer_watch();"),
+			"the PROPAGATED held-link attempt starts a fresh transfer watch"
+		);
 	}
 
 	/// REGRESSION GUARD: message_get_response must acknowledge every fetched
@@ -6278,5 +6345,110 @@ mod ratchet_mirror_router_tests {
 		assert_eq!(load(&primary), advertised, "the file still holds the advertised ratchet");
 		assert_eq!(load(&mirror), advertised, "and so does the mirror");
 		Transport::deregister_destination(&hash);
+	}
+}
+
+/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30), at the router's
+/// own assertion (`process_outbound`, debug build: a violation panics). A
+/// send whose payload goes as a Resource is measured by its progress, never
+/// by its total time; a send that fits one packet keeps the assertion from
+/// its start. Until 2026-10-01 a moving 14-part photo on the Pixel tripped
+/// it 5.23 s after the send, 0.8 s after its last part request.
+#[cfg(test)]
+mod send_assertion_router_tests {
+	use super::*;
+
+	fn temp_storage(label: &str) -> String {
+		let mut bytes = [0u8; 8];
+		rand::thread_rng().fill(&mut bytes);
+		std::env::temp_dir()
+			.join(format!("lxmf-router-send-assert-{label}-{}", hexrep(&bytes, false)))
+			.to_string_lossy()
+			.into_owned()
+	}
+
+	/// A router, and a DIRECT message to a destination nobody opened, in
+	/// flight (SENDING) since `sent_secs_ago`, with `content_len` bytes of
+	/// content. Its next attempt is far off, so the pass does nothing for it
+	/// but the §1 assertion.
+	fn in_flight(label: &str, content_len: usize, sent_secs_ago: f64) -> (Arc<Mutex<LXMRouter>>, Arc<Mutex<LXMessage>>) {
+		let router = LXMRouter::new(
+			Some(Identity::new(true)), temp_storage(label), None, None, None, None, None,
+			false, false, Vec::new(), None, false, 0, 0, 0, 0, 0, None,
+		)
+		.expect("router");
+		let source = router
+			.lock()
+			.unwrap()
+			.register_delivery_identity(Identity::new(true), None, None)
+			.expect("register");
+		let recipient = Destination::new_outbound(
+			Some(Identity::new(true)), DestinationType::Single, "lxmf".into(), vec!["delivery".into()],
+		)
+		.unwrap();
+		let mut lxm = LXMessage::new(Some(recipient), Some(source), Some(vec![0x42; content_len]), None, None,
+			Some(LXMessage::DIRECT), None, None, None, false).unwrap();
+		lxm.pack(false).expect("pack");
+		lxm.state = LXMessage::SENDING;
+		lxm.timestamp = Some(now() - sent_secs_ago);
+		lxm.next_delivery_attempt = Some(now() + 3600.0);
+		(router, Arc::new(Mutex::new(lxm)))
+	}
+
+	/// One router pass over the message; afterwards the router lets go of it,
+	/// so its job thread does not assert it again after the test.
+	fn pass(router: &Arc<Mutex<LXMRouter>>, message: &Arc<Mutex<LXMessage>>) {
+		let mut r = router.lock().unwrap();
+		r.pending_outbound.push(message.clone());
+		r.process_outbound();
+		r.pending_outbound.clear();
+	}
+
+	/// The photo has been moving for 30 s, its last progress 1 s ago: no
+	/// violation, however long the whole transfer has run.
+	#[test]
+	fn a_moving_resource_send_does_not_trip_the_assertion() {
+		let (router, photo) = in_flight("moving", 2000, 30.0);
+		assert!(photo.lock().unwrap().packed.as_ref().unwrap().len() > reticulum_rust::link::MDU);
+		photo.lock().unwrap().transfer_moved_at = Some(now() - 1.0);
+		pass(&router, &photo);
+		assert_eq!(photo.lock().unwrap().state, LXMessage::SENDING);
+	}
+
+	/// The photo's transfer has been silent for 6 s: a §1 violation.
+	#[test]
+	#[should_panic(expected = "Resource transfer silent for 6.")]
+	fn a_six_second_silence_trips_the_assertion() {
+		let (router, photo) = in_flight("silent", 2000, 30.0);
+		photo.lock().unwrap().transfer_moved_at = Some(now() - 6.0);
+		pass(&router, &photo);
+	}
+
+	/// The photo is queued behind another transfer on its link (or its link
+	/// is still being set up), not yet advertised, 30 s after the send: not
+	/// measured here (`LXMessage::measured_by_transfer_progress`).
+	#[test]
+	fn a_resource_send_not_yet_advertised_does_not_trip_the_assertion() {
+		let (router, photo) = in_flight("queued", 2000, 30.0);
+		pass(&router, &photo);
+		assert_eq!(photo.lock().unwrap().state, LXMessage::SENDING);
+	}
+
+	/// A text message that fits one packet keeps the assertion exactly as
+	/// it was: 6 s after the send it is stuck.
+	#[test]
+	#[should_panic(expected = "stuck for 6.")]
+	fn a_packet_send_keeps_the_total_time_assertion() {
+		let (router, text) = in_flight("packet", 10, 6.0);
+		assert!(text.lock().unwrap().packed.as_ref().unwrap().len() <= reticulum_rust::link::MDU);
+		pass(&router, &text);
+	}
+
+	/// …and inside 5 s it is not.
+	#[test]
+	fn a_packet_send_inside_five_seconds_does_not_trip_the_assertion() {
+		let (router, text) = in_flight("packet-ok", 10, 2.0);
+		pass(&router, &text);
+		assert_eq!(text.lock().unwrap().state, LXMessage::SENDING);
 	}
 }

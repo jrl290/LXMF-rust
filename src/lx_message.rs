@@ -85,6 +85,27 @@ pub struct LXMessage {
 	/// Cleared when the message transitions to a new send attempt.
 	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 	pub(crate) violation_reported: bool,
+	/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): when the
+	/// Resource carrying this send last showed progress: its advertisement
+	/// going out, each request of the receiver's it served (parts, a window,
+	/// a hashmap update), its proof. `None` until a Resource carrying the
+	/// current attempt has been advertised, and always for a send that fits
+	/// one packet. Once it is set the router's §1 assertion measures the
+	/// silence since it, never the transfer's total time
+	/// (`transfer_silence`). Until 2026-10-01 the assertion counted a
+	/// moving photo's whole transfer against 5 s: it fired on the Pixel for
+	/// a 14-part direct Resource whose part requests came every 0.5-1.3 s
+	/// (a release build logs it; a debug build panics).
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) transfer_moved_at: Option<f64>,
+	/// A silence over the §1 limit that ended (the transfer moved again, or
+	/// its proof came) before a router pass could assert it while it ran:
+	/// the router's next pass asserts it. The longest, if several did.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) transfer_silence_unasserted: Option<f64>,
+	/// The router has asserted the silence now running. The transfer's next
+	/// progress ends it, and a later silence is asserted in its turn.
+	pub(crate) transfer_silence_asserted: bool,
 	/// DISPLAY_NAMES.md §4.1: the router has decided whether this message
 	/// carries the name entry (key 0 of `FIELD_RETICHAT`) and written the decision into `fields`.
 	/// Set once, in `LXMRouter::handle_outbound`, before the first pack; a
@@ -267,6 +288,9 @@ impl LXMessage {
 			receipt_timed_out: false,
 			needs_prop_fallback: false,
 			violation_reported: false,
+			transfer_moved_at: None,
+			transfer_silence_unasserted: None,
+			transfer_silence_asserted: false,
 			display_name_decided: false,
 			transport_encrypted: false,
 			transport_encryption: None,
@@ -915,6 +939,7 @@ impl LXMessage {
 			}
 			Self::DIRECT => {
 				self.state = Self::SENDING;
+				self.begin_transfer_watch();
 				match self.representation {
 					Self::PACKET => {
 						if self.delivery_destination.is_none() {
@@ -971,6 +996,7 @@ impl LXMessage {
 		// See: LXMRouter::process_outbound — PROPAGATED ACTIVE branch.
 		Self::PROPAGATED => {
 				self.state = Self::SENDING;
+				self.begin_transfer_watch();
 				match self.representation {
 					Self::PACKET => {
 						let mut packet = self.as_packet()?;
@@ -1358,6 +1384,7 @@ impl LXMessage {
 				resource_concluded_shared(&handle, &resource);
 			}) as Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>
 		});
+		let advertised = handle.clone();
 		let progress_callback = handle.map(|handle| {
 			Arc::new(move |resource: Arc<Mutex<Resource>>| {
 				update_transfer_progress_shared(&handle, &resource);
@@ -1391,7 +1418,22 @@ impl LXMessage {
 			None,
 		)?;
 		let resource_arc = Arc::new(Mutex::new(resource));
-		Resource::advertise_shared(resource_arc.clone());
+		match advertised {
+			// DESIGN_PRINCIPLES §1, bulk transfers: the transfer is watched
+			// from its advertisement on. The hook runs on the advertise
+			// thread once the advertisement has gone out, and waits for the
+			// message lock this caller holds.
+			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+			Some(handle) => Resource::advertise_shared_then(
+				resource_arc.clone(),
+				Box::new(move || {
+					if let Ok(mut message) = handle.lock() {
+						message.note_transfer_progress(now_seconds());
+					}
+				}),
+			),
+			None => Resource::advertise_shared(resource_arc.clone()),
+		}
 		Ok(resource_arc)
 	}
 
@@ -1403,6 +1445,8 @@ impl LXMessage {
 			false,
 		);
 		let newly = self.state != Self::DELIVERED;
+		// The proof is the transfer's last progress (§1, bulk transfers).
+		self.note_transfer_proof(now_seconds());
 		self.state = Self::DELIVERED;
 		self.progress = 1.0;
 		if newly && self.released_state_callback.is_some() {
@@ -1437,6 +1481,8 @@ impl LXMessage {
 			false,
 			false,
 		);
+		// The proof is the transfer's last progress (§1, bulk transfers).
+		self.note_transfer_proof(now_seconds());
 		self.state = Self::SENT;
 		self.progress = 1.0;
 		if let Some(callback) = self.delivery_callback.as_ref() {
@@ -1533,6 +1579,8 @@ impl LXMessage {
 	fn update_transfer_progress(&mut self, resource: &mut Resource) {
 		let progress = resource.get_progress();
 		self.progress = Self::transfer_progress(progress);
+		// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1 (bulk transfers)
+		self.note_transfer_progress(now_seconds());
 	}
 
 	/// The message progress a Resource fraction stands for: 0.10 to hand
@@ -1558,6 +1606,112 @@ impl LXMessage {
 			self.progress = progress;
 		}
 	}
+
+	/// DESIGN_PRINCIPLES §1, bulk transfers: whether the router's §1
+	/// assertion measures this send by its transfer's progress instead of by
+	/// the time since it began. True for a DIRECT payload over the link MDU,
+	/// which goes as a Resource (`app_links::link_representation`, the
+	/// boundary AppLinks sends by), and for any send a Resource has carried
+	/// in this attempt. Until its Resource is advertised such a send is not
+	/// measured by the router: its path race and link have their own §1
+	/// bounds (app-links' 5 s race, Reticulum-rust's `link.establish`
+	/// assertion), and a Resource QUEUED behind another on its link is
+	/// waiting out that one's transfer, which is watched in its own right.
+	/// A send that fits one packet keeps the assertion from the send's
+	/// start, as before.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) fn measured_by_transfer_progress(&self) -> bool {
+		if self.transfer_moved_at.is_some() {
+			return true;
+		}
+		self.method == Self::DIRECT
+			&& self
+				.packed
+				.as_ref()
+				.map(|packed| app_links::link_representation(packed.len()) == app_links::LinkRepresentation::Resource)
+				.unwrap_or(false)
+	}
+
+	/// The Resource carrying this send showed progress at `at` (unix
+	/// seconds): its advertisement went out, it served a request of the
+	/// receiver's, or its proof came. Only while SENDING, as the progress
+	/// itself. A gap over the §1 limit since the last progress is a silence:
+	/// if no router pass asserted it while it ran, it is kept for the next
+	/// one (`transfer_silence`); if one did, it ends here, and says so.
+	/// Never changes the message's state: the Resource's own events decide
+	/// the send (DESIGN_PRINCIPLES §1, bulk transfers).
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) fn note_transfer_progress(&mut self, at: f64) {
+		if self.state != Self::SENDING {
+			return;
+		}
+		if let Some(previous) = self.transfer_moved_at {
+			let silent_for = at - previous;
+			if silent_for > reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
+				if self.transfer_silence_asserted {
+					log(
+						&format!(
+							"DESIGN_PRINCIPLES §1: {} transfer moving again after {:.2}s of silence",
+							self, silent_for,
+						),
+						LOG_NOTICE, false, false,
+					);
+				} else if self.transfer_silence_unasserted.map_or(true, |kept| silent_for > kept) {
+					self.transfer_silence_unasserted = Some(silent_for);
+				}
+			}
+		}
+		self.transfer_silence_asserted = false;
+		self.transfer_moved_at = Some(at);
+	}
+
+	/// The proof of the Resource carrying this send came at `at`: the last
+	/// progress its transfer shows. Nothing for a send no Resource carries.
+	fn note_transfer_proof(&mut self, at: f64) {
+		if self.transfer_moved_at.is_some() {
+			self.note_transfer_progress(at);
+		}
+	}
+
+	/// DESIGN_PRINCIPLES §1, bulk transfers: the silence the router's pass
+	/// at `now` must assert, each one once. First a silence that ended
+	/// before a pass saw it (in any state: it happened); otherwise, while
+	/// the send is SENDING, the one running since the transfer last moved,
+	/// once it is over the limit. Total time is never measured: a transfer
+	/// that keeps moving yields nothing however long it takes.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) fn transfer_silence(&mut self, now: f64) -> Option<TransferSilence> {
+		if let Some(seconds) = self.transfer_silence_unasserted.take() {
+			return Some(TransferSilence { seconds, ended: true });
+		}
+		let moved_at = self.transfer_moved_at?;
+		if self.state != Self::SENDING || self.transfer_silence_asserted {
+			return None;
+		}
+		let seconds = now - moved_at;
+		if seconds > reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
+			self.transfer_silence_asserted = true;
+			return Some(TransferSilence { seconds, ended: false });
+		}
+		None
+	}
+
+	/// A new send attempt: its transfer is watched afresh, from its own
+	/// Resource's advertisement.
+	pub(crate) fn begin_transfer_watch(&mut self) {
+		self.transfer_moved_at = None;
+		self.transfer_silence_unasserted = None;
+		self.transfer_silence_asserted = false;
+	}
+}
+
+/// A §1 silence of the transfer carrying a send (DESIGN_PRINCIPLES §1, bulk
+/// transfers): `seconds` without progress, still running or `ended` before
+/// a router pass saw it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TransferSilence {
+	pub(crate) seconds: f64,
+	pub(crate) ended: bool,
 }
 
 impl std::fmt::Display for LXMessage {
@@ -1753,6 +1907,12 @@ pub(crate) fn transfer_progress_reporter(handle: &Arc<Mutex<LXMessage>>) -> Arc<
 	Arc::new(move |fraction: f64| {
 		if let Ok(mut message) = handle.lock() {
 			message.apply_transfer_fraction(fraction);
+			// Each report is an event of the transfer: its advertisement
+			// (0.0, app-links `TransferWatch::advertised`) or a request
+			// served. DESIGN_PRINCIPLES §1, bulk transfers, measures the
+			// silence between them.
+			// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+			message.note_transfer_progress(now_seconds());
 		}
 	})
 }
@@ -2036,6 +2196,187 @@ mod tests {
 			assert_eq!(message.progress, progress, "state {:#04x} must not move", state);
 			assert_eq!(message.state, state);
 		}
+	}
+
+	// ── DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30) ──────────
+	//
+	// A Resource's total time is not measured against 5 s. From its
+	// advertisement on it must show progress at least every 5 s; a longer
+	// silence is asserted (the router's pass, `transfer_silence`) and never
+	// fails the send. Times are injected: `t0` is the send's start.
+
+	/// A DIRECT message whose packed payload is over the link MDU, so it
+	/// goes as a Resource (a photo), in `state`, sent at `t0`.
+	fn photo_message(state: u8, t0: f64) -> LXMessage {
+		let mut photo = make_propagated_message();
+		photo.content = vec![0x42; 2000];
+		photo.desired_method = Some(LXMessage::DIRECT);
+		photo.pack(false).expect("pack");
+		assert!(photo.packed.as_ref().unwrap().len() > reticulum_rust::link::MDU, "the payload goes as a Resource");
+		photo.state = state;
+		photo.timestamp = Some(t0);
+		photo
+	}
+
+	/// The silences a router pass every `pass` seconds from `from` to `to`
+	/// would assert.
+	fn passes(message: &mut LXMessage, from: f64, to: f64, pass: f64) -> Vec<TransferSilence> {
+		let mut seen = Vec::new();
+		let mut now = from;
+		while now <= to {
+			seen.extend(message.transfer_silence(now));
+			now += pass;
+		}
+		seen
+	}
+
+	/// The Pixel's photo of 2026-10-01 at any length: a transfer that keeps
+	/// moving is never a §1 violation, here 30 s of it with progress every
+	/// 4.5 s. Until 2026-10-01 the router counted the whole transfer from the
+	/// send and panicked a debug build 5 s in.
+	#[test]
+	fn a_moving_thirty_second_transfer_does_not_trip_section_1() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		assert!(photo.measured_by_transfer_progress(), "a Resource send is measured by its progress");
+
+		photo.note_transfer_progress(t0 + 2.0); // the advertisement went out
+		let mut at = t0 + 2.0;
+		let mut seen = Vec::new();
+		while at < t0 + 32.0 {
+			seen.extend(passes(&mut photo, at, at + 4.5, 0.25));
+			at += 4.5;
+			photo.note_transfer_progress(at); // a request served
+		}
+		assert!(at - t0 >= 30.0, "the transfer ran {} s", at - t0);
+		assert!(seen.is_empty(), "a moving transfer is never silent: {:?}", seen);
+		assert_eq!(photo.transfer_silence_unasserted, None);
+	}
+
+	/// Six seconds without progress is a §1 silence: the pass that sees it
+	/// over the limit asserts it, once. The transfer moving again ends it,
+	/// and a later silence is asserted in its turn. Nothing changes state.
+	#[test]
+	fn a_six_second_silence_trips_section_1_once() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_transfer_progress(t0 + 1.0); // advertised
+		photo.note_transfer_progress(t0 + 2.0); // a request served
+
+		assert_eq!(photo.transfer_silence(t0 + 6.9), None, "4.9 s of silence is inside the limit");
+		assert_eq!(photo.transfer_silence(t0 + 8.0), Some(TransferSilence { seconds: 6.0, ended: false }));
+		assert_eq!(photo.transfer_silence(t0 + 9.0), None, "asserted once");
+		assert_eq!(photo.state, LXMessage::SENDING, "a silence never fails the send");
+
+		photo.note_transfer_progress(t0 + 9.0); // moving again
+		assert_eq!(photo.transfer_silence(t0 + 10.0), None, "the silence was asserted while it ran: nothing more");
+		assert_eq!(passes(&mut photo, t0 + 9.0, t0 + 14.0, 0.5), vec![]);
+		assert_eq!(photo.transfer_silence(t0 + 15.0), Some(TransferSilence { seconds: 6.0, ended: false }), "the next silence");
+	}
+
+	/// A silence that ends between two router passes is still asserted, by
+	/// the next pass: as it ended in a request served, and as it ended in
+	/// the proof (the real `mark_delivered_shared`).
+	#[test]
+	fn a_silence_that_ends_between_passes_is_still_asserted() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_transfer_progress(t0 + 1.0);
+		photo.note_transfer_progress(t0 + 7.0); // 6 s later, no pass in between
+		assert_eq!(photo.transfer_silence(t0 + 7.5), Some(TransferSilence { seconds: 6.0, ended: true }));
+		assert_eq!(photo.transfer_silence(t0 + 8.0), None, "asserted once");
+
+		let photo = Arc::new(Mutex::new(photo_message(LXMessage::SENDING, t0)));
+		photo.lock().unwrap().transfer_moved_at = Some(now_seconds() - 6.0);
+		mark_delivered_shared(&photo);
+		let mut photo = photo.lock().unwrap();
+		assert_eq!(photo.state, LXMessage::DELIVERED);
+		let silence = photo.transfer_silence(now_seconds()).expect("the silence the proof ended");
+		assert!(silence.ended && silence.seconds >= 6.0 && silence.seconds < 7.0, "{:?}", silence);
+		assert_eq!(photo.transfer_silence(now_seconds() + 60.0), None, "and nothing once delivered");
+	}
+
+	/// Before its Resource is advertised a Resource send is not measured by
+	/// the transfer watch (its path and link have their own §1 bounds, and
+	/// a Resource QUEUED behind another on its link waits out that one's
+	/// transfer), nor by the router's total-time assertion
+	/// (`measured_by_transfer_progress`). A send that fits one packet stays
+	/// with the total-time assertion.
+	#[test]
+	fn before_its_advertisement_a_resource_send_is_not_measured() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		assert!(photo.measured_by_transfer_progress());
+		assert_eq!(passes(&mut photo, t0, t0 + 60.0, 0.5), vec![], "queued for a minute: not silent");
+
+		let (text, _) = packed_direct_message(LXMessage::SENDING);
+		let mut text = Arc::try_unwrap(text).ok().unwrap().into_inner().unwrap();
+		assert!(text.packed.as_ref().unwrap().len() <= reticulum_rust::link::MDU, "one packet");
+		assert!(!text.measured_by_transfer_progress(), "a packet send keeps the assertion from its start");
+		assert_eq!(passes(&mut text, t0, t0 + 60.0, 0.5), vec![], "nothing for this watch to say about it");
+	}
+
+	/// Each send attempt is watched from its own advertisement: what an
+	/// earlier attempt's transfer left behind is gone.
+	#[test]
+	fn a_new_attempt_is_watched_afresh() {
+		let t0 = 1_000.0;
+		let mut photo = photo_message(LXMessage::SENDING, t0);
+		photo.note_transfer_progress(t0 + 1.0);
+		photo.note_transfer_progress(t0 + 8.0);
+		assert!(photo.transfer_silence_unasserted.is_some());
+
+		photo.begin_transfer_watch();
+		assert_eq!(photo.transfer_moved_at, None);
+		assert_eq!(photo.transfer_silence(t0 + 100.0), None);
+	}
+
+	/// The transfer's events are noted only while the message is SENDING,
+	/// like its progress: a report after the attempt ended says nothing.
+	#[test]
+	fn transfer_events_count_only_while_sending() {
+		let t0 = 1_000.0;
+		for state in [LXMessage::OUTBOUND, LXMessage::FAILED, LXMessage::CANCELLED, LXMessage::DELIVERED, LXMessage::SENT] {
+			let mut photo = photo_message(state, t0);
+			photo.note_transfer_progress(t0 + 1.0);
+			assert_eq!(photo.transfer_moved_at, None, "state {:#04x}", state);
+		}
+	}
+
+	/// The message's own Resource (a DIRECT send on a link the router holds
+	/// without AppLinks) reports its advertisement and its progress to the
+	/// transfer watch too.
+	#[test]
+	fn the_messages_own_resource_reports_to_the_transfer_watch() {
+		let src = include_str!("lx_message.rs");
+		let production = src.split("#[cfg(test)]").next().expect("production source");
+		let as_resource = &production[production.find("fn as_resource(").expect("as_resource")..];
+		let as_resource = &as_resource[..as_resource.find("\n\t}\n").expect("its end")];
+		assert!(
+			as_resource.contains("Some(handle) => Resource::advertise_shared_then(")
+				&& as_resource.contains("message.note_transfer_progress(now_seconds());"),
+			"the advertisement starts the watch"
+		);
+		let update = &production[production.find("fn update_transfer_progress(").expect("update_transfer_progress")..];
+		let update = &update[..update.find("\n\t}\n").expect("its end")];
+		assert!(update.contains("self.note_transfer_progress(now_seconds());"), "each request served is an event");
+	}
+
+	/// The reporter the router hands AppLinks notes each report (the
+	/// advertisement as 0.0, then each request served) as an event of the
+	/// transfer, at the time it lands.
+	#[test]
+	fn the_progress_reporter_notes_each_transfer_event() {
+		let photo = Arc::new(Mutex::new(photo_message(LXMessage::SENDING, now_seconds())));
+		let report = transfer_progress_reporter(&photo);
+		let before = now_seconds();
+		report(0.0);
+		let advertised = photo.lock().unwrap().transfer_moved_at.expect("the advertisement is noted");
+		assert!(advertised >= before && advertised <= now_seconds());
+		assert!((photo.lock().unwrap().progress - 0.10).abs() < 1e-9, "the advertisement is 0.10, as LXMessage.py");
+		std::thread::sleep(std::time::Duration::from_millis(5));
+		report(0.0);
+		assert!(photo.lock().unwrap().transfer_moved_at.unwrap() > advertised, "a resend-only request is an event too");
 	}
 
 	#[test]
