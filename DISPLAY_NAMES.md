@@ -414,9 +414,11 @@ Changes take effect at once through the router setters, with no stack restart.
   arrives (the accept needs every one), and its inviter and the members it
   lists are allowed only when the user accepts it, which allowlists every
   member, creating a row where there is none (creating a group does the
-  same). A declined or unanswered invite leaves them as they were. A source
-  is *allowed* for a group held here when it passes the filter or is a
-  current member (invited or accepted, not left) of a group the user has
+  same). A declined or unanswered invite leaves them as they were, and lets
+  them through nowhere else either: a DM or a distro identity transfer from
+  a member listed only in a pending group is dropped like a stranger's. A
+  source is *allowed* for a group held here when it passes the filter or is
+  a current member (invited or accepted, not left) of a group the user has
   accepted; a member listed in a group still pending is not. Any other
   group action (accept, leave, relay_req, relay_done, an unknown one) for a
   group held here is processed only when the packet's own LXMF source is
@@ -440,8 +442,9 @@ Changes take effect at once through the router setters, with no stack restart.
   `GROUP_ACTIONS_THAT_RELAY`, `PrivacyFilter.groupAccepts` and
   `PrivacyFilter.groupMember` (`33bc41d`, `793a959`, `47bc47d`, `33a299a`);
   `_handleGroupMessage`'s invite branch keeps keys and allows nobody
-  (`07b89e2`), and `_performGroupRelay` refuses a group that is not active
-  (`33a299a`); the held groups' members are allowlisted once by
+  (`07b89e2`), `PrivacyFilter.knows` counts the member lists of joined
+  groups only (`d13509f`), and `_performGroupRelay` refuses a group that is
+  not active (`33a299a`); the held groups' members are allowlisted once by
   `allowHeldGroupMembers` (`23b2346`; a pending group's are not). iOS and
   Android still allowlist the inviter and every listed co-member whose key
   checks out as the invite arrives (`handleGroupInvite`; the `INVITE` branch
