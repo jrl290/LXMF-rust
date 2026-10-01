@@ -260,6 +260,23 @@ messages keep the hash and resolve it when shown.
 
 Never lose a name the user typed.
 
+White space in this section is §3's: the Unicode `White_Space` characters,
+U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000–U+200A, U+2028,
+U+2029, U+202F, U+205F and U+3000, and no others (added 2026-09-30). Where a
+rule below trims it, it is these characters that go, from both ends, so that
+every client reads a stored name the same way. No platform trim is that set,
+so none is used as it stands: JavaScript's `String.prototype.trim` also
+removes U+FEFF and keeps U+0085, Swift's `.whitespacesAndNewlines` also
+removes U+200B, Kotlin's `trim()` also removes U+001C–U+001F and keeps
+U+0085, and SQLite's `trim(x)` removes U+0020 alone. In SQLite it is
+`trim(x, WS)`, with `WS` = `char(9, 10, 11, 12, 13, 32, 133, 160, 5760,
+8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232,
+8233, 8239, 8287, 12288)`; in Kotlin, `trim { it in WS }` over those
+characters (or `\p{IsWhite_Space}`); in Swift, a `CharacterSet` of them,
+trimmed over unicode scalars. A name cleaned under §3 holds none of them at
+either end, but a name stored before the update may. Shared vectors: the
+"white space" entries of sections `placeholder` and `own_hash_suffix`.
+
 Placeholders, dropped wherever the name was not typed by the user:
 "Retichat", "Retichat Web", "Anonymous Peer" (case-insensitive), hash
 forms (8 to 32 hex, with or without `?` or `…`), and the old web node
@@ -281,7 +298,7 @@ space before the parenthesis), ends with `)`, and has at least one character
 between them. Nothing about those characters is checked, so the forms with a
 hex suffix are instances of the same rule. As a regular expression,
 `^retichat web \(.+\)$` with ASCII-only case folding; in SQLite,
-`lower(trim(name)) GLOB 'retichat web (?*)'`. An old web node default is a
+`lower(trim(name, WS)) GLOB 'retichat web (?*)'`. An old web node default is a
 placeholder even where a name may have been typed (every iOS name, Android
 `isNameManual` names and DM chat names, web customized names): no user types
 one, and the old web rename field was pre-filled with the contact's current
@@ -305,9 +322,9 @@ their own hash's prefix, so "Bob (work)" and "Alice (fedcba987654)" stay as
 they are. One suffix, the last. As a regular expression on the trimmed
 name, `^(.+) \(([0-9a-f]{12})\)$` (ASCII case folding, `.` matching any
 character), keeping group 1 when group 2 equals the hash's first 12 hex;
-in SQLite, `length(trim(n)) > 15 AND lower(substr(trim(n), -15)) = ' (' ||
-lower(substr(hash, 1, 12)) || ')'`, keeping `trim(substr(trim(n), 1,
-length(trim(n)) - 15))`. A stored name that lost the suffix came from an
+in SQLite, `length(trim(n, WS)) > 15 AND lower(substr(trim(n, WS), -15)) =
+' (' || lower(substr(hash, 1, 12)) || ')'`, keeping `trim(substr(trim(n,
+WS), 1, length(trim(n, WS)) - 15), WS)`. A stored name that lost the suffix came from an
 announce, whatever slot holds it: what is left is then judged by the
 placeholder list above as a name that was not typed, even in a slot where
 names may have been ("Retichat (0123456789ab)" is dropped, not kept as
@@ -331,6 +348,9 @@ the name after the rule, the input itself when it does not apply).
   already migrated before the old web node defaults were added need a pass
   that clears a `localName` or `legacyName` holding one, and strips the old
   web announce suffix from a `localName`, `legacyName` or `announceName`.
+  The 10 → 11 migration's `placeholderSql` trims with SQLite's `trim(x)`
+  (U+0020 alone); the pass, and `placeholderSql` from then on, use
+  `trim(x, WS)`.
 - Web: `nameCustomized` → `localName`, unless it is this contact's own hash
   form (what the old rename field was pre-filled with when the contact had no
   name) or an old web node default. Otherwise `legacyName`, unless a
@@ -484,7 +504,9 @@ web announce suffix: web `stripOwnHashSuffix` (used by `migrateContact`, its
 one-off `ownHashSuffixPass` run once by `ContactStore.init`, and
 `LXMF.displayNameFromAppData` for announces), run against the shared
 `own_hash_suffix` vectors by `display_names.test.mjs`; iOS and Android not
-yet (open follow-ups).
+yet (open follow-ups). §5.4's white space: web `trimWhiteSpace`
+(`lib/display_name.js`, over §3's `isWhiteSpace`), used by every §5.4 rule
+there; iOS and Android not yet (open follow-ups).
 NSE: `chat_names.json` entries carry the slot and `messageNameAt`
 (`DisplayNames.SharedName`), channel names their post time
 (`SharedChannelName`). Web names for non-contacts: hidden

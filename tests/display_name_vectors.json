@@ -9,7 +9,8 @@
     "Interpretation of rule 5: after truncation, trailing U+0020 and U+200D are stripped repeatedly (see the 'trailing' vectors).",
     "Order of rules 2 and 3: U+0085 is White_Space, so rule 2 turns it into a space before rule 3 could remove it as C1.",
     "placeholder (DISPLAY_NAMES.md 5.4): input is a stored name, own_hash the contact's hash. placeholder is the test where the name was not typed: 'Retichat', 'Retichat Web', 'Anonymous Peer' (case-insensitive), hash forms (8 to 32 hex, with or without '?' before or U+2026 after) and the old web node defaults. web_node_default is the old web node default alone ('Retichat Web (' + one or more characters + ')', ASCII case-insensitive, surrounding white space trimmed), which is dropped even where a name may have been typed. Where a name may have been typed, a hash form counts only when it prefixes own_hash (5.4).",
-    "own_hash_suffix (DISPLAY_NAMES.md 5.4): until 2026-09-23 the web announced '<name> (' + the first 12 hex of its lxmf.delivery hash + ')'. input is a stored or announced name, own_hash the contact's hash. A trailing ' (' + exactly 12 hex + ')' is stripped only when those 12 hex are the first 12 of own_hash (ASCII case-insensitive), after surrounding white space is trimmed and with at least one character before ' ('; expected is what is left, trimmed. Anything else is returned unchanged (expected equals input). One suffix only. What is left then meets the placeholder rules like any name."
+    "own_hash_suffix (DISPLAY_NAMES.md 5.4): until 2026-09-23 the web announced '<name> (' + the first 12 hex of its lxmf.delivery hash + ')'. input is a stored or announced name, own_hash the contact's hash. A trailing ' (' + exactly 12 hex + ')' is stripped only when those 12 hex are the first 12 of own_hash (ASCII case-insensitive), after surrounding white space is trimmed and with at least one character before ' ('; expected is what is left, trimmed. Anything else is returned unchanged (expected equals input). One suffix only. What is left then meets the placeholder rules like any name.",
+    "White space in section 5.4 (placeholder, own_hash_suffix) is section 3's, Unicode White_Space and nothing else: U+0009-U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000. Platform trims differ (JavaScript's String.prototype.trim also removes U+FEFF and keeps U+0085; Swift's .whitespacesAndNewlines also removes U+200B; Kotlin's trim() also removes U+001C-U+001F and keeps U+0085; SQLite's trim(x) removes U+0020 only), and the 'white space' vectors tell them apart."
   ],
   "clean": [
     {
@@ -836,6 +837,27 @@
       "own_hash": "0123456789abcdef0123456789abcdef",
       "placeholder": false,
       "web_node_default": false
+    },
+    {
+      "name": "white space is Unicode White_Space: a line feed after it",
+      "input": "Retichat\n",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "white space is Unicode White_Space: a tab, a no-break space and U+3000 around it",
+      "input": "\t\u00a0Retichat Web\u3000",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": false
+    },
+    {
+      "name": "web node default, white space: U+0085 before it and a tab after it",
+      "input": "\u0085Retichat Web (selectiv)\t",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "placeholder": true,
+      "web_node_default": true
     }
   ],
   "own_hash_suffix": [
@@ -958,6 +980,66 @@
       "input": "Alice",
       "own_hash": "0123456789abcdef0123456789abcdef",
       "expected": "Alice"
+    },
+    {
+      "name": "white space: a line feed after it",
+      "input": "Alice (0123456789ab)\n",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "white space: a tab before it",
+      "input": "\tAlice (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "white space: U+0085 after it",
+      "input": "Alice (0123456789ab)\u0085",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "white space: U+2003 left before the suffix is trimmed",
+      "input": "Alice\u2003 (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "white space: U+2028 and U+3000 after it",
+      "input": "Alice (0123456789ab)\u2028\u3000",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice"
+    },
+    {
+      "name": "not stripped: only a no-break space before it",
+      "input": "\u00a0 (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "\u00a0 (0123456789ab)"
+    },
+    {
+      "name": "not stripped: U+3000 instead of the space",
+      "input": "Alice\u3000(0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice\u3000(0123456789ab)"
+    },
+    {
+      "name": "not white space: U+200B after it, so it does not end the name",
+      "input": "Alice (0123456789ab)\u200b",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "Alice (0123456789ab)\u200b"
+    },
+    {
+      "name": "not white space: U+FEFF before it stays",
+      "input": "\ufeffAlice (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "\ufeffAlice"
+    },
+    {
+      "name": "not white space: U+001F before it stays",
+      "input": "\u001fAlice (0123456789ab)",
+      "own_hash": "0123456789abcdef0123456789abcdef",
+      "expected": "\u001fAlice"
     }
   ]
 }
