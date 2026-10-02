@@ -466,16 +466,40 @@ Changes take effect at once through the router setters, with no stack restart.
     stranger's, a pending group's member's, and an allowlisted contact's
     that is no member, filter on or off (a departure from iOS, which shows
     it as the member it names).
+  - *A member's own means signed by it.* The LXMF source field is not
+    authenticated by itself, and a message whose signature fails is kept
+    (the reference keeps it; so do the phones), so every rule above that
+    turns on who the source is also asks the signature (§5.2's three
+    outcomes). Invalid (the source's key is held and did not sign it): no
+    group action is taken, an invite included; a plain post is kept, as a
+    DM is, and speaks only for its source. A `relay_req` or any other
+    action needs a validated signature (it comes only from a member of a
+    joined group, whose key the user's accept or the creation already
+    required). An accept or a leave from a source whose key is not held
+    yet is held, with the bytes its signature covers, until the key
+    arrives (an invite message brings it, the user accepts the group,
+    the member announces, or a validated message of the member's
+    arrives), then counted if the signature verifies and dropped if not,
+    in the order they came: a pending group's keys come one per invite
+    message, so a member's accept arriving before its key is normal. Held
+    ones are persisted and bounded (web: a signed payload of at most 2048
+    bytes, 4 per member, 128 in all; a new one is refused when full).
+    `GROUP_SENDER` is believed only with a validated signature. Until
+    the review of `1fdfca8` a forged source could mark a member left for
+    good, accept in its name, or have a client relay words as its post.
   Anything dropped is dropped like any filtered message, unproved, with no
   membership change, no allowlisting and no relay. Web: Retichat-js
   `shouldProcessGroupMessage(action, sourceAllowed, groupStatus,
-  sourceStatus, namesOther, groupClosed)`, `groupTrustsSource`,
+  sourceStatus, namesOther, groupClosed, signature)`, `groupTrustsSource`,
   `GROUP_ACTIONS_THAT_RELAY`, `PrivacyFilter.groupAccepts` and
   `PrivacyFilter.groupMember`; `GroupStore.addPending` (a held group
   unchanged), `updateMember` (listed members only, never back from left),
   `close` / `isClosed` (`groups_closed_v1`), `_declineGroupInvite` and
-  `_leaveGroup` (`1fdfca8`); before that the trust rule's `33bc41d`,
-  `793a959`, `47bc47d`, `33a299a`, `07b89e2`, `d13509f`, `e6d5862`; the
+  `_leaveGroup` (`1fdfca8`); `_holdGroupStatusChange`, `GroupStore.hold`
+  (`groups_held_v1`), `_decideHeldGroupChanges` and
+  `_applyGroupStatusChange` (`91cd48a`); before that the trust rule's
+  `33bc41d`, `793a959`, `47bc47d`, `33a299a`, `07b89e2`, `d13509f`,
+  `e6d5862`; the
   held groups' members are allowlisted once by `allowHeldGroupMembers`
   (`23b2346`; a pending group's are not). iOS and Android, open
   follow-ups: they still allowlist the inviter and every listed co-member
@@ -490,9 +514,14 @@ Changes take effect at once through the router setters, with no stack restart.
   and for a pending group (`handleGroupRelayRequest`; `RELAY_REQUEST`),
   keep no record of a declined or left group (`declineGroupInvite` /
   `leaveGroup`; `declineGroupInvite` / `leaveGroupChat`), and take any
-  `GROUP_SENDER` as the author. Android's leave is a plain post "left the
-  group" with no action (`leaveGroupChat`; audit L5), so no other client
-  records it as a leave.
+  `GROUP_SENDER` as the author. Nor do they ask the signature of a group
+  message: iOS `handleIncomingMessage` has `unverifiedReason` but
+  `shouldProcessGroupMessage(groupId:sourceHash:action:)` and
+  `handleGroupMessage` never see it; Android `onMessageReceived` the same
+  with `DeliveryPolicy.groupMessage`; both keep a message whose signature
+  fails, so a forged source is believed there. Android's leave is a plain
+  post "left the group" with no action (`leaveGroupChat`; audit L5), so no
+  other client records it as a leave.
 - **Web privacy filter default** (James, 2026-10-01: "on retichat.com I
   don't want the Privacy Filter on by default"): on the web the filter is
   off unless the user turns it on (Retichat-js `PrivacyFilter.init`,
@@ -509,7 +538,8 @@ Changes take effect at once through the router setters, with no stack restart.
 - Group membership of distro holders (audit H8), GROUP_SENDER trust (M13:
   on the web, since `1fdfca8`, a `GROUP_SENDER` is believed only from a
   current member of a joined group and only when it names a listed member,
-  §7; such a member can still name any listed author),
+  and since `91cd48a` only when the message's signature verifies, §7; such
+  a member can still name any listed author),
   link-proven identities (M15), Android's leave message (L5).
 
 ## 9. Implementation
@@ -725,7 +755,9 @@ channel send rule (it never posts).
   - Tests: `retichat_field.test.mjs`.
 - §7 signatures: `LXMessage.verify` / `signedPayload`
   (`lib/rns/lxmf/lxmf_message.js`), giving `signatureState` validated /
-  unknown / invalid.
+  unknown / invalid; `fromBytes` keeps `signature` and `packedPayload`, so
+  a group accept or leave held for its source's key can be checked once
+  the key is here (§7's group model, `_decideHeldGroupChanges`).
 - Resolver: `contactName` / `channelPosterName` / `shortHash`, through
   `ContactStore.name` and `channelSenderLabel` in `app.js`.
 - Accept (§5.2): `acceptMessageName` via `ContactStore.acceptMessageName` in
@@ -744,7 +776,8 @@ channel send rule (it never posts).
   accept or leave: §7's group trust rule and group model; with the filter
   off every source passes this step and `acceptsMessage` holds the group
   model) and
-  `acceptsMessage` (after the parse, before the proof) in
+  `acceptsMessage` (after the parse, before the proof, with the message's
+  `signatureState`: a group action whose signature fails is dropped) in
   `lib/rns/lxmf/lxmf_router.js`; a dropped message records no name and is
   not proved by the router (a link Resource is proved by the Resource
   protocol on assembly, before its source can be read). Allowlist:
