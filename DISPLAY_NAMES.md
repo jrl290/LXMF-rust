@@ -445,8 +445,31 @@ Changes take effect at once through the router setters, with no stack restart.
     member of a pending group may accept or leave for itself (recorded,
     since a group fans out to accepted members only) and is allowed
     nothing by it; in a joined group its accept also allowlists it, as the
-    user's accept already did. A reject is local: the user's decline sends
-    nothing (no client has a reject message).
+    user's accept already did.
+  - *A reject is the member's leave* (James, 2026-10-02: "Make the decline
+    message the same as the leave message"; until then a decline sent
+    nothing, so only the decliner's device knew). Declining an invite
+    sends the very message leaving a group sends: `GROUP_ID`,
+    `GROUP_ACTION` `leave` and `GROUP_SENDER` the member itself, no
+    content, signed, with the Message Display Name under the ledger
+    (section 4.1), each copy delivered directly or through the propagation
+    node like any group message. No client has a separate reject message.
+    A leave, the decline's included, goes to every member on the group's
+    list but the sender and the members that left, the ones still
+    "invited" included: in a pending group only the inviter starts
+    accepted, and in a joined one an invited member may have accepted
+    already or accept later, and must not go on counting the sender as a
+    member. A member whose key has not arrived yet (a pending group's keys
+    come one per invite message) is asked for and sent it once its
+    announce brings the key. The decliner's device closes the group at
+    once (below), and the send neither undoes nor waits for that. Sending
+    to a pending group's members is the user's explicit act; opening that
+    group's chat still asks nothing of them. A receiver counts a leave
+    from a member still "invited" (never accepted) exactly as one from a
+    member that accepted, in a pending or a joined group, under the same
+    signature rule (held until the member's key is here): the member is
+    left for good, the timeline says it "left the group", and the member
+    list shows it as a member that left.
   - *Reject and leave are final.* A member that left stays left: its
     later accept is dropped, and no message, and no second invite, moves it
     back. The user's own decline or leave is recorded (bounded: the web
@@ -497,7 +520,11 @@ Changes take effect at once through the router setters, with no stack restart.
   `close` / `isClosed` (`groups_closed_v1`), `_declineGroupInvite` and
   `_leaveGroup` (`1fdfca8`); `_holdGroupStatusChange`, `GroupStore.hold`
   (`groups_held_v1`), `_decideHeldGroupChanges` and
-  `_applyGroupStatusChange` (`91cd48a`); before that the trust rule's
+  `_applyGroupStatusChange` (`91cd48a`); the decline as the user's leave,
+  one path for both (`_quitGroup` calling `sendGroupLeave`, which sends
+  to every listed member that has not left) (`451f14d`; on the web a
+  leave or decline made offline or before initialization is not queued,
+  and the group is closed regardless); before that the trust rule's
   `33bc41d`, `793a959`, `47bc47d`, `33a299a`, `07b89e2`, `d13509f`,
   `e6d5862`; the
   held groups' members are allowlisted once by `allowHeldGroupMembers`
@@ -521,7 +548,22 @@ Changes take effect at once through the router setters, with no stack restart.
   with `DeliveryPolicy.groupMessage`; both keep a message whose signature
   fails, so a forged source is believed there. Android's leave is a plain
   post "left the group" with no action (`leaveGroupChat`; audit L5), so no
-  other client records it as a leave.
+  other client records it as a leave. Neither phone sends anything on a
+  decline (iOS `ChatRepository.declineGroupInvite(groupId:)`, Android
+  `ChatRepository.declineGroupInvite(chatId)`, both only deleting the
+  chat): each must send the user's leave through the same function
+  leaving uses, before the chat is deleted; and each sends its leave to
+  the accepted members only (iOS `leaveGroup(chatId:)` into
+  `GroupChatManager.sendLeave`, Android `leaveGroupChat` through
+  `GroupMemberStatuses.acceptedMemberHexes`), which must become every
+  listed member that has not left, the decline's targets too. On Android
+  that leave is the L5 plain post: the decline must send the proper leave
+  (`GROUP_ACTION` `leave`, as `GroupChatManager.sendLeave` builds it and
+  nothing calls), so L5 is fixed first or with it. As receivers both
+  already mark a leaving member left whatever its status, an invited
+  one's included (iOS `handleGroupLeave`; Android's `LEAVE` branch of
+  `handleGroupMessage`), but a later accept brings it back (above:
+  `handleGroupAccept` / `ACCEPT` must ignore a member that left).
 - **Web privacy filter default** (James, 2026-10-01: "on retichat.com I
   don't want the Privacy Filter on by default"): on the web the filter is
   off unless the user turns it on (Retichat-js `PrivacyFilter.init`,
@@ -540,7 +582,8 @@ Changes take effect at once through the router setters, with no stack restart.
   current member of a joined group and only when it names a listed member,
   and since `91cd48a` only when the message's signature verifies, §7; such
   a member can still name any listed author),
-  link-proven identities (M15), Android's leave message (L5).
+  link-proven identities (M15), Android's leave message (L5; a decline
+  sends the leave too since 2026-10-02, §7).
 
 ## 9. Implementation
 
