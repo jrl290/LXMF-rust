@@ -421,7 +421,9 @@ Changes take effect at once through the router setters, with no stack restart.
   stranger's. Nor does a client ask anything of the members a pending
   group lists before the user accepts: opening that group's chat requests
   no path and opens no link to them (the accept itself asks for every
-  member's path and sends the accept to each).
+  member's path and sends the accept to each, and a decline, which is the
+  user's leave, asks for every listed member's path and sends the leave to
+  each).
 - **Group model** (James, 2026-10-01, later the same day): "There are no
   membership changes for a group. One person starts the group with the
   membership list. Each person can accept or reject. And each person can
@@ -558,8 +560,9 @@ Changes take effect at once through the router setters, with no stack restart.
   `GroupMemberStatuses.acceptedMemberHexes`), which must become every
   listed member that has not left, the decline's targets too. On Android
   that leave is the L5 plain post: the decline must send the proper leave
-  (`GROUP_ACTION` `leave`, as `GroupChatManager.sendLeave` builds it and
-  nothing calls), so L5 is fixed first or with it. As receivers both
+  (`GROUP_ACTION` `leave` with empty content, as the web and iOS send it;
+  `GroupChatManager.sendLeave`, which nothing calls, sets the content "left
+  the group" and must send "" instead), so L5 is fixed first or with it. As receivers both
   already mark a leaving member left whatever its status, an invited
   one's included (iOS `handleGroupLeave`; Android's `LEAVE` branch of
   `handleGroupMessage`), but a later accept brings it back (above:
