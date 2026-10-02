@@ -409,56 +409,96 @@ Changes take effect at once through the router setters, with no stack restart.
 - **Group trust rule** (James, 2026-10-01): "Groups start by invite. If the
   invite doesn't come from someone on the allowlist, it is ignored. If the
   invite is accepted, the other group members are considered allowed." So:
-  an invite is processed only from a source the privacy filter allows. The
-  invite itself allows nobody: the member keys it carries are kept as it
-  arrives (the accept needs every one), and its inviter and the members it
-  lists are allowed only when the user accepts it, which allowlists every
-  member, creating a row where there is none (creating a group does the
-  same). A declined or unanswered invite leaves them as they were, and lets
-  them through nowhere else either: a DM or a distro identity transfer from
-  a member listed only in a pending group is dropped like a stranger's. A
-  source is *allowed* for a group held here when it passes the filter or is
-  a current member (invited or accepted, not left) of a group the user has
-  accepted; a member listed in a group still pending is not. Any other
-  group action (accept, leave, relay_req, relay_done, an unknown one) for a
-  group held here is processed only when the packet's own LXMF source is
-  allowed, with one exception: a member listed in a pending group may
-  accept or leave for itself (no `GROUP_SENDER`, or its own), which records
-  its status and allows nobody. A client never transmits on someone's
-  behalf for a group the user has not joined: a `relay_req` (the one action
-  that makes it send for someone, the relay and its `relay_done`) for a
-  pending group is dropped from any source, the allowlisted inviter's
-  included and with the filter off; once the user accepts, the rule above
-  applies. Nor does it ask anything of the members a pending group lists
-  before the user accepts: opening that group's chat requests no path and
-  opens no link to them (the accept itself asks for every member's path
-  and sends the accept to each). Anything dropped is dropped like any
-  filtered message, with no membership change, no allowlisting and no
-  relay. An accept from an allowed source makes the member it names
-  (`GROUP_SENDER`) a member, allowlisted in a group the user has
-  accepted; in a pending one the
-  user's accept allows it with every other member, and a decline leaves
-  nobody allowed. A plain group message (no action) for a group held here
-  is kept whoever sent it, and `GROUP_SENDER` names its author only when
-  its source is allowed: anyone else's post is shown as its own (a
-  departure from iOS, which shows it as the member it names). Web:
-  Retichat-js `shouldProcessGroupMessage`, `groupTrustsSource`,
+  an invite is processed only from a source the privacy filter allows (on:
+  an allowlisted contact; off: anyone, and the user accepts or declines).
+  The invite itself allows nobody: the member keys it carries are kept as
+  it arrives (the accept needs every one), and its inviter and the members
+  it lists are allowed only when the user accepts it, which allowlists
+  every member, creating a row where there is none (creating a group does
+  the same). A declined or unanswered invite leaves them as they were, and
+  lets them through nowhere else either: a DM or a distro identity
+  transfer from a member listed only in a pending group is dropped like a
+  stranger's. Nor does a client ask anything of the members a pending
+  group lists before the user accepts: opening that group's chat requests
+  no path and opens no link to them (the accept itself asks for every
+  member's path and sends the accept to each).
+- **Group model** (James, 2026-10-01, later the same day): "There are no
+  membership changes for a group. One person starts the group with the
+  membership list. Each person can accept or reject. And each person can
+  leave at any time. Once the group is rejected/left, that person cannot
+  rejoin." It holds whether the privacy filter is on or off; only an
+  invite asks the filter. In every client:
+  - *Membership is the creator's list, fixed.* The member list is the one
+    the group was created with, or the first invite brought; nothing adds
+    to it. Another invite for a group held here (pending or joined), from
+    the creator or anyone, changes nobody's membership or status (its
+    member keys are still kept). This replaces the trust rule's former
+    item "an allowed member's relayed accept naming someone new
+    (`GROUP_SENDER`) makes that member a member, allowlisted".
+  - *Accept, reject and leave are each member's own.* An accept or a leave
+    counts only when the packet's own LXMF source is on the group's member
+    list, has not left, and the message names nobody else (no
+    `GROUP_SENDER`, or the source's own). No client relays an accept or a
+    leave (each sends its own, with `GROUP_SENDER` itself; nothing calls a
+    relay request for one), so one about anyone else is never genuine and
+    is dropped. A hash that is not on the list never becomes a member. A
+    member of a pending group may accept or leave for itself (recorded,
+    since a group fans out to accepted members only) and is allowed
+    nothing by it; in a joined group its accept also allowlists it, as the
+    user's accept already did. A reject is local: the user's decline sends
+    nothing (no client has a reject message).
+  - *Reject and leave are final.* A member that left stays left: its
+    later accept is dropped, and no message, and no second invite, moves it
+    back. The user's own decline or leave is recorded (bounded: the web
+    keeps the last 500), and a later invite to that group is dropped from
+    anyone, so the UI never offers it again; the decline and leave
+    confirmations say it is final.
+  - *Relay only for an accepted member of a joined group.* A `relay_req`
+    (the one action that makes a client send for someone: the relay and
+    its `relay_done`) is honoured only for a group the user has joined and
+    only from a member that accepted it; from anyone else, the allowlisted
+    and (filter off) strangers included, it is dropped. Any other action
+    (`relay_done`, an unknown one) is taken only from a current member
+    (invited or accepted, not left) of a joined group.
+  - *`GROUP_SENDER` names an author only when a current member of a
+    joined group relays a listed member's post.* Anyone else's plain post
+    (kept whoever sent it, for a group held here) is shown as its own: a
+    stranger's, a pending group's member's, and an allowlisted contact's
+    that is no member, filter on or off (a departure from iOS, which shows
+    it as the member it names).
+  Anything dropped is dropped like any filtered message, unproved, with no
+  membership change, no allowlisting and no relay. Web: Retichat-js
+  `shouldProcessGroupMessage(action, sourceAllowed, groupStatus,
+  sourceStatus, namesOther, groupClosed)`, `groupTrustsSource`,
   `GROUP_ACTIONS_THAT_RELAY`, `PrivacyFilter.groupAccepts` and
-  `PrivacyFilter.groupMember` (`33bc41d`, `793a959`, `47bc47d`, `33a299a`);
-  `_handleGroupMessage`'s invite branch keeps keys and allows nobody
-  (`07b89e2`), `PrivacyFilter.knows` counts the member lists of joined
-  groups only (`d13509f`), `_performGroupRelay` refuses a group that is
-  not active (`33a299a`), and `openGroupConversation` asks nothing of the
-  members of a group that is not active (`e6d5862`); the held groups'
-  members are allowlisted once by `allowHeldGroupMembers` (`23b2346`; a
-  pending group's are not). iOS and Android still allowlist the inviter
-  and every listed co-member whose key checks out as the invite arrives
-  (`handleGroupInvite`; the `INVITE` branch of `handleGroupMessage`),
-  process every non-invite action for a held
-  group from any source (`groupMessagePolicy`;
-  `DeliveryPolicy.groupMessage`), relay for a pending group
-  (`handleGroupRelayRequest`; `RELAY_REQUEST`), and take any `GROUP_SENDER`
-  as the author (open follow-ups).
+  `PrivacyFilter.groupMember`; `GroupStore.addPending` (a held group
+  unchanged), `updateMember` (listed members only, never back from left),
+  `close` / `isClosed` (`groups_closed_v1`), `_declineGroupInvite` and
+  `_leaveGroup` (`1fdfca8`); before that the trust rule's `33bc41d`,
+  `793a959`, `47bc47d`, `33a299a`, `07b89e2`, `d13509f`, `e6d5862`; the
+  held groups' members are allowlisted once by `allowHeldGroupMembers`
+  (`23b2346`; a pending group's are not). iOS and Android, open
+  follow-ups: they still allowlist the inviter and every listed co-member
+  whose key checks out as the invite arrives (`handleGroupInvite`; the
+  `INVITE` branch of `handleGroupMessage`), merge a later invite into a
+  held group and mark its sender accepted, take an accept or leave for
+  whichever member `GROUP_SENDER` names from any source and add that
+  member if it is not on the list (`handleGroupAccept` /
+  `handleGroupLeave`; `ACCEPT` / `LEAVE`), let a member that left accept
+  again, process every non-invite action for a held group from any source
+  (`groupMessagePolicy`; `DeliveryPolicy.groupMessage`), relay for anyone
+  and for a pending group (`handleGroupRelayRequest`; `RELAY_REQUEST`),
+  keep no record of a declined or left group (`declineGroupInvite` /
+  `leaveGroup`; `declineGroupInvite` / `leaveGroupChat`), and take any
+  `GROUP_SENDER` as the author. Android's leave is a plain post "left the
+  group" with no action (`leaveGroupChat`; audit L5), so no other client
+  records it as a leave.
+- **Web privacy filter default** (James, 2026-10-01: "on retichat.com I
+  don't want the Privacy Filter on by default"): on the web the filter is
+  off unless the user turns it on (Retichat-js `PrivacyFilter.init`,
+  `3b6ba2c`); the phones keep it on by default. Only the Settings switch
+  stores it, so a web user who never touched it is off from that build;
+  an explicit on stays on.
 
 ## 8. Not in scope (follow-ups)
 
@@ -467,8 +507,9 @@ Changes take effect at once through the router setters, with no stack restart.
 - Syncing one Message Display Name across a distro's devices. Each device
   sends its own.
 - Group membership of distro holders (audit H8), GROUP_SENDER trust (M13:
-  on the web, since `47bc47d`, only an allowed source's `GROUP_SENDER` is
-  believed, §7; an allowed member can still name any author),
+  on the web, since `1fdfca8`, a `GROUP_SENDER` is believed only from a
+  current member of a joined group and only when it names a listed member,
+  §7; such a member can still name any listed author),
   link-proven identities (M15), Android's leave message (L5).
 
 ## 9. Implementation
@@ -693,12 +734,16 @@ channel send rule (it never posts).
   Announces: `ContactStore.updateFromAnnounce`. Channels:
   `ChannelSenderNames.apply`.
 - §7 privacy filter: `PrivacyFilter` in `app.js` (iOS's `allowlistDecision`
-  and `groupMessagePolicy`, on by default), asked by `LXMRouter.acceptsSource`
+  and `groupMessagePolicy`; off by default on the web since `3b6ba2c`, the
+  phones' on), asked by `LXMRouter.acceptsSource`
   (the decrypted source, before the proof and the parse; a source that is
-  neither allowlisted nor a member here is read only as far as its group id
-  and action, `LXMessage.peekGroupFields`, and kept only as a plain group
-  message, with no action, for a group held here, as iOS keeps it: §7's
-  group trust rule) and
+  neither allowlisted nor a member of a joined group here is read only as
+  far as its group id and action, `LXMessage.peekGroupFields`, and kept
+  only as a plain group message, with no action, for a group held here, as
+  iOS keeps it, or, when it is on that group's member list, as its own
+  accept or leave: §7's group trust rule and group model; with the filter
+  off every source passes this step and `acceptsMessage` holds the group
+  model) and
   `acceptsMessage` (after the parse, before the proof) in
   `lib/rns/lxmf/lxmf_router.js`; a dropped message records no name and is
   not proved by the router (a link Resource is proved by the Resource
