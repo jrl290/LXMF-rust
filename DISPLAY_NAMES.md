@@ -186,26 +186,51 @@ post carries an empty `0xD1` (clear) once.
 
 After the post is handed to RFed, record `last_digest` and `last_included_at`.
 
-**Learning from the channel** (2026-10-03). The state records what readers
-last got from the posting identity, whichever of the user's devices sent it.
-So a device also records it when it receives, in the channel, a post whose
-source is its current posting identity (the echo of its own post, or a post
-a sibling device signed with the same distro) that passed the key binding
-and the signature, carries key 0 (`Name` or `Clear`), and is later than
-`last_included_at`: `last_digest` becomes the digest of that value (the
-empty-name digest for a `Clear`) and `last_included_at` the post's time.
-When the user's devices hold the same name, one device including it then
-stops its siblings repeating it within 24 hours, and the posts themselves
-are the only exchange between devices.
-A device that did not receive the post keeps its own record and at worst
-includes the name once more.
+**Learning from the channel** (2026-10-03, narrowed the same day). A device
+also takes into its state what a sibling's post told readers, but only when
+that is what the device itself would tell them. It considers a post it
+receives in the channel whose source is its current posting identity (the
+echo of its own post, or a post a sibling device signed with the same
+distro), that passed the key binding and the signature, and that is later
+than `last_included_at`. It records from that post only when the post's key 0
+is the value this device would send now:
+
+- `Name(s)` where `s` is this device's current Channel Display Name (the same
+  digest), or
+- `Clear` while this device's Channel Display Name is unset.
+
+Then `last_digest` becomes the digest of that value (the empty-name digest for
+a `Clear`) and `last_included_at` the post's time. Any other post leaves the
+record as it was: one with no key 0, a name other than this device's, a name
+while this device has none, or a clear while it has one.
+
+- When the user's devices hold the same name, one device including it stops
+  its siblings repeating it, because their rules 1-3 then count from that
+  post. The posts themselves are the only exchange between devices. When all
+  of them have unset their names, one clear is enough. A device that did not
+  receive the post keeps its own record and at worst includes the name, or
+  the clear, once more.
+- A device never records a name it does not hold, so its own clear (the
+  unset-name rule above) follows only a name that this device itself
+  included, and is sent at most once. Learning any value would break this. A
+  device with no name would learn a sibling's name and clear it on its next
+  post, after each of the sibling's posts. Two devices with different names
+  would each find the other's name recorded (rule 1) and include their own on
+  every post.
 
 **Devices with different names.** The Channel Display Name stays a setting of
-each device (§8). When two devices of one distro hold different names, a post
-from either carries its device's name whenever readers last got the other one
-(rule 1), so readers show the name of whichever device last included one.
-That is what the posts say: no device's name is hidden or replaced by
-another's. The same name on every device avoids it.
+each device (§8). Here an unset name counts as a different name. Readers keep
+one `channelName` per channel and sender (§5.1) and show it on every post
+from that sender (§5.3). So they label all of D's posts in a channel with one
+name at a time, the one that any of the user's devices included last, and
+that includes D's earlier posts. With different names, that label changes
+when a device includes its own name on its own triggers (rules 1-3: its first
+post as D, a change of its name, a new sender, the 24-hour refresh). It never
+changes merely because a sibling posted. A device whose name was unset after
+it had included one sends its clear once. Readers then show D's posts with no
+channel name until a device that has a name includes it again on one of those
+triggers. Readers cannot tell which device a name came from. The same name on
+every device avoids all of this.
 
 **When the posting identity changes** (the device gains, replaces or gives up
 its distro), readers have never had a name from the new source in the
@@ -621,8 +646,9 @@ Changes take effect at once through the router setters, with no stack restart.
 - Syncing one Message Display Name across a distro's devices. Each device
   sends its own.
 - Syncing one Channel Display Name across a distro's devices. Each device
-  keeps its own setting; §4.2 says what readers see when two differ. (The
-  channel rule's *state* is shared through the posts themselves, §4.2.)
+  keeps its own setting; §4.2 says what readers see when two differ.
+  (Devices that hold the same name share the channel rule's *state* through
+  the posts themselves, §4.2.)
 - Group membership of distro holders (audit H8), GROUP_SENDER trust (M13:
   on the web, since `1fdfca8`, a `GROUP_SENDER` is believed only from a
   current member of a joined group and only when it names a listed member,
@@ -908,6 +934,15 @@ RFed-rust SPEC.md §17.12, "Implementation index". For §4.2 in short:
 - Retichat-js: `ChannelPostNames` (`decide` / `noteSender` /
   `recordIncluded`, `lib/name_ledger.js`) keyed by channel and posting
   identity, learning in `_handleChannelPacket`.
+- Every client learns only a value equal to its own (§4.2, "Learning from the
+  channel"). Its tests drive two devices posting as one distro to one reader
+  slot and assert four things. A device with no name never sends a clear while
+  its sibling posts a name, and the reader keeps that name. Two devices with
+  the same name include it once within 24 hours. Two devices with different
+  names include theirs only on their own triggers, not on every post. When
+  both have unset their names, one clear is sent. Mutation: learning every
+  value breaks the first and the third; learning nothing breaks the second
+  and the fourth.
 
 ### Python reference
 
