@@ -3,7 +3,9 @@
 Status: agreed 2026-09-27 (James). Replaces the `FIELD_SENDER_NAME` (0x10)
 mechanism. Applies to LXMF-rust, the iOS FFI crate, the Android JNI crate,
 Retichat-ios (app and Notification Service Extension), Retichat-android and
-Retichat-js.
+Retichat-js. Amended 2026-10-03 (James): a device that holds a distro posts
+to channels as the distro, so the channel rule (§4.2) is kept per posting
+identity.
 
 The audit that led here (every client, every surface, file:line) found that
 names reached almost no screen: iOS decoded 0x10 only as msgpack str while the
@@ -76,6 +78,10 @@ channel rule (section 4.2) says to include the name, the map holds
 `0xD1`.
 Nothing else about the envelope changes.
 
+The post's source, the identity key 0 names (§2.1), is the **posting
+identity**: the distro when the device holds one, otherwise the device
+(RFed-spec/Channel.md, "Distro holders"; RFed-rust SPEC.md §17.12).
+
 **Key binding (required).** Channel unpack must check, before remembering any
 key, that the 64-byte public key in the post's prelude produces the claimed
 source hash as an `lxmf.delivery` destination (`channel::unpack`, and
@@ -130,8 +136,9 @@ ends up empty).
 - The router holds one `message_display_name` (cleaned, or none), set at start
   and changed at runtime through a setter. No stack restart.
 - It applies to every outbound message whatever its source (device or distro),
-  except messages to one's own devices (distro sent-copies §17.11 and distro
-  identity transfers §17.9).
+  except messages to one's own devices (distro sent-copies §17.11, distro
+  identity transfers §17.9 and channel membership messages §17.12, all
+  recognised by their `FIELD_CUSTOM_TYPE`).
 - The ledger remembers, per `(source hash, recipient hash)`, the digest of the
   name last **confirmed delivered** and when:
   `SQLite <storagepath>/lxmf/display_names.sqlite3`, table
@@ -157,17 +164,19 @@ ends up empty).
 
 ### 4.2 Channel posts: the client rule
 
-Channel posts have no per-reader confirmation. Each client keeps, per channel:
-`last_digest` (digest of the name last included, or none),
-`last_included_at`, and the set of sender hashes seen in the channel. All of it
-is persisted.
+Channel posts have no per-reader confirmation. Each client keeps, per channel
+and **posting identity** (§2.3: the distro when the device holds one,
+otherwise the device): `last_digest` (digest of the name last included, or
+none) and `last_included_at`; and per channel, the set of sender hashes seen
+in the channel. All of it is persisted.
 
 A post includes the Channel Display Name when the name is set and any of:
 
 1. `last_digest` differs from the current name's digest (first post, or the
    name changed);
 2. a sender not seen before in this channel has posted since
-   `last_included_at`;
+   `last_included_at`. The user's own posting identities, this device's
+   `lxmf.delivery` hash and the held distro's, are never such a sender;
 3. more than **24 hours** have passed since `last_included_at`
    (`CHANNEL_NAME_REFRESH_SECS`). This is the only thing that reaches silent
    readers who joined later.
@@ -176,6 +185,33 @@ When the name is unset and `last_digest` is a non-empty name's digest, the next
 post carries an empty `0xD1` (clear) once.
 
 After the post is handed to RFed, record `last_digest` and `last_included_at`.
+
+**Learning from the channel** (2026-10-03). The state records what readers
+last got from the posting identity, whichever of the user's devices sent it.
+So a device also records it when it receives, in the channel, a post whose
+source is its current posting identity (the echo of its own post, or a post
+a sibling device signed with the same distro) that passed the key binding
+and the signature, carries key 0 (`Name` or `Clear`), and is later than
+`last_included_at`: `last_digest` becomes the digest of that value (the
+empty-name digest for a `Clear`) and `last_included_at` the post's time.
+When the user's devices hold the same name, one device including it then
+stops its siblings repeating it within 24 hours, and the posts themselves
+are the only exchange between devices.
+A device that did not receive the post keeps its own record and at worst
+includes the name once more.
+
+**Devices with different names.** The Channel Display Name stays a setting of
+each device (§8). When two devices of one distro hold different names, a post
+from either carries its device's name whenever readers last got the other one
+(rule 1), so readers show the name of whichever device last included one.
+That is what the posts say: no device's name is hidden or replaced by
+another's. The same name on every device avoids it.
+
+**When the posting identity changes** (the device gains, replaces or gives up
+its distro), readers have never had a name from the new source in the
+channel. The client starts the new identity from its own stored state for
+that identity, or from none, and never carries the old identity's state over,
+so the first post under the new identity carries the name (rule 1).
 
 ## 5. Receiving
 
@@ -250,7 +286,11 @@ messages keep the hash and resolve it when shown.
   | no `channelName` | `localName ?? messageName ?? announceName ?? legacyName ?? shortHash` | none |
 
   (James, 2026-09-27: the user's own name for someone is the name they know them
-  by; the channel name moves to the grey spot.) Notifications for channel posts
+  by; the channel name moves to the grey spot.) A post whose source is one of
+  the user's own posting identities (this device's `lxmf.delivery` hash, or the
+  distro it holds) is the user's own, from whichever of their devices it came:
+  it is shown as their own bubble under no label and is never notified
+  (RFed-spec/Channel.md, "Distro holders"). Notifications for channel posts
   name the poster the same way, main label then secondary text
   (`Mum · Night Owl`, `Night Owl · 1a2b3c4d…`), so a channel name never stands
   alone there either.
@@ -580,6 +620,9 @@ Changes take effect at once through the router setters, with no stack restart.
   receiver's own contacts through 0xA4.
 - Syncing one Message Display Name across a distro's devices. Each device
   sends its own.
+- Syncing one Channel Display Name across a distro's devices. Each device
+  keeps its own setting; §4.2 says what readers see when two differ. (The
+  channel rule's *state* is shared through the posts themselves, §4.2.)
 - Group membership of distro holders (audit H8), GROUP_SENDER trust (M13:
   on the web, since `1fdfca8`, a `GROUP_SENDER` is believed only from a
   current member of a joined group and only when it names a listed member,
@@ -845,6 +888,26 @@ channel send rule (it never posts).
 - Migration: `migrateContact` (in `ContactStore.init`),
   `migrateOwnDisplayName` / `OwnNames.finishMigration`,
   `GroupMsgStore.migrateLegacyNotices`.
+
+### Posting as the distro (2026-10-03, not yet in the code)
+
+The §2.3 posting identity, own posts (§5.3), and the §4.2 state per posting
+identity with its learning rule are to be made in every client. What changes,
+function by function, for LXMF-rust, iOS, Android and the web, is listed in
+RFed-rust SPEC.md §17.12, "Implementation index". For §4.2 in short:
+
+- LXMF-rust: `name_ledger::is_own_devices_message` takes the channel
+  membership type `"rfed.distro.channel"` too (§4.1).
+- Retichat-ios: `RfedChannelClient.channelPostName(for:)` and
+  `recordPostName` keyed by channel and posting identity
+  (`ChannelEntity.nameLastDigestHex` / `nameLastIncludedAt`), learning in
+  `dispatchVerifiedLxmf`.
+- Retichat-android: `RfedChannelClient.channelPostName` and `recordPostName`
+  over `ChannelNameStateEntity` keyed by channel and posting identity,
+  learning in `dispatchBlob`.
+- Retichat-js: `ChannelPostNames` (`decide` / `noteSender` /
+  `recordIncluded`, `lib/name_ledger.js`) keyed by channel and posting
+  identity, learning in `_handleChannelPacket`.
 
 ### Python reference
 
