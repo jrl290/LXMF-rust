@@ -978,15 +978,18 @@ entry: it is no larger from three entries up.
 | 1 | `RF_GROUP_ID` | str: 32-hex group id | `0xA0` |
 | 2 | `RF_GROUP_MEMBERS` | str: comma-separated hex hashes of all members (invite only) | `0xA1` |
 | 3 | `RF_GROUP_NAME` | str: group name | `0xA2` |
-| 4 | `RF_GROUP_ACTION` | str: `invite`, `accept`, `leave`, `relay_req`, `relay_done` | `0xA3` |
+| 4 | `RF_GROUP_ACTION` | str: `invite`, `accept`, `leave`, `relay_req`, `relay_done`, `status` | `0xA3` |
 | 5 | `RF_GROUP_SENDER` | str: original sender hex | `0xA4` |
 | 6 | `RF_GROUP_RELAY_SEEN` | str: comma-separated hashes already delivered to | `0xA5` |
 | 7 | `RF_GROUP_RELAY_FOR` | str: hash of the member being relayed for | `0xA6` |
 | 8 | `RF_GROUP_RELAY_DONE` | bool: relay-complete signal | `0xA7` |
-| 9 | `RF_GROUP_MEMBER_KEYS` | str: one `hash:base64-public-key` pair per invite chunk | `0xA8` |
+| 9 | `RF_GROUP_MEMBER_KEYS` | str: one `hash:base64-public-key` pair per invite chunk; an `accept`/`leave` carries its sender's own | `0xA8` |
+| 10 | `RF_GROUP_STATUSES` | array of bin: in `status`, the members' own packed `accept`/`leave` messages (2026-10-06) | (new: no old field) |
 
 Each value keeps exactly the type it had as a top-level field, so the group
-logic itself is unchanged. Group semantics are RFed-spec `Group.md`.
+logic itself is unchanged. Key 10 exists only here: before the switch it is
+the one group entry a sender writes into the Retichat field. Group semantics
+are RFed-spec `Group.md` (member statuses and keys: its 2026-10-06 section).
 
 **Transition (group entries only; the name was never sent anywhere else):**
 
