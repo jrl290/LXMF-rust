@@ -121,6 +121,16 @@ pub struct LXMessage {
 	/// The router has asserted the silence now running. The transfer's next
 	/// progress ends it, and a later silence is asserted in its turn.
 	pub(crate) transfer_silence_asserted: bool,
+	/// DESIGN_PRINCIPLES §1, bulk transfers ("Panic at the end", James,
+	/// 2026-10-10): each silence the router's pass asserted for this send,
+	/// as it logged it there (`[SEND-ASSERT]` and an ERROR line, in every
+	/// build). The pass runs with the router's, this message's and the
+	/// outbound processing lock held, so it never panics there; in a debug
+	/// build these panic once the router has let go of the message, its
+	/// outcome decided and handled (`LXMRouter::process_outbound_pass`).
+	/// Kept across attempts: a new attempt does not undo an old silence.
+	/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+	pub(crate) transfer_violations: Vec<String>,
 	/// DISPLAY_NAMES.md §4.1: the router has decided whether this message
 	/// carries the name entry (key 0 of `FIELD_RETICHAT`) and written the decision into `fields`.
 	/// Set once, in `LXMRouter::handle_outbound`, before the first pack; a
@@ -307,6 +317,7 @@ impl LXMessage {
 			transfer_moved_at: None,
 			transfer_silence_unasserted: None,
 			transfer_silence_asserted: false,
+			transfer_violations: Vec::new(),
 			display_name_decided: false,
 			transport_encrypted: false,
 			transport_encryption: None,

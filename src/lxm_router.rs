@@ -1179,17 +1179,31 @@ impl LXMRouter {
 	}
 
 	pub fn process_outbound(&mut self) {
+		// DESIGN_PRINCIPLES §1 ("Panic at the end", James, 2026-10-10): the
+		// threads the pass's debug panics run on are not joined; each panics
+		// on its own, holding nothing.
+		let _ = self.process_outbound_pass();
+	}
+
+	/// One pass over the outbound queue ([`Self::process_outbound`]).
+	/// Returns the threads on which, in a debug build, the §1 violations of
+	/// the sends it let go of panic (`app_links::assert_after_the_outcome`);
+	/// tests join them. Empty in a release build.
+	pub(crate) fn process_outbound_pass(&mut self) -> Vec<thread::JoinHandle<()>> {
 		log(&format!("[POB] enter pending={}", self.pending_outbound.len()), LOG_VERBOSE, false, false);
 		let _guard = match self.outbound_processing_lock.lock() {
 			Ok(guard) => {
 				guard
 			}
 			Err(_err) => {
-				return;
+				return Vec::new();
 			}
 		};
 
 		let mut index = 0;
+		// §1, bulk transfers: the violations recorded on each send this pass
+		// lets go of, asserted (debug) at its end (`transfer_violations`).
+		let mut concluded_violations: Vec<Vec<String>> = Vec::new();
 		let mut backchannel_setup_links: Vec<(LinkHandle, Vec<u8>)> = Vec::new();
 		let mut propagation_links_to_open: Vec<(Vec<u8>, String)> = Vec::new();
 		while index < self.pending_outbound.len() {
@@ -1241,10 +1255,22 @@ impl LXMRouter {
 				// its total time: a photo legitimately takes minutes. From
 				// its Resource's advertisement on, the transfer must show
 				// progress (a request served, its proof) at least every
-				// 5 s; a longer silence is the §1 violation, asserted here
-				// as above (panic in debug, [SEND-ASSERT] + log in release)
-				// and never used to fail the send: the Resource's own
-				// events (concluded, failed, link closed) decide it.
+				// 5 s; a longer silence is the §1 violation, and it is
+				// never used to fail the send: the Resource's own events
+				// (concluded, failed, link closed) decide it. So it is not
+				// asserted as above ("Panic at the end", James, 2026-10-10):
+				// here, in every build, it is logged ([SEND-ASSERT] + an
+				// ERROR line) and recorded on the message
+				// (`transfer_violations`), with no state change. This pass
+				// holds the router's lock (its caller's), the message's and
+				// `outbound_processing_lock`: a panic here poisoned them,
+				// the message's next `if let Ok(..) = lock()` (its progress,
+				// its proof: `mark_delivered_shared`) skipped, and every
+				// later pass returned at the poisoned processing lock, so
+				// the assertion decided the send. In a debug build the
+				// recorded violations panic once this pass has let go of
+				// the message, its outcome decided and handled, on a thread
+				// of their own (end of `process_outbound_pass`).
 				// `transfer_silence` hands each silence over once, whether
 				// it is still running or ended between two passes. Each
 				// Resource is watched from its advertisement to its end: a
@@ -1270,18 +1296,11 @@ impl LXMRouter {
 						reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS,
 						lxm.method, lxm.state, lxm.progress,
 					);
-					#[cfg(debug_assertions)]
-					{
-						log(&msg, LOG_ERROR, false, false);
-						panic!("{}", msg);
-					}
-					#[cfg(not(debug_assertions))]
-					{
-						eprintln!("[SEND-ASSERT] {}", msg);
-						log(&msg, LOG_ERROR, false, false);
-						// Intentionally no state change: the silence is
-						// never used to fail the send (§1, bulk transfers).
-					}
+					eprintln!("[SEND-ASSERT] {}", msg);
+					log(&msg, LOG_ERROR, false, false);
+					lxm.transfer_violations.push(msg);
+					// Intentionally no state change: the silence is
+					// never used to fail the send (§1, bulk transfers).
 				}
 
 				if !LXMessage::is_success_state(lxm.state)
@@ -1929,6 +1948,14 @@ impl LXMRouter {
 					// message then reports DELIVERED itself.
 					let released = self.released_state_callback(&lxm);
 					lxm.release_state_reporting(released);
+					// §1, bulk transfers ("Panic at the end"): its outcome is
+					// decided and handled (its state reported, its delivery
+					// or failed callback run); the violations its transfer
+					// recorded are asserted at the end of this pass.
+					let violations = std::mem::take(&mut lxm.transfer_violations);
+					if !violations.is_empty() {
+						concluded_violations.push(violations);
+					}
 					self.pending_outbound.remove(index);
 				} else {
 					index += 1;
@@ -1957,6 +1984,21 @@ impl LXMRouter {
 				hexrep(&dest_hash, false)
 			), LOG_NOTICE, false, false);
 		}
+
+		// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+		// §1, bulk transfers ("Panic at the end", James, 2026-10-10): the
+		// last thing this pass does. The sends it let go of are decided and
+		// handled; in a debug build each one's recorded violations panic now,
+		// on a thread of their own (`app_links::assert_after_the_outcome`).
+		// No message lock is held here, `outbound_processing_lock` was
+		// dropped above, and the router's lock, which the caller holds, is
+		// not that thread's: it has taken no lock, so the panic poisons
+		// nothing, and nothing runs after it there. In release: nothing more
+		// (each was logged where it was found).
+		concluded_violations
+			.into_iter()
+			.filter_map(app_links::assert_after_the_outcome)
+			.collect()
 	}
 
 	pub fn handle_outbound(&mut self, message: Arc<Mutex<LXMessage>>) {
@@ -6432,15 +6474,116 @@ mod send_assertion_router_tests {
 		photo.lock().unwrap().note_transfer_progress(now() - 1.0);
 		pass(&router, &photo);
 		assert_eq!(photo.lock().unwrap().state, LXMessage::SENDING);
+		assert!(photo.lock().unwrap().transfer_violations.is_empty());
 	}
 
-	/// The photo's transfer has been silent for 6 s: a §1 violation.
+	/// The photo's transfer was silent for 6 s: a §1 violation. "Panic at
+	/// the end" (James, 2026-10-10): it is found where locks are held (the
+	/// silence's end, reported by the progress callback under the Resource's
+	/// lock; the router's pass, under the router's, the message's and the
+	/// outbound processing lock), and it panics at none of them. It is
+	/// logged and recorded there, nothing is poisoned, and the send
+	/// concludes by its own event, its proof. Only once the router has let
+	/// go of it, its outcome handled, is it asserted: in a debug build on a
+	/// thread of its own, in release not at all beyond the log.
 	#[test]
-	#[should_panic(expected = "Resource transfer silent for 6.")]
-	fn a_six_second_silence_trips_the_assertion() {
+	fn a_six_second_silence_is_recorded_where_found_and_panics_at_no_lock() {
 		let (router, photo) = in_flight("silent", 2000, 30.0);
 		photo.lock().unwrap().note_transfer_progress(now() - 6.0);
-		pass(&router, &photo);
+
+		// A request served after the silence: the progress callback runs on
+		// the thread serving it, with the Resource's lock held (a stand-in).
+		let resource_lock = Arc::new(Mutex::new(()));
+		let served = {
+			let resource_lock = resource_lock.clone();
+			let report = crate::lx_message::transfer_progress_reporter(&photo);
+			thread::spawn(move || {
+				let _resource = resource_lock.lock().unwrap();
+				report(app_links::SendProgress::Fraction(0.5));
+			})
+		};
+		assert!(served.join().is_ok(), "no panic under the Resource's lock");
+		assert!(!resource_lock.is_poisoned() && !photo.is_poisoned());
+
+		// The router's pass, under the router's lock as its job thread holds it.
+		let mut r = router.lock().unwrap();
+		r.pending_outbound.push(photo.clone());
+		let ends = r.process_outbound_pass();
+		assert!(ends.is_empty(), "nothing is asserted while the send is the router's");
+		assert!(!photo.is_poisoned() && !r.outbound_processing_lock.is_poisoned(), "nothing poisoned");
+		{
+			let lxm = photo.lock().unwrap();
+			assert_eq!(lxm.state, LXMessage::SENDING, "it decides nothing");
+			assert_eq!(lxm.transfer_violations.len(), 1, "{:?}", lxm.transfer_violations);
+			assert!(lxm.transfer_violations[0].contains("Resource transfer silent for 6."), "{}", lxm.transfer_violations[0]);
+			assert!(lxm.transfer_violations[0].contains("over before this pass"), "{}", lxm.transfer_violations[0]);
+		}
+		assert_eq!(r.pending_outbound.len(), 1, "still in flight");
+
+		// Its own event concludes it: the proof (AppLinks' on_delivered).
+		crate::lx_message::mark_delivered_shared(&photo);
+		assert_eq!(photo.lock().unwrap().state, LXMessage::DELIVERED, "the proof is recorded");
+		let ends = r.process_outbound_pass();
+		assert!(r.pending_outbound.is_empty(), "the router let go of it, delivered");
+		assert!(photo.lock().unwrap().transfer_violations.is_empty(), "taken for the end point");
+		drop(r);
+		assert!(!router.is_poisoned());
+
+		#[cfg(debug_assertions)]
+		{
+			assert_eq!(ends.len(), 1);
+			let panic = ends
+				.into_iter()
+				.next()
+				.unwrap()
+				.join()
+				.expect_err("debug: asserted at the end, on a thread of its own");
+			let report = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+			assert!(report.contains("Resource transfer silent for 6."), "{}", report);
+		}
+		#[cfg(not(debug_assertions))]
+		assert!(ends.is_empty(), "release: logged where found, and nothing more");
+	}
+
+	/// In a debug build the recorded silence panics once the router has let
+	/// go of the send, its outcome handled, and not in the pass that found it.
+	#[test]
+	#[cfg(debug_assertions)]
+	#[should_panic(expected = "Resource transfer silent for 6.")]
+	fn in_debug_a_recorded_silence_panics_once_the_router_let_go_of_the_send() {
+		let (router, photo) = in_flight("silent-end", 2000, 30.0);
+		photo.lock().unwrap().note_transfer_progress(now() - 6.0);
+		let mut r = router.lock().unwrap();
+		r.pending_outbound.push(photo.clone());
+		assert!(r.process_outbound_pass().is_empty(), "the running silence is recorded, not panicked on");
+		assert_eq!(photo.lock().unwrap().transfer_violations.len(), 1);
+		crate::lx_message::mark_delivered_shared(&photo);
+		let ends = r.process_outbound_pass();
+		assert!(r.pending_outbound.is_empty());
+		drop(r);
+		for end in ends {
+			if let Err(panic) = end.join() {
+				std::panic::resume_unwind(panic);
+			}
+		}
+	}
+
+	/// In a release build the router's watch only logs, as before: the
+	/// silence is logged in the pass that finds it, with no state change,
+	/// and nothing more happens when the router lets go of the send.
+	#[test]
+	#[cfg(not(debug_assertions))]
+	fn in_release_a_recorded_silence_only_logs() {
+		let (router, photo) = in_flight("silent-release", 2000, 30.0);
+		photo.lock().unwrap().note_transfer_progress(now() - 6.0);
+		let mut r = router.lock().unwrap();
+		r.pending_outbound.push(photo.clone());
+		assert!(r.process_outbound_pass().is_empty());
+		assert_eq!(photo.lock().unwrap().state, LXMessage::SENDING);
+		assert_eq!(photo.lock().unwrap().transfer_violations.len(), 1, "logged");
+		crate::lx_message::mark_delivered_shared(&photo);
+		assert!(r.process_outbound_pass().is_empty(), "nothing more at the end");
+		assert!(r.pending_outbound.is_empty());
 	}
 
 	/// The photo has been handed over as a Resource and is queued behind
@@ -6453,6 +6596,7 @@ mod send_assertion_router_tests {
 		photo.lock().unwrap().transfer_by_resource = true;
 		pass(&router, &photo);
 		assert_eq!(photo.lock().unwrap().state, LXMessage::SENDING);
+		assert!(photo.lock().unwrap().transfer_violations.is_empty());
 	}
 
 	/// The reviewer's case of 2026-10-01: tier 1's Resource moved, then
@@ -6472,6 +6616,7 @@ mod send_assertion_router_tests {
 		}
 		pass(&router, &photo);
 		assert_eq!(photo.lock().unwrap().state, LXMessage::SENDING);
+		assert!(photo.lock().unwrap().transfer_violations.is_empty(), "no violation recorded");
 	}
 
 	/// On the router's own DIRECT path (a destination nobody opened through
