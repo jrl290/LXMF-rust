@@ -15,8 +15,11 @@
 //!
 //! Payload shapes are pinned by `rfed`'s `verify_signed_payload` and
 //! `parse_distro_announce_payload`; see RFed SPEC §17.5 and §17.9. The
-//! sent-message sync marker read by `unwrap_blob` is RFed SPEC §17.11.
+//! sent-message sync marker read by `unwrap_blob` is RFed SPEC §17.11. The
+//! distro sync proof (`seal_for_sync`, `sealed_upload`,
+//! `decode_sync_extension`, `verify_sync_claim`) is RFed SPEC §17.13.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -25,7 +28,7 @@ use rmpv::encode::write_value;
 use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType, Direction};
-use reticulum_rust::identity::{full_hash, Identity};
+use reticulum_rust::identity::{full_hash, truncated_hash, Identity};
 
 use crate::display_name::{self, NameField};
 use crate::lx_message::LXMessage;
@@ -293,6 +296,338 @@ pub fn announce_payload(distro: &Identity, announce_name: Option<&[u8]>) -> Resu
         Value::Binary(distro_pubkey),
         Value::Binary(sig),
     ])))
+}
+
+// ---------------------------------------------------------------------------
+// RFed SPEC §17.13: the distro sync proof.
+//
+// A device's own uploads to its distro D (the §17.11 sent copy and the §17.12
+// membership message) are sync, and RFed delivers them without a wake when
+// the upload proves, with D's key, that it is one. The proof is a third
+// element of the client's `lxmf.propagation` upload:
+//
+//     [ timebase f64, [ lxmf_data, ... ], { "rfed.distro.sync": [ claim, ... ] } ]
+//     claim = [ bin(16) id, bin(64) distro_pubkey, bin(64) sig ]
+//
+// One implementation serves the sending device (seal_for_sync, sealed_upload)
+// and RFed (decode_sync_extension, verify_sync_claim), so the two cannot
+// drift. Golden vector: tests/distro_sync_vectors.json.
+// ---------------------------------------------------------------------------
+
+/// The key of the sync proof in the third element of the upload.
+pub const DISTRO_SYNC_KEY: &str = "rfed.distro.sync";
+/// The domain tag the signed bytes begin with: the same 16 ASCII bytes.
+pub const DISTRO_SYNC_TAG: &[u8; 16] = b"rfed.distro.sync";
+/// The version byte that follows the tag in the signed bytes.
+pub const DISTRO_SYNC_VERSION: u8 = 0x01;
+/// `tag(16) | version(1) | D_hash(16) | transient_id(32)`.
+pub const DISTRO_SYNC_SIGNED_LEN: usize = 65;
+/// A claim's `id`: `transient_id[0..16]`, RFed's `distro_message_id`.
+pub const DISTRO_SYNC_ID_LEN: usize = 16;
+/// `transient_id = SHA-256(sealed)`.
+const TRANSIENT_ID_LEN: usize = 32;
+/// The PN stamp that follows the sealed message in `lxmf_data`.
+const STAMP_LEN: usize = crate::lx_stamper::STAMP_SIZE;
+
+/// The bytes D signs for a sync proof (SPEC §17.13):
+/// `"rfed.distro.sync" | 0x01 | D_hash | transient_id`, 65 bytes.
+///
+/// `transient_id = SHA-256(sealed)` commits to the destination and the
+/// ciphertext, so a signature covers one exact sealed message. No other D
+/// signature is 65 bytes that begin with this tag: the register and list
+/// signatures cover 64 and 16 bytes, the announce value begins with a flags
+/// byte, an RNS announce or LXMF signature begins with a destination hash,
+/// and a packet proof covers 32 bytes.
+pub fn sync_signed_bytes(d_hash: &[u8; DEST_HASH_LEN], transient_id: &[u8; TRANSIENT_ID_LEN]) -> [u8; DISTRO_SYNC_SIGNED_LEN] {
+    let mut out = [0u8; DISTRO_SYNC_SIGNED_LEN];
+    out[..16].copy_from_slice(DISTRO_SYNC_TAG);
+    out[16] = DISTRO_SYNC_VERSION;
+    out[17..17 + DEST_HASH_LEN].copy_from_slice(d_hash);
+    out[17 + DEST_HASH_LEN..].copy_from_slice(transient_id);
+    out
+}
+
+/// `transient_id = SHA-256(sealed)`: what the PN stamp is mined over, and
+/// what a sync signature covers.
+pub fn sync_transient_id(sealed: &[u8]) -> [u8; TRANSIENT_ID_LEN] {
+    let mut out = [0u8; TRANSIENT_ID_LEN];
+    out.copy_from_slice(&full_hash(sealed));
+    out
+}
+
+/// A message sealed once, when it is owed (SPEC §17.13 "On the sending
+/// device"). The device stores both with the owed entry, and every upload of
+/// the entry carries these same bytes; only the stamp and the timebase are
+/// made again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sealed {
+    /// `D_hash(16) | D.encrypt(packed[16..])`: LXMF's `lxmf_data` before the
+    /// stamp, the bytes RFed stores.
+    pub sealed: Vec<u8>,
+    /// D's Ed25519 signature over `sync_signed_bytes(D_hash, SHA-256(sealed))`.
+    pub sig: [u8; 64],
+}
+
+/// Seal a packed LXMF message for distro sync: encrypt it to D once and sign
+/// the result with D's key (DISTRO-SYNC-PROOF-DESIGN.md §5.1).
+///
+/// `packed` is the message as `LXMessage::pack` leaves it, addressed to and
+/// signed by D: `D_hash | src | signature | payload`. Fails, with nothing
+/// made, when:
+/// - `distro` has no private key (`Identity::sign` would panic on it);
+/// - `packed` is too short to be an LXMF message, or is not addressed to D;
+/// - the encryption fails, or the signature does not validate.
+///
+/// The caller then owes the entry without `sealed`, logs the failure as an
+/// error, and builds it the legacy way.
+pub fn seal_for_sync(distro: &Identity, packed: &[u8]) -> Result<Sealed, String> {
+    if distro.get_private_key().is_err() {
+        return Err("the distro identity has no private key: a sync proof needs D's signature".into());
+    }
+    if packed.len() <= DEST_HASH_LEN + LXMF_HEADER_LEN {
+        return Err(format!(
+            "a packed LXMF message is longer than {} bytes, this is {}",
+            DEST_HASH_LEN + LXMF_HEADER_LEN,
+            packed.len()
+        ));
+    }
+    let d_hash: [u8; DEST_HASH_LEN] = delivery_hash(distro)?
+        .try_into()
+        .map_err(|_| "the distro's lxmf.delivery hash is not 16 bytes".to_string())?;
+    if packed[..DEST_HASH_LEN] != d_hash {
+        return Err("the packed message is not addressed to the distro".into());
+    }
+
+    // Encrypted once: every upload of this entry carries these bytes.
+    let encrypted = distro.encrypt(&packed[DEST_HASH_LEN..])?;
+    let mut sealed = Vec::with_capacity(DEST_HASH_LEN + encrypted.len());
+    sealed.extend_from_slice(&d_hash);
+    sealed.extend_from_slice(&encrypted);
+
+    let signed = sync_signed_bytes(&d_hash, &sync_transient_id(&sealed));
+    let sig = distro.sign(&signed);
+    if !distro.validate(&sig, &signed) {
+        return Err("the sync signature does not validate with the distro's own key".into());
+    }
+    let sig: [u8; 64] = sig
+        .try_into()
+        .map_err(|_| "the sync signature is not 64 bytes".to_string())?;
+    Ok(Sealed { sealed, sig })
+}
+
+/// One claim of the sync proof: `[bin(16) id, bin(64) distro_pubkey, bin(64) sig]`.
+/// It names no device: it marks one sealed message as D's own sync and
+/// nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncClaim {
+    /// `transient_id[0..16]` of the message the claim is for.
+    pub id: [u8; DISTRO_SYNC_ID_LEN],
+    /// D's public key: X25519(32) | Ed25519(32).
+    pub distro_pubkey: [u8; 64],
+    /// D's signature over `sync_signed_bytes(D_hash, transient_id)`.
+    pub sig: [u8; 64],
+}
+
+impl SyncClaim {
+    /// The claim for a sealed message, from what the device stored with the
+    /// entry: `sealed`, D's public key and the sync signature.
+    pub fn for_sealed(sealed: &[u8], distro_pubkey: &[u8], sig: &[u8]) -> Result<SyncClaim, String> {
+        let distro_pubkey: [u8; 64] = distro_pubkey
+            .try_into()
+            .map_err(|_| format!("a distro public key is 64 bytes, this is {}", distro_pubkey.len()))?;
+        let sig: [u8; 64] = sig
+            .try_into()
+            .map_err(|_| format!("a sync signature is 64 bytes, this is {}", sig.len()))?;
+        let mut id = [0u8; DISTRO_SYNC_ID_LEN];
+        id.copy_from_slice(&sync_transient_id(sealed)[..DISTRO_SYNC_ID_LEN]);
+        Ok(SyncClaim { id, distro_pubkey, sig })
+    }
+
+    fn to_value(&self) -> Value {
+        Value::Array(vec![
+            Value::Binary(self.id.to_vec()),
+            Value::Binary(self.distro_pubkey.to_vec()),
+            Value::Binary(self.sig.to_vec()),
+        ])
+    }
+
+    /// Exactly `[bin16, bin64, bin64]` (reader rule 4), or `None`.
+    fn from_value(value: &Value) -> Option<SyncClaim> {
+        let Value::Array(items) = value else { return None };
+        let [Value::Binary(id), Value::Binary(distro_pubkey), Value::Binary(sig)] = items.as_slice() else {
+            return None;
+        };
+        Some(SyncClaim {
+            id: id.as_slice().try_into().ok()?,
+            distro_pubkey: distro_pubkey.as_slice().try_into().ok()?,
+            sig: sig.as_slice().try_into().ok()?,
+        })
+    }
+}
+
+/// LXMF's two-element propagation upload, `msgpack [timebase f64, [bin lxmf_data]]`,
+/// as `LXMessage` packs `propagation_packed` (LXMessage.py). Byte for byte
+/// what the native bridges wrote by hand before this (retichat-jni and
+/// retichat-ffi `distro_outbox::propagation_payload`): every value native
+/// msgpack (CHECK_THESE_THINGS_FIRST §11).
+pub fn propagation_payload(timebase: f64, lxmf_data: &[u8]) -> Vec<u8> {
+    encode(&Value::Array(vec![
+        Value::F64(timebase),
+        Value::Array(vec![Value::Binary(lxmf_data.to_vec())]),
+    ]))
+}
+
+/// The upload of one sealed message to `lxmf.propagation` (SPEC §17.13):
+/// `lxmf_data = sealed | stamp`, where the stamp is the PN stamp mined over
+/// `SHA-256(sealed)` at the node's cost.
+///
+/// With a claim, `[timebase, [lxmf_data], {"rfed.distro.sync": [claim]}]`,
+/// built with rmpv so every value is native msgpack: bin for bytes, str for
+/// the key, arrays and a map for the structure, nothing pre-encoded and
+/// wrapped in bin. Without one, today's two-element envelope,
+/// `propagation_payload`, byte for byte. The caller passes a claim only to
+/// the `lxmf.propagation` destination of the RFed it registered D with:
+/// LXMF ignores a Resource whose envelope is not exactly two elements
+/// (DISTRO-SYNC-PROOF-DESIGN.md §5.4).
+///
+/// Fails when the stamp is not 32 bytes, or when the claim is not one RFed
+/// would accept for this message (`verify_sync_claim`): a claim for another
+/// message, a key that is not the destination's, or a bad signature.
+pub fn sealed_upload(sealed: &[u8], stamp: &[u8], claim: Option<&SyncClaim>, timebase: f64) -> Result<Vec<u8>, String> {
+    if sealed.len() <= DEST_HASH_LEN {
+        return Err(format!("a sealed message is longer than {DEST_HASH_LEN} bytes, this is {}", sealed.len()));
+    }
+    if stamp.len() != STAMP_LEN {
+        return Err(format!("a propagation stamp is {STAMP_LEN} bytes, this is {}", stamp.len()));
+    }
+    let mut lxmf_data = Vec::with_capacity(sealed.len() + stamp.len());
+    lxmf_data.extend_from_slice(sealed);
+    lxmf_data.extend_from_slice(stamp);
+
+    let Some(claim) = claim else {
+        return Ok(propagation_payload(timebase, &lxmf_data));
+    };
+    verify_sync_claim(claim, &sync_transient_id(sealed), sealed)
+        .map_err(|reason| format!("the sync claim is not this message's: {reason}"))?;
+    Ok(encode(&Value::Array(vec![
+        Value::F64(timebase),
+        Value::Array(vec![Value::Binary(lxmf_data)]),
+        Value::Map(vec![(
+            Value::String(DISTRO_SYNC_KEY.into()),
+            Value::Array(vec![claim.to_value()]),
+        )]),
+    ])))
+}
+
+/// The claims of one upload, as RFed reads them (`decode_sync_extension`).
+/// Counts only: nothing here is a string, so nothing a sender writes reaches
+/// a log line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncClaims {
+    /// Well-formed claims with an `id` no other claim shares, at most one per
+    /// message of the upload.
+    pub by_id: HashMap<[u8; DISTRO_SYNC_ID_LEN], SyncClaim>,
+    /// Claims that are not exactly `[bin16, bin64, bin64]`.
+    pub malformed: usize,
+    /// Well-formed claims dropped because another claim has the same `id`
+    /// (all of them, not all but one).
+    pub duplicate: usize,
+    /// 1 when the extension was ignored as a whole, else 0. RFed adds its own
+    /// (a peer's batch that carries one).
+    pub ignored: usize,
+}
+
+/// Read the third element of a client's `lxmf.propagation` upload with the
+/// reader rules of DISTRO-SYNC-PROOF-DESIGN.md §4.1. `extension` is `data[2]`;
+/// `n_messages` is the number of messages in `data[1]` (rule 1, the caller's).
+///
+/// 2. `extension` counts only as a map, and only its str key
+///    `"rfed.distro.sync"` is read; other keys are ignored. A map that has
+///    the key twice is ambiguous and is ignored as a whole.
+/// 3. The claims value is ignored as a whole when it is not an array, is
+///    empty, or has more elements than `n_messages`: then no claim is looked
+///    at, so the work is bounded by the message count.
+/// 4. A claim that is not exactly `[bin16, bin64, bin64]` is ignored and
+///    counted malformed. Claims that share an `id` are all ignored and
+///    counted duplicate.
+/// 5. Nothing is logged here; the counts are for RFed's one summary line per
+///    batch.
+///
+/// Every claim is counted once: `by_id.len() + malformed + duplicate` is the
+/// number of claims unless the extension was ignored as a whole.
+pub fn decode_sync_extension(extension: &Value, n_messages: usize) -> SyncClaims {
+    let mut out = SyncClaims::default();
+    let ignored = |mut out: SyncClaims| {
+        out.ignored = 1;
+        out
+    };
+
+    let Value::Map(entries) = extension else { return ignored(out) };
+    let mut values = entries
+        .iter()
+        .filter(|(k, _)| matches!(k, Value::String(s) if s.as_bytes() == DISTRO_SYNC_KEY.as_bytes()))
+        .map(|(_, v)| v);
+    let (Some(claims), None) = (values.next(), values.next()) else { return ignored(out) };
+    let Value::Array(claims) = claims else { return ignored(out) };
+    if claims.is_empty() || claims.len() > n_messages {
+        return ignored(out);
+    }
+
+    let mut shared: std::collections::HashSet<[u8; DISTRO_SYNC_ID_LEN]> = Default::default();
+    for value in claims {
+        let Some(claim) = SyncClaim::from_value(value) else {
+            out.malformed += 1;
+            continue;
+        };
+        if shared.contains(&claim.id) {
+            out.duplicate += 1;
+        } else if out.by_id.remove(&claim.id).is_some() {
+            out.duplicate += 2;
+            shared.insert(claim.id);
+        } else {
+            out.by_id.insert(claim.id, claim);
+        }
+    }
+    out
+}
+
+/// RFed's check of one claim against the message it names (SPEC §17.13 "At
+/// RFed"), run only for a message whose PN stamp is valid and whose
+/// destination is a distro registered there.
+///
+/// `transient_id` and `lxmf_data` are what `lx_stamper::validate_pn_stamp`
+/// returns for the message: `SHA-256(sealed)` and the stamp-free `sealed`.
+/// The claim is accepted when:
+/// - `id == transient_id[0..16]`;
+/// - the `lxmf.delivery` hash of `distro_pubkey` is `lxmf_data[0..16]`, the
+///   message's destination;
+/// - `sig` is valid for `distro_pubkey` over
+///   `sync_signed_bytes(lxmf_data[0..16], transient_id)`.
+///
+/// The refusal reason is a fixed string, for RFed's verdict line.
+pub fn verify_sync_claim(claim: &SyncClaim, transient_id: &[u8], lxmf_data: &[u8]) -> Result<(), &'static str> {
+    let transient_id: &[u8; TRANSIENT_ID_LEN] = transient_id
+        .try_into()
+        .map_err(|_| "transient id is not 32 bytes")?;
+    let d_hash: &[u8; DEST_HASH_LEN] = lxmf_data
+        .get(..DEST_HASH_LEN)
+        .and_then(|d| d.try_into().ok())
+        .ok_or("message shorter than a destination hash")?;
+    if claim.id[..] != transient_id[..DISTRO_SYNC_ID_LEN] {
+        return Err("id is not the message's");
+    }
+    // The identity hash is the truncated hash of the public key (as
+    // `Identity` computes it), so a key that is not the destination's is
+    // refused before any curve work.
+    let identity_hash = truncated_hash(&claim.distro_pubkey);
+    if Destination::hash(Some(&identity_hash), "lxmf", &["delivery"])[..] != d_hash[..] {
+        return Err("distro key is not the message's destination");
+    }
+    let distro = Identity::from_public_key(&claim.distro_pubkey).map_err(|_| "distro key unusable")?;
+    if !distro.validate(&claim.sig, &sync_signed_bytes(d_hash, transient_id)) {
+        return Err("signature invalid");
+    }
+    Ok(())
 }
 
 /// Decrypt and parse a distro blob delivered on `rfed.delivery` or returned by
@@ -1119,5 +1454,558 @@ mod tests {
     fn short_blobs_are_rejected() {
         let mut distro = identity();
         assert!(unwrap_blob(&mut distro, &[0u8; 8]).is_err());
+    }
+}
+
+/// RFed SPEC §17.13, the distro sync proof (DISTRO-SYNC-PROOF-DESIGN.md
+/// §13.1 "LXMF-rust"). The golden vector, made with the Python reference, is
+/// checked by tests/distro_sync_vectors.rs.
+#[cfg(test)]
+mod sync_proof_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const STAMP: [u8; 32] = [7u8; 32];
+
+    fn identity() -> Identity {
+        Identity::new(true)
+    }
+
+    fn d_hash(distro: &Identity) -> [u8; 16] {
+        delivery_hash(distro).unwrap().try_into().unwrap()
+    }
+
+    /// An LXMF message `signer` packs to `to`'s `lxmf.delivery`, as
+    /// `LXMessage::pack` leaves it: dest | src | signature | payload. With
+    /// `signer` = `to` = D it is a §17.11 sent copy.
+    fn packed_by(signer: &Identity, to: &Identity, content: &[u8]) -> Vec<u8> {
+        let dest = delivery_hash(to).unwrap();
+        let src = delivery_hash(signer).unwrap();
+        let payload = encode(&Value::Array(vec![
+            Value::F64(1_790_000_000.5),
+            Value::Binary(Vec::new()),
+            Value::Binary(content.to_vec()),
+            Value::Map(vec![
+                (Value::Integer(FIELD_CUSTOM_TYPE.into()), Value::String(DISTRO_SENT_TYPE.into())),
+                (Value::Integer(FIELD_CUSTOM_DATA.into()), Value::String("ab".repeat(16).into())),
+                (Value::Integer(FIELD_CUSTOM_META.into()), Value::String("cd".repeat(16).into())),
+            ]),
+        ]));
+        let mut hashed_part = [dest.clone(), src.clone(), payload.clone()].concat();
+        let hash = full_hash(&hashed_part);
+        hashed_part.extend_from_slice(&hash);
+        let sig = signer.sign(&hashed_part);
+        [dest, src, sig, payload].concat()
+    }
+
+    fn packed(distro: &Identity) -> Vec<u8> {
+        packed_by(distro, distro, b"hello R")
+    }
+
+    fn claim_for(distro: &Identity, sealed: &Sealed) -> SyncClaim {
+        SyncClaim::for_sealed(&sealed.sealed, &distro.get_public_key().unwrap(), &sealed.sig).unwrap()
+    }
+
+    fn sealed_message() -> (Identity, Sealed, [u8; 32]) {
+        let distro = identity();
+        let sealed = seal_for_sync(&distro, &packed(&distro)).expect("seal");
+        let transient_id = sync_transient_id(&sealed.sealed);
+        (distro, sealed, transient_id)
+    }
+
+    fn decode_upload(bytes: &[u8]) -> Vec<Value> {
+        match read_value(&mut Cursor::new(bytes)).expect("msgpack") {
+            Value::Array(items) => items,
+            other => panic!("the upload is not an array: {other:?}"),
+        }
+    }
+
+    // ---- the signed bytes ----
+
+    #[test]
+    fn the_signed_bytes_are_tag_version_destination_and_transient_id() {
+        let d = [0x11u8; 16];
+        let t = [0x22u8; 32];
+        let signed = sync_signed_bytes(&d, &t);
+        assert_eq!(signed.len(), 65);
+        assert_eq!(
+            signed[..16].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "726665642e64697374726f2e73796e63",
+            "the 16 ASCII bytes of \"rfed.distro.sync\""
+        );
+        assert_eq!(signed[16], 0x01, "version");
+        assert_eq!(signed[17..33], d, "D_hash");
+        assert_eq!(signed[33..], t, "transient_id");
+        assert_eq!(DISTRO_SYNC_KEY.as_bytes(), DISTRO_SYNC_TAG, "the map key and the tag are the same text");
+    }
+
+    // ---- seal_for_sync ----
+
+    #[test]
+    fn seal_for_sync_encrypts_to_the_distro_once_and_signs_the_sealed_bytes() {
+        let mut distro = identity();
+        let packed = packed(&distro);
+        let sealed = seal_for_sync(&distro, &packed).expect("seal");
+
+        assert_eq!(sealed.sealed[..16], d_hash(&distro), "sealed[0..16] is D_hash");
+        assert_eq!(distro.decrypt(&sealed.sealed[16..]).unwrap(), packed[16..], "D.encrypt(packed[16..])");
+
+        let message = unwrap_blob(&mut distro, &sealed.sealed).unwrap().expect("a blob for this distro");
+        assert!(message.signature_validated, "unwrap_blob validates the copy D signed");
+        assert_eq!(message.content, "hello R");
+        assert_eq!(message.sent_to.as_deref(), Some("ab".repeat(16).as_str()));
+
+        let transient_id = sync_transient_id(&sealed.sealed);
+        assert_eq!(transient_id.to_vec(), full_hash(&sealed.sealed), "transient_id = SHA-256(sealed)");
+        let public = Identity::from_public_key(&distro.get_public_key().unwrap()).unwrap();
+        assert!(
+            public.validate(&sealed.sig, &sync_signed_bytes(&d_hash(&distro), &transient_id)),
+            "the sig validates with D's public key alone"
+        );
+        assert_eq!(verify_sync_claim(&claim_for(&distro, &sealed), &transient_id, &sealed.sealed), Ok(()));
+    }
+
+    #[test]
+    fn seal_for_sync_refuses_a_public_only_identity_without_panicking() {
+        let distro = identity();
+        let public = Identity::from_public_key(&distro.get_public_key().unwrap()).unwrap();
+        let err = seal_for_sync(&public, &packed(&distro)).unwrap_err();
+        assert!(err.contains("no private key"), "{err}");
+    }
+
+    #[test]
+    fn seal_for_sync_refuses_a_message_not_addressed_to_the_distro() {
+        let distro = identity();
+        let other = identity();
+
+        let to_other = packed_by(&distro, &other, b"hello");
+        let err = seal_for_sync(&distro, &to_other).unwrap_err();
+        assert!(err.contains("not addressed to the distro"), "{err}");
+
+        let err = seal_for_sync(&other, &packed(&distro)).unwrap_err();
+        assert!(err.contains("not addressed to the distro"), "a wrong D: {err}");
+
+        let packed = packed(&distro);
+        assert!(seal_for_sync(&distro, &packed[..DEST_HASH_LEN + LXMF_HEADER_LEN]).is_err(), "no payload");
+        assert!(seal_for_sync(&distro, &[]).is_err());
+    }
+
+    #[test]
+    fn every_upload_of_one_sealed_entry_carries_the_same_message() {
+        // Each seal encrypts afresh, so the device seals once, when the entry
+        // is owed, and stores the result: then two uploads differ only in the
+        // stamp and the timebase, and RFed holds the second as the first.
+        let distro = identity();
+        let packed = packed(&distro);
+        let a = seal_for_sync(&distro, &packed).unwrap();
+        let b = seal_for_sync(&distro, &packed).unwrap();
+        assert_ne!(a.sealed, b.sealed, "the encryption is random");
+
+        let claim = claim_for(&distro, &a);
+        for (stamp, timebase) in [([1u8; 32], 1.0), ([2u8; 32], 2.0)] {
+            let items = decode_upload(&sealed_upload(&a.sealed, &stamp, Some(&claim), timebase).unwrap());
+            assert_eq!(items[0], Value::F64(timebase));
+            assert_eq!(items[1], Value::Array(vec![Value::Binary([a.sealed.clone(), stamp.to_vec()].concat())]));
+            let claims = decode_sync_extension(&items[2], 1);
+            assert_eq!(claims.by_id.get(&claim.id), Some(&claim));
+            assert_eq!(claim.id[..], sync_transient_id(&a.sealed)[..16]);
+        }
+    }
+
+    // ---- sealed_upload and the two-element envelope ----
+
+    #[test]
+    fn sealed_upload_with_a_claim_is_three_native_msgpack_elements() {
+        let (distro, sealed, _) = sealed_message();
+        let claim = claim_for(&distro, &sealed);
+        let bytes = sealed_upload(&sealed.sealed, &STAMP, Some(&claim), 1_790_000_001.25).unwrap();
+        assert_eq!(bytes[0], 0x93, "fixarray(3)");
+
+        // The extension is the last 170 bytes (one claim is 151): a fixmap(1)
+        // with the fixstr(16) key and a fixarray(1) of one fixarray(3) of bin,
+        // nothing wrapped in bin.
+        let mut extension = vec![0x81, 0xb0];
+        extension.extend_from_slice(b"rfed.distro.sync");
+        extension.extend_from_slice(&[0x91, 0x93, 0xc4, 0x10]);
+        extension.extend_from_slice(&claim.id);
+        extension.extend_from_slice(&[0xc4, 0x40]);
+        extension.extend_from_slice(&claim.distro_pubkey);
+        extension.extend_from_slice(&[0xc4, 0x40]);
+        extension.extend_from_slice(&claim.sig);
+        assert_eq!(extension.len(), 170);
+        assert_eq!(encode(&claim.to_value()).len(), 151);
+        assert_eq!(bytes[bytes.len() - 170..], extension[..]);
+
+        // Before it, today's envelope under a fixarray(3) header.
+        let legacy = sealed_upload(&sealed.sealed, &STAMP, None, 1_790_000_001.25).unwrap();
+        assert_eq!(legacy[0], 0x92);
+        assert_eq!(bytes[1..bytes.len() - 170], legacy[1..]);
+
+        let items = decode_upload(&bytes);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[1], Value::Array(m) if m.len() == 1 && matches!(m[0], Value::Binary(_))));
+        assert!(matches!(items[2], Value::Map(_)), "data[2] is a native map, never bin");
+        let claims = decode_sync_extension(&items[2], 1);
+        assert_eq!(claims.by_id.get(&claim.id), Some(&claim));
+        assert_eq!((claims.malformed, claims.duplicate, claims.ignored), (0, 0, 0));
+    }
+
+    /// The native bridges' hand-written builder as it stood (retichat-jni and
+    /// retichat-ffi `distro_outbox::propagation_payload`), the reference the
+    /// rmpv builder must match byte for byte.
+    fn bridges_propagation_payload(timestamp: f64, lxmf_data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(lxmf_data.len() + 16);
+        out.push(0x92);
+        out.push(0xcb);
+        out.extend_from_slice(&timestamp.to_bits().to_be_bytes());
+        out.push(0x91);
+        let len = lxmf_data.len();
+        if len <= 0xff {
+            out.extend_from_slice(&[0xc4, len as u8]);
+        } else if len <= 0xffff {
+            out.push(0xc5);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            out.push(0xc6);
+            out.extend_from_slice(&(len as u32).to_be_bytes());
+        }
+        out.extend_from_slice(lxmf_data);
+        out
+    }
+
+    #[test]
+    fn the_two_element_envelope_is_byte_for_byte_the_bridges_one() {
+        for len in [0usize, 1, 31, 255, 256, 431, 65_535, 65_536, 70_000] {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            for timebase in [0.0, 1_790_000_001.25, -1.5, f64::MAX, f64::MIN_POSITIVE] {
+                assert_eq!(
+                    propagation_payload(timebase, &data),
+                    bridges_propagation_payload(timebase, &data),
+                    "{len} bytes, timebase {timebase}"
+                );
+            }
+        }
+        let (_, sealed, _) = sealed_message();
+        assert_eq!(
+            sealed_upload(&sealed.sealed, &STAMP, None, 5.0).unwrap(),
+            bridges_propagation_payload(5.0, &[sealed.sealed.clone(), STAMP.to_vec()].concat()),
+            "without a claim, sealed_upload is today's envelope over sealed | stamp"
+        );
+    }
+
+    #[test]
+    fn sealed_upload_refuses_a_claim_rfed_would_refuse_and_a_bad_stamp() {
+        let (distro, a, _) = sealed_message();
+        let b = seal_for_sync(&distro, &packed(&distro)).unwrap();
+        let good = claim_for(&distro, &a);
+
+        let err = sealed_upload(&a.sealed, &STAMP, Some(&claim_for(&distro, &b)), 1.0).unwrap_err();
+        assert!(err.contains("id is not the message's"), "another sealing's claim: {err}");
+
+        let other = identity();
+        let wrong_key = SyncClaim { distro_pubkey: other.get_public_key().unwrap().try_into().unwrap(), ..good.clone() };
+        assert!(sealed_upload(&a.sealed, &STAMP, Some(&wrong_key), 1.0).is_err());
+
+        let wrong_sig = SyncClaim { sig: b.sig, ..good.clone() };
+        assert!(sealed_upload(&a.sealed, &STAMP, Some(&wrong_sig), 1.0).is_err());
+
+        for stamp in [&[0u8; 31][..], &[0u8; 33][..], &[][..]] {
+            assert!(sealed_upload(&a.sealed, stamp, None, 1.0).is_err(), "{} byte stamp", stamp.len());
+            assert!(sealed_upload(&a.sealed, stamp, Some(&good), 1.0).is_err(), "{} byte stamp", stamp.len());
+        }
+        assert!(sealed_upload(&a.sealed[..16], &STAMP, None, 1.0).is_err(), "no ciphertext");
+        assert!(sealed_upload(&a.sealed, &STAMP, Some(&good), 1.0).is_ok());
+    }
+
+    // ---- verify_sync_claim ----
+
+    #[test]
+    fn verify_sync_claim_accepts_only_d_signing_this_message() {
+        let (distro, sealed, transient_id) = sealed_message();
+        let good = claim_for(&distro, &sealed);
+        let verify = |claim: &SyncClaim| verify_sync_claim(claim, &transient_id, &sealed.sealed);
+        assert_eq!(verify(&good), Ok(()));
+
+        let d = d_hash(&distro);
+        let signed = sync_signed_bytes(&d, &transient_id);
+        let sig = |s: Vec<u8>| -> [u8; 64] { s.try_into().unwrap() };
+
+        // Another identity's key, signing correctly with its own key.
+        let other = identity();
+        let other_key = SyncClaim {
+            distro_pubkey: other.get_public_key().unwrap().try_into().unwrap(),
+            sig: sig(other.sign(&signed)),
+            ..good.clone()
+        };
+        assert_eq!(verify(&other_key), Err("distro key is not the message's destination"));
+
+        // D's signature over another transient id.
+        let over_other = SyncClaim { sig: sig(distro.sign(&sync_signed_bytes(&d, &[0x5a; 32]))), ..good.clone() };
+        assert_eq!(verify(&over_other), Err("signature invalid"));
+
+        // D's signature without the tag, without the version, or another version.
+        let no_tag = signed[16..].to_vec();
+        let no_version = [&signed[..16], &signed[17..]].concat();
+        let mut version_2 = signed;
+        version_2[16] = 0x02;
+        for (name, bytes) in [("no tag", no_tag), ("no version", no_version), ("version 2", version_2.to_vec())] {
+            let claim = SyncClaim { sig: sig(distro.sign(&bytes)), ..good.clone() };
+            assert_eq!(verify(&claim), Err("signature invalid"), "{name}");
+        }
+
+        // A device key's signature over the right bytes, naming D's key.
+        let device = identity();
+        assert_eq!(verify(&SyncClaim { sig: sig(device.sign(&signed)), ..good.clone() }), Err("signature invalid"));
+
+        // D's register signature (over a device's public key) and list
+        // signature (over D's identity hash).
+        let register = sig(distro.sign(&device.get_public_key().unwrap()));
+        assert_eq!(verify(&SyncClaim { sig: register, ..good.clone() }), Err("signature invalid"));
+        let list = sig(distro.sign(distro.hash.as_ref().unwrap()));
+        assert_eq!(verify(&SyncClaim { sig: list, ..good.clone() }), Err("signature invalid"));
+
+        // An id that is not transient_id[0..16].
+        let mut id = good.id;
+        id[15] ^= 1;
+        assert_eq!(verify(&SyncClaim { id, ..good.clone() }), Err("id is not the message's"));
+
+        // The good claim against another sealing of the same packed message.
+        let again = seal_for_sync(&distro, &packed(&distro)).unwrap();
+        assert_eq!(
+            verify_sync_claim(&good, &sync_transient_id(&again.sealed), &again.sealed),
+            Err("id is not the message's")
+        );
+
+        // A key that is no key.
+        assert!(verify(&SyncClaim { distro_pubkey: [0xff; 64], ..good.clone() }).is_err());
+
+        // Inputs of the wrong length.
+        assert_eq!(verify_sync_claim(&good, &transient_id[..31], &sealed.sealed), Err("transient id is not 32 bytes"));
+        assert_eq!(
+            verify_sync_claim(&good, &transient_id, &sealed.sealed[..15]),
+            Err("message shorter than a destination hash")
+        );
+    }
+
+    #[test]
+    fn fields_of_63_or_65_bytes_never_become_a_claim() {
+        // A claim's fields are fixed-size, so verify_sync_claim never sees one
+        // of the wrong length: the reader counts it malformed, and the
+        // sending side refuses to build it.
+        let (distro, sealed, _) = sealed_message();
+        let key = distro.get_public_key().unwrap();
+        for n in [63usize, 65] {
+            let key_n = if n == 63 { key[..63].to_vec() } else { [key.clone(), vec![0]].concat() };
+            assert!(SyncClaim::for_sealed(&sealed.sealed, &key_n, &sealed.sig).is_err(), "{n} byte key");
+            let sig_n = if n == 63 { sealed.sig[..63].to_vec() } else { [sealed.sig.to_vec(), vec![0]].concat() };
+            assert!(SyncClaim::for_sealed(&sealed.sealed, &key, &sig_n).is_err(), "{n} byte sig");
+
+            let bin = |len: usize| Value::Binary(vec![1u8; len]);
+            let claims = Value::Array(vec![
+                Value::Array(vec![bin(16), bin(n), bin(64)]),
+                Value::Array(vec![bin(16), bin(64), bin(n)]),
+            ]);
+            let got = decode_sync_extension(&extension(claims), 2);
+            assert_eq!((got.by_id.len(), got.malformed), (0, 2), "{n} byte fields");
+        }
+    }
+
+    // ---- decode_sync_extension ----
+
+    fn extension(claims: Value) -> Value {
+        Value::Map(vec![(Value::String(DISTRO_SYNC_KEY.into()), claims)])
+    }
+
+    fn claim_value(id: u8) -> Value {
+        Value::Array(vec![
+            Value::Binary(vec![id; 16]),
+            Value::Binary(vec![1u8; 64]),
+            Value::Binary(vec![2u8; 64]),
+        ])
+    }
+
+    fn claim_with(id: u8) -> SyncClaim {
+        SyncClaim { id: [id; 16], distro_pubkey: [1u8; 64], sig: [2u8; 64] }
+    }
+
+    fn ignored_whole() -> SyncClaims {
+        SyncClaims { ignored: 1, ..Default::default() }
+    }
+
+    #[test]
+    fn an_extension_that_is_not_a_map_with_the_key_once_is_ignored_as_a_whole() {
+        let one = Value::Array(vec![claim_value(1)]);
+        let key = Value::String(DISTRO_SYNC_KEY.into());
+        let cases = [
+            ("nil", Value::Nil),
+            ("an array", one.clone()),
+            ("the map pre-encoded and wrapped in bin", Value::Binary(encode(&extension(one.clone())))),
+            ("a str", Value::String(DISTRO_SYNC_KEY.into())),
+            ("an integer", Value::Integer(1.into())),
+            ("an empty map", Value::Map(Vec::new())),
+            ("a map without the key", Value::Map(vec![(Value::String("rfed.distro.other".into()), one.clone())])),
+            ("the key as bin", Value::Map(vec![(Value::Binary(DISTRO_SYNC_TAG.to_vec()), one.clone())])),
+            ("the key twice", Value::Map(vec![(key.clone(), one.clone()), (key.clone(), one.clone())])),
+        ];
+        for (name, value) in cases {
+            assert_eq!(decode_sync_extension(&value, 4), ignored_whole(), "{name}");
+        }
+    }
+
+    #[test]
+    fn claims_that_are_not_an_array_of_one_to_n_are_ignored_as_a_whole() {
+        let cases = [
+            ("a map", Value::Map(vec![(Value::Integer(0.into()), claim_value(1))]), 3),
+            ("bin", Value::Binary(encode(&Value::Array(vec![claim_value(1)]))), 3),
+            ("nil", Value::Nil, 3),
+            ("an empty array", Value::Array(Vec::new()), 3),
+            ("more claims than messages", Value::Array(vec![claim_value(1), claim_value(2)]), 1),
+            ("a claim and no messages", Value::Array(vec![claim_value(1)]), 0),
+        ];
+        for (name, claims, n) in cases {
+            assert_eq!(decode_sync_extension(&extension(claims), n), ignored_whole(), "{name}");
+        }
+        // A claim not wrapped in the claims array is an array of three
+        // elements, none of them a claim.
+        let bare = decode_sync_extension(&extension(claim_value(1)), 3);
+        assert_eq!((bare.by_id.len(), bare.malformed, bare.duplicate, bare.ignored), (0, 3, 0, 0));
+    }
+
+    #[test]
+    fn claims_are_bounded_by_the_message_count() {
+        let claims = |m: u8| Value::Array((0..m).map(claim_value).collect());
+
+        let at_n = decode_sync_extension(&extension(claims(5)), 5);
+        assert_eq!(at_n.by_id.len(), 5, "M = N is read");
+        assert_eq!((at_n.malformed, at_n.duplicate, at_n.ignored), (0, 0, 0));
+        assert_eq!(decode_sync_extension(&extension(claims(4)), 5).by_id.len(), 4, "M < N is read");
+        assert_eq!(decode_sync_extension(&extension(claims(6)), 5), ignored_whole(), "M = N + 1 is not");
+
+        // 10^5 junk claims for one message: no claim is looked at, one count.
+        let junk = Value::Array(vec![Value::Nil; 100_000]);
+        assert_eq!(decode_sync_extension(&extension(junk.clone()), 1), ignored_whole());
+        // Against as many messages, each is counted and none returned.
+        let got = decode_sync_extension(&extension(junk), 100_000);
+        assert_eq!((got.by_id.len(), got.malformed, got.duplicate, got.ignored), (0, 100_000, 0, 0));
+    }
+
+    #[test]
+    fn malformed_claims_are_counted_and_skipped() {
+        let bin = |n: usize| Value::Binary(vec![3u8; n]);
+        let malformed = vec![
+            Value::Nil,
+            Value::Binary(encode(&claim_value(8))),
+            Value::Array(Vec::new()),
+            Value::Array(vec![bin(16), bin(64)]),
+            Value::Array(vec![bin(16), bin(64), bin(64), bin(64)]),
+            Value::Array(vec![bin(15), bin(64), bin(64)]),
+            Value::Array(vec![bin(17), bin(64), bin(64)]),
+            Value::Array(vec![bin(16), bin(63), bin(64)]),
+            Value::Array(vec![bin(16), bin(65), bin(64)]),
+            Value::Array(vec![bin(16), bin(64), bin(63)]),
+            Value::Array(vec![bin(16), bin(64), bin(65)]),
+            Value::Array(vec![Value::String("0123456789abcdef".into()), bin(64), bin(64)]),
+            Value::Array(vec![bin(16), Value::Array(vec![Value::Integer(1.into()); 64]), bin(64)]),
+            Value::Array(vec![bin(16), bin(64), Value::Nil]),
+            Value::Map(vec![(bin(16), bin(64))]),
+        ];
+        let mut claims = malformed.clone();
+        claims.insert(3, claim_value(9));
+        let n = claims.len();
+        let got = decode_sync_extension(&extension(Value::Array(claims)), n);
+        assert_eq!(got.malformed, malformed.len());
+        assert_eq!((got.duplicate, got.ignored), (0, 0));
+        assert_eq!(got.by_id.len(), 1);
+        assert_eq!(got.by_id[&[9u8; 16]], claim_with(9));
+    }
+
+    #[test]
+    fn claims_that_share_an_id_are_all_dropped() {
+        let mut other_key = claim_with(2);
+        other_key.distro_pubkey = [5u8; 64];
+        let claims = vec![
+            claim_value(1),
+            claim_value(2),
+            claim_value(1),
+            claim_value(3),
+            other_key.to_value(),
+            claim_value(2),
+            // A malformed claim with id 3 is not a claim, so it shares nothing.
+            Value::Array(vec![Value::Binary(vec![3u8; 16]), Value::Binary(vec![1u8; 63]), Value::Binary(vec![2u8; 64])]),
+        ];
+        let n = claims.len();
+        let got = decode_sync_extension(&extension(Value::Array(claims)), n);
+        assert_eq!(got.by_id.keys().copied().collect::<HashSet<_>>(), HashSet::from([[3u8; 16]]));
+        assert_eq!(got.duplicate, 5, "both of id 1 and all three of id 2");
+        assert_eq!(got.malformed, 1);
+        assert_eq!(got.ignored, 0);
+        assert_eq!(got.by_id.len() + got.malformed + got.duplicate, n, "every claim is counted once");
+    }
+
+    #[test]
+    fn other_keys_and_their_order_do_not_matter() {
+        let value = Value::Map(vec![
+            (Value::String("rfed.other".into()), Value::Nil),
+            (Value::Integer(1.into()), Value::Array(vec![claim_value(6)])),
+            (Value::String(DISTRO_SYNC_KEY.into()), Value::Array(vec![claim_value(4)])),
+            (Value::Binary(b"rfed.distro.sync".to_vec()), Value::Array(vec![claim_value(5)])),
+        ]);
+        let got = decode_sync_extension(&value, 1);
+        assert_eq!(got.by_id.len(), 1);
+        assert_eq!(got.by_id[&[4u8; 16]], claim_with(4));
+        assert_eq!((got.malformed, got.duplicate, got.ignored), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_reader_returns_claims_and_counts_and_no_strings() {
+        // Pins the shapes: no field carries text a sender wrote, so nothing a
+        // sender puts in the extension can reach a log line.
+        let SyncClaims { by_id, malformed, duplicate, ignored } = decode_sync_extension(&Value::Nil, 1);
+        let _: (HashMap<[u8; 16], SyncClaim>, usize, usize, usize) = (by_id, malformed, duplicate, ignored);
+        let SyncClaim { id, distro_pubkey, sig } = claim_with(1);
+        let _: ([u8; 16], [u8; 64], [u8; 64]) = (id, distro_pubkey, sig);
+    }
+
+    // ---- RFed's path, end to end ----
+
+    #[test]
+    fn rfed_reads_a_proven_upload_and_refuses_a_strangers_claim() {
+        // As RFed will: decode the batch, take data[2] as the extension,
+        // validate the stamp, then look the claim up by transient_id[0..16].
+        let rfed_verdict = |upload: &[u8]| -> Result<(), &'static str> {
+            let items = decode_upload(upload);
+            let Value::Array(messages) = &items[1] else { panic!("data[1]") };
+            let claims = decode_sync_extension(&items[2], messages.len());
+            let Value::Binary(lxmf_data) = &messages[0] else { panic!("bin") };
+            let (transient_id, lxm_data, _, _) =
+                crate::lx_stamper::validate_pn_stamp(lxmf_data, 0).expect("stamp valid at cost 0");
+            let id: [u8; 16] = transient_id[..16].try_into().unwrap();
+            let claim = claims.by_id.get(&id).ok_or("no claim")?;
+            verify_sync_claim(claim, &transient_id, &lxm_data)
+        };
+
+        let (distro, sealed, _) = sealed_message();
+        let own = sealed_upload(&sealed.sealed, &STAMP, Some(&claim_for(&distro, &sealed)), 1.0).unwrap();
+        assert_eq!(rfed_verdict(&own), Ok(()));
+
+        // A stranger's message to D, with a claim the stranger signed: it
+        // cannot be built with sealed_upload, so it is written by hand.
+        let stranger = identity();
+        let packed = packed_by(&stranger, &distro, b"from a stranger");
+        let mut theirs = d_hash(&distro).to_vec();
+        theirs.extend_from_slice(&distro.encrypt(&packed[16..]).unwrap());
+        let transient_id = sync_transient_id(&theirs);
+        let forged = SyncClaim {
+            id: transient_id[..16].try_into().unwrap(),
+            distro_pubkey: stranger.get_public_key().unwrap().try_into().unwrap(),
+            sig: stranger.sign(&sync_signed_bytes(&d_hash(&stranger), &transient_id)).try_into().unwrap(),
+        };
+        let upload = encode(&Value::Array(vec![
+            Value::F64(1.0),
+            Value::Array(vec![Value::Binary([theirs.clone(), STAMP.to_vec()].concat())]),
+            extension(Value::Array(vec![forged.to_value()])),
+        ]));
+        assert_eq!(rfed_verdict(&upload), Err("distro key is not the message's destination"));
+        assert!(sealed_upload(&theirs, &STAMP, Some(&forged), 1.0).is_err());
     }
 }
