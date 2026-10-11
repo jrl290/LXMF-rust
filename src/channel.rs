@@ -280,9 +280,9 @@ impl UnpackedPost {
 ///
 /// Rejects, before any key is remembered, a post whose prelude key does not
 /// produce its claimed source hash (DISPLAY_NAMES.md §2.3) and a post whose
-/// LXMF payload cannot be read or repeats a key (refused whole, RFed SPEC
-/// §17.14 "Repeated keys": the error starts with
-/// `msgpack_keys::REFUSED_WHOLE`). A post that passes has its sender key
+/// LXMF payload cannot be read or Python LXMF refuses it whole (RFed SPEC
+/// §17.14 "Repeated keys", "Unhashable keys", "Nesting": the error starts
+/// with `msgpack_keys::REFUSED_WHOLE`). A post that passes has its sender key
 /// remembered under the source hash, so the LXMF signature is checked
 /// against it.
 pub fn unpack(channel: &str, data: &[u8]) -> Result<UnpackedPost, String> {
@@ -316,14 +316,14 @@ pub fn unpack(channel: &str, data: &[u8]) -> Result<UnpackedPost, String> {
 		));
 	}
 	// Nothing of a post that is not kept is remembered (as on the web): a
-	// payload that is not an LXMF payload is rejected here, and one that
-	// repeats a key is refused whole (RFed SPEC §17.14 "Repeated keys"; logged
-	// once, there, and its error starts with REFUSED_WHOLE), before the key.
-	let payload = rmpv::decode::read_value(&mut &lxmf_tail[HASH_LEN + LXMessage::SIGNATURE_LENGTH..])
-		.map_err(|e| format!("channel: msgpack decode error: {e}"))?;
-	crate::msgpack_keys::refuse_repeated_keys(
-		&payload,
+	// payload that is not an LXMF payload is rejected here, and one Python
+	// LXMF refuses whole (RFed SPEC §17.14 "Repeated keys", "Unhashable keys",
+	// "Nesting"; logged once, there, and its error starts with REFUSED_WHOLE)
+	// is refused, before the key.
+	let payload = crate::msgpack_keys::read_refusing(
+		&lxmf_tail[HASH_LEN + LXMessage::SIGNATURE_LENGTH..],
 		&format!("channel post from {} on #{channel}", reticulum_rust::hexrep(claimed_source, false)),
+		|e| format!("channel: msgpack decode error: {e}"),
 	)?;
 	if !payload.is_array() {
 		return Err("channel: LXMF payload is not an array".into());

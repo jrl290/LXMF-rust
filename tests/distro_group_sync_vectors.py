@@ -33,6 +33,35 @@ message. Every client does the same, on the direct path and on the distro path.
 takes for one key (or not); the script asserts that the reference refuses each
 refused message, and refuses or reads each key_equality message as it says. No
 other vector repeats a key, which the script also asserts.
+
+Unhashable keys (RFed SPEC §17.14, decided 2026-10-11: parity). umsgpack
+refuses a map used as a key, and an array key that holds a map at any depth
+(it turns the array into a tuple, which Python cannot hash then), with
+UnhashableKeyException, in any map at any depth; LXMF.py drops the message
+whole. Those messages are `refused` too, each with the `reason` the reference
+gives: the first refusal in the order umsgpack reads the bytes (a key is read
+whole before it is judged; an array key's value is read before the key is
+hashed). An array key that holds no map is read (`key_equality`).
+
+Nesting (RFed SPEC §17.14, decided 2026-10-11: one limit, Python's measured
+delivery-path depth). umsgpack reads a payload recursively, two Python frames
+for each level, so a payload nested deep enough raises RecursionError, and
+LXMRouter.lxmf_delivery drops the message ("Could not assemble LXMF message
+from received data"). Where depends on how many frames sit under the unpack.
+Measured with tests/delivery_nesting_probe.py, real LXMF over local TCP
+between three processes (CPython 3.13.5, RNS 1.5.2, LXMF 1.1.1, recursion
+limit 1000), 2026-10-11:
+- propagated (propagation node -> message_get_response -> lxmf_propagation ->
+  lxmf_delivery), the unpack the 10th frame of its thread: a field reads 492
+  nested arrays or maps whose innermost is empty and 491 whose innermost holds
+  anything (a nil, an int, a str, a bin), and refuses one more. That is exactly
+  "no value deeper than 493", the payload at depth 0, its fields map at 1, a
+  field's value at 2: the one limit every client follows (NESTING_MAX_DEPTH).
+- direct over a link as a Resource (assemble -> delivery_resource_concluded ->
+  lxmf_delivery), the 7th frame: 494, 493 or 492 by what the innermost holds.
+The script checks every `nesting` vector on DELIVERY_FRAMES, the propagated
+path's measured stack, rebuilt in a fresh thread (on_delivery_stack), and
+asserts the reference's verdict for each.
 """
 
 import base64
@@ -40,6 +69,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import unicodedata
 
 import RNS
@@ -71,6 +101,18 @@ DISTRO_GROUP_TYPE = "rfed.distro.group"
 DISTRO_MARKERS = ["rfed.distro.transfer", "rfed.distro.sent", "rfed.distro.channel", "rfed.distro.group"]
 MAX_AT_MS = 2**53 - 1
 LEFT_MAX = 32
+
+# Nesting (RFed SPEC §17.14): no value of a payload deeper than this, the
+# payload at depth 0, the fields map at 1, a field's value at 2; so a field
+# holds at most NESTING_MAX_DEPTH - 1 nested arrays or maps, the innermost
+# empty. Python's propagated delivery path, measured (see the module text).
+NESTING_MAX_DEPTH = 493
+# The frames of the thread that unpacks a propagated message, the unpack's
+# own included: _bootstrap, _bootstrap_inner, run, job (RNS Link's response
+# thread), handle_response, response_received, message_get_response,
+# lxmf_propagation, lxmf_delivery, unpack_from_bytes. Measured by
+# tests/delivery_nesting_probe.py.
+DELIVERY_FRAMES = 10
 
 OPS = {
     # op: (LXMF timestamp, at_ms)
@@ -289,33 +331,89 @@ class Raw(bytes):
 def raw_map(pairs):
     """The msgpack map of `pairs` in their order, a key repeated as often as
     it is given (a dict holds each key once): a fixmap header, then each key
-    and value as umsgpack packs it, or as given when Raw."""
+    and value as umsgpack packs it, or as given when Raw (a key too: a map or
+    an array that holds a map, which no dict can have as a key)."""
     assert len(pairs) < 16
-    return Raw(bytes([0x80 | len(pairs)]) + b"".join(
-        msgpack.packb(k) + (v if isinstance(v, Raw) else msgpack.packb(v)) for k, v in pairs))
+    def packed(x):
+        return x if isinstance(x, Raw) else msgpack.packb(x)
+    return Raw(bytes([0x80 | len(pairs)]) + b"".join(packed(k) + packed(v) for k, v in pairs))
+
+
+def nested(levels, innermost=b"\x90", kind="array"):
+    """`levels` arrays nested one in the next (a fixarray of one each; maps of
+    one entry {0: ...} when kind is "map"), the innermost given as msgpack
+    bytes: b"\x90" an empty array, b"\x80" an empty map, or an array or map
+    holding one value. Built as bytes: umsgpack's own packer recurses too."""
+    assert levels >= 1
+    head = b"\x81\x00" if kind == "map" else b"\x91"
+    return Raw(head * (levels - 1) + innermost)
 
 
 def reference_refuses(fields_bytes):
-    """Whether the reference refuses these bytes: RNS's umsgpack raises
-    DuplicateKeyException on a map, at any depth, that repeats a key, so
-    LXMF.py (LXMessage.unpack_from_bytes) drops such a message whole."""
+    """Whether the reference refuses these bytes for a key: RNS's umsgpack
+    raises DuplicateKeyException on a map, at any depth, that repeats a key,
+    and UnhashableKeyException on a map key or an array key that holds a map,
+    so LXMF.py (LXMessage.unpack_from_bytes) drops such a message whole. Read
+    here on this script's own stack: never used for nesting."""
     try:
         msgpack.unpackb(fields_bytes)
-    except msgpack.DuplicateKeyException:
+    except (msgpack.DuplicateKeyException, msgpack.UnhashableKeyException):
         return True
     return False
+
+
+def on_delivery_stack(fn, *args):
+    """fn(*args) run as the reference's delivery path runs its unpack: in a
+    fresh thread whose frames, fn's own included, are DELIVERY_FRAMES deep
+    when fn starts. Returns ("ok", value) or ("raised", exception)."""
+    out = {}
+
+    def at(levels_left):
+        if levels_left > 0:
+            return at(levels_left - 1)
+        frame, depth = sys._getframe(), 0
+        while frame is not None:
+            frame, depth = frame.f_back, depth + 1
+        # This frame is one short of DELIVERY_FRAMES; fn's is the last.
+        assert depth == DELIVERY_FRAMES - 1, depth
+        return fn(*args)
+
+    def run():
+        # _bootstrap, _bootstrap_inner and Thread.run are 3 frames; run is the
+        # 4th and each `at` one more.
+        try:
+            out["ok"] = at(DELIVERY_FRAMES - 1 - 4 - 1)
+        except BaseException as e:  # noqa: BLE001 (the verdict is the exception)
+            out["raised"] = e
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    return ("ok", out["ok"]) if "ok" in out else ("raised", out["raised"])
+
+
+def reference_verdict(packed):
+    """The reference's verdict on a packed message, its own
+    LXMessage.unpack_from_bytes on the delivery path's stack: None when it
+    reads it, else why it refuses it whole (LXMRouter.lxmf_delivery then drops
+    it: "Could not assemble LXMF message from received data"): "repeated_key"
+    (DuplicateKeyException), "unhashable_key" (UnhashableKeyException) or
+    "too_deep" (RecursionError). Any other exception is an error here."""
+    outcome, value = on_delivery_stack(LXMessage.unpack_from_bytes, packed)
+    if outcome == "ok":
+        return None
+    if isinstance(value, msgpack.DuplicateKeyException):
+        return "repeated_key"
+    if isinstance(value, msgpack.UnhashableKeyException):
+        return "unhashable_key"
+    if isinstance(value, RecursionError):
+        return "too_deep"
+    raise value
 
 
 def reference_refuses_message(packed):
-    """Whether the reference's own LXMessage.unpack_from_bytes refuses the
-    packed message for a repeated key (LXMRouter.lxmf_delivery then drops it:
-    "Could not assemble LXMF message from received data"). Any other outcome
-    but reading it is an error here."""
-    try:
-        LXMessage.unpack_from_bytes(packed)
-    except msgpack.DuplicateKeyException:
-        return True
-    return False
+    """Whether the reference refuses the packed message whole (any reason)."""
+    return reference_verdict(packed) is not None
 
 
 # --- A second reading of §11.1 rule 4, to check the vectors against --------
@@ -909,14 +1007,58 @@ def main():
          "a group post whose commands field 0x09 is an array holding one map that repeats its key 1", m, m_hash,
          raw_map([(0xA0, GROUP_ID), (0xA4, m_hex), (0x09, Raw(b"\x91" + raw_map([(1, b"a"), (1, b"b")])))])),
     ]
+    refused_specs = [spec + ("repeated_key",) for spec in refused_specs]
+
+    # 8b. Unhashable keys (RFed SPEC §17.14; decided 2026-10-11: parity): a
+    #     map used as a key, or an array key that holds a map at any depth, is
+    #     refused whole as the reference refuses it (UnhashableKeyException).
+    #     `reason` is the reference's own, the first refusal in the order
+    #     umsgpack reads: a key is read whole before it is judged (a map key
+    #     that repeats a key is refused for the repeat), a map key is refused
+    #     before its value is read, and an array key's value is read before the
+    #     key is hashed (so a repeat in that value is the reason).
+    empty_map, empty_array = Raw(b"\x80"), Raw(b"\x90")
+    array_holding_map = Raw(b"\x91\x80")
+    refused_specs += [
+        ("map_key_beside_group_id", "a fields map whose key is an empty map, beside a group id", m, m_hash,
+         raw_map([(0xA0, GROUP_ID), (empty_map, 0)]), "unhashable_key"),
+        ("map_key_not_empty", "a plain message whose fields map has the key {1: 2}", m, m_hash,
+         raw_map([(Raw(msgpack.packb({1: 2})), "x")]), "unhashable_key"),
+        ("array_key_holding_a_map", "an accept whose fields map has the key [{}] beside its group entries", m, m_hash,
+         raw_map([(0xA0, GROUP_ID), (0xA3, "accept"), (array_holding_map, 0)]), "unhashable_key"),
+        ("array_key_holding_a_map_deeper", "a fields key [1, [[{1: 2}]]]: a map at any depth of an array key", m, m_hash,
+         raw_map([(Raw(b"\x92\x01\x91\x91\x81\x01\x02"), 0)]), "unhashable_key"),
+        ("retichat_field_map_key",
+         "well-formed group entries in 0xD1 beside its key 10 (no reader knows it), a map whose key is an empty map", m, m_hash,
+         raw_map([(FIELD_RETICHAT, raw_map([(1, GROUP_ID), (4, "accept"), (10, raw_map([(empty_map, 0)]))]))]),
+         "unhashable_key"),
+        ("non_group_field_nested_map_key",
+         "a group post whose commands field 0x09 is an array holding one map whose key is the map {1: 2}", m, m_hash,
+         raw_map([(0xA0, GROUP_ID), (0xA4, m_hex), (0x09, Raw(b"\x91" + raw_map([(Raw(b"\x81\x01\x02"), 1)])))]),
+         "unhashable_key"),
+        ("g_leave_map_key", "a leave G from D whose fields also hold an entry keyed by an empty map", d, d_hash,
+         raw_map([(FIELD_TICKET, b""), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE), (FIELD_CUSTOM_DATA, leave_arr),
+                  (FIELD_CUSTOM_META, DEVICE), (empty_map, 0)]), "unhashable_key"),
+        ("map_key_that_repeats_a_key", "a fields key that is a map repeating its key 0: the key is read, and refused, first",
+         m, m_hash, raw_map([(raw_map([(0, 1), (0, 2)]), 0)]), "repeated_key"),
+        ("map_key_whose_value_repeats_a_key",
+         "a fields key that is an empty map, whose value repeats its key 0: the map key is refused before its value is read",
+         m, m_hash, raw_map([(empty_map, raw_map([(0, 1), (0, 2)]))]), "unhashable_key"),
+        ("array_key_holding_a_map_whose_value_repeats_a_key",
+         "a fields key [{}] whose value repeats its key 0: an array key's value is read before the key is hashed",
+         m, m_hash, raw_map([(array_holding_map, raw_map([(0, 1), (0, 2)]))]), "repeated_key"),
+        ("array_key_holding_a_map_then_a_repeat",
+         "a fields key [{}], then the key 5 twice: refused at the array key, before the repeat is read", m, m_hash,
+         raw_map([(array_holding_map, 0), (5, 1), (5, 2)]), "unhashable_key"),
+    ]
     refused = []
-    for i, (name, why, signer, src, fields_raw) in enumerate(refused_specs):
+    for i, (name, why, signer, src, fields_raw, reason) in enumerate(refused_specs):
         content = b"" if src == d_hash else b"x"
         timestamp = 1790000600.5 + i
         packed = pack_raw(signer, d_hash, src, timestamp, b"", content, fields_raw)
-        assert reference_refuses(fields_raw), f"{name}: the fields repeat a key"
-        assert reference_refuses_message(packed), f"{name}: LXMF.py refuses the message"
-        refused.append({"name": name, "why": why, "source": "distro" if src == d_hash else "member",
+        assert reference_refuses(fields_raw), f"{name}: the fields repeat a key or hold an unhashable one"
+        assert reference_verdict(packed) == reason, f"{name}: LXMF.py refuses the message for {reason}"
+        refused.append({"name": name, "why": why, "reason": reason, "source": "distro" if src == d_hash else "member",
                         "timestamp": timestamp, "content": content.decode(), "fields_hex": hexs(fields_raw),
                         "packed_hex": hexs(packed)})
     assert len({r["name"] for r in refused}) == len(refused)
@@ -951,14 +1093,62 @@ def main():
          "the timestamp ext (-1) of the epoch as timestamp 32 and as timestamp 64: one instant"),
         ("array_twice", "9101", "9101", False,
          "the array [1] twice: umsgpack never compares an array key (it makes it a tuple and skips the check)"),
+        ("empty_array_twice", "90", "90", False,
+         "the empty array twice: never compared, and an array key that holds no map is read"),
+        ("array_holding_an_array_twice", "919101", "919101", False,
+         "the array [[1]] twice: never compared, and an array key that holds no map, at any depth, is read"),
     ]):
         fields_raw = b"\x82" + bytes.fromhex(a) + b"\x00" + bytes.fromhex(b) + b"\x01"
         packed = pack_raw(m, d_hash, m_hash, 1790000700.5 + i, b"", b"x", fields_raw)
         assert reference_refuses(fields_raw) == is_refused, name
-        assert reference_refuses_message(packed) == is_refused, name
+        assert reference_verdict(packed) == ("repeated_key" if is_refused else None), name
         key_equality.append({"name": name, "why": why, "keys_hex": [a, b], "refused": is_refused,
                              "fields_hex": hexs(fields_raw), "packed_hex": hexs(packed)})
     assert len({k["name"] for k in key_equality}) == len(key_equality)
+
+    # 10. Nesting (RFed SPEC §17.14; decided 2026-10-11): no value of a payload
+    #     deeper than NESTING_MAX_DEPTH (the payload at depth 0, the fields map
+    #     at 1, field 0x77's value at 2), Python's propagated delivery path,
+    #     measured. Each is a message from M to D whose field 0x77 (no reader
+    #     knows it) nests that deep, judged on DELIVERY_FRAMES.
+    def field_0x77(value_raw):
+        return raw_map([(0x77, value_raw)])
+
+    at, past = NESTING_MAX_DEPTH - 1, NESTING_MAX_DEPTH  # nested containers in field 0x77
+    nesting = []
+    for i, (name, why, fields_raw, is_refused) in enumerate([
+        ("arrays_at_the_limit", f"{at} arrays nested in a field, the innermost empty, at depth {NESTING_MAX_DEPTH}",
+         field_0x77(nested(at)), False),
+        ("arrays_past_the_limit", f"{past} arrays nested in a field, the innermost empty, at depth {NESTING_MAX_DEPTH + 1}",
+         field_0x77(nested(past)), True),
+        ("maps_at_the_limit", f"{at} maps {{0: ...}} nested in a field, the innermost empty, at depth {NESTING_MAX_DEPTH}",
+         field_0x77(nested(at, b"\x80", "map")), False),
+        ("maps_past_the_limit", f"{past} maps {{0: ...}} nested in a field, the innermost empty",
+         field_0x77(nested(past, b"\x80", "map")), True),
+        ("int_at_the_limit", f"{at - 1} arrays nested in a field, the innermost holding the int 0 at depth {NESTING_MAX_DEPTH}",
+         field_0x77(nested(at - 1, b"\x91\x00")), False),
+        ("int_past_the_limit", f"{at} arrays nested in a field, the innermost holding the int 0 at depth {NESTING_MAX_DEPTH + 1}",
+         field_0x77(nested(at, b"\x91\x00")), True),
+        ("str_at_the_limit", f"{at - 1} arrays nested in a field, the innermost holding the str 'a' at depth {NESTING_MAX_DEPTH}",
+         field_0x77(nested(at - 1, b"\x91\xa1a")), False),
+        ("str_past_the_limit", f"{at} arrays nested in a field, the innermost holding the str 'a' at depth {NESTING_MAX_DEPTH + 1}",
+         field_0x77(nested(at, b"\x91\xa1a")), True),
+        ("key_at_the_limit", f"a map in a field whose key is {at - 1} nested arrays, the innermost empty at depth {NESTING_MAX_DEPTH}",
+         field_0x77(raw_map([(nested(at - 1), 0)])), False),
+        ("key_past_the_limit", f"a map in a field whose key is {at} nested arrays, the innermost empty at depth {NESTING_MAX_DEPTH + 1}",
+         field_0x77(raw_map([(nested(at), 0)])), True),
+        ("far_past_the_limit", "600 arrays nested in a field (past what a decoder may read at all: still refused whole)",
+         field_0x77(nested(600)), True),
+    ]):
+        packed = pack_raw(m, d_hash, m_hash, 1790000800.5 + i, b"", b"x", fields_raw)
+        verdict = reference_verdict(packed)
+        assert verdict == ("too_deep" if is_refused else None), f"{name}: {verdict}"
+        vector = {"name": name, "why": why, "refused": is_refused, "fields_hex": hexs(fields_raw),
+                  "packed_hex": hexs(packed)}
+        if is_refused:
+            vector["reason"] = "too_deep"
+        nesting.append(vector)
+    assert len({n["name"] for n in nesting}) == len(nesting)
 
     for set_name, vectors in [("ops", ops), ("variants", variants), ("at_ms_encodings", at_ms_encodings),
                               ("rejects", rejects), ("sealed", sealed), ("group_entries", group_entries)]:
@@ -982,8 +1172,11 @@ def main():
             "group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
             "invite_members: csv strings and the members the invite parser lists for each. The csv is split on the code point ',' (U+002C), never on grapheme clusters: a combining mark after a comma does not join it (Swift's String.split on Character would), and a combining mark before an entry is part of that entry. variants accept_members_combining_mark_after_a_comma and rejects members_naming_d_after_a_combining_mark are the same two cases in a G.",
             "Repeated keys (RFed SPEC §17.14; James, 2026-10-11: parity): a message whose payload holds a map, at any depth, that repeats a key is refused whole, as Python LXMF refuses it (RNS umsgpack raises DuplicateKeyException in LXMessage.unpack_from_bytes): on the direct path and on the distro path, with a log line, and never shown, stored or applied. No reader of the group entries, the group sync or a channel membership message ever sees such a map. No vector outside refused and key_equality repeats a key.",
-            "refused: messages to D whose payload repeats a key, each signed by its source (source 'member' is M, 'distro' is D); packed_hex = dest(16) | src(16) | signature(64) | msgpack [timestamp f64, bin title '', bin content, fields as fields_hex]. Every client refuses each whole: the direct path's unpack of packed_hex, and the distro unwrap of packed_hex[0:16] | D.encrypt(packed_hex[16:]). The generator asserts the reference refuses each.",
-            "key_equality: a fields map {a: 0, b: 1} for each pair of keys keys_hex = [a, b], and the message from M to D carrying it (packed_hex as in refused); refused is whether the reference takes a and b for one key and refuses the message. Python's equality: an integer, float or boolean of one numeric value whatever its encoding is one key (1, 1.0, true); NaN is no key's equal; a str by its code points, a bin by its bytes, a str never a bin; nil; an ext by type and data, a timestamp ext (-1) by its instant to the microsecond; an array key is never compared (umsgpack skips the check for it). A map key is refused by umsgpack for another reason (UnhashableKeyException), not pinned here.",
+            "refused: messages to D whose payload repeats a key or holds an unhashable key, each signed by its source (source 'member' is M, 'distro' is D); packed_hex = dest(16) | src(16) | signature(64) | msgpack [timestamp f64, bin title '', bin content, fields as fields_hex]. Every client refuses each whole: the direct path's unpack of packed_hex, and the distro unwrap of packed_hex[0:16] | D.encrypt(packed_hex[16:]). reason is the reference's own: 'repeated_key' (DuplicateKeyException) or 'unhashable_key' (UnhashableKeyException), the first refusal in the order umsgpack reads the bytes. The generator asserts the reference refuses each, for that reason.",
+            "Unhashable keys (RFed SPEC §17.14; decided 2026-10-11: parity): a message whose payload holds a map, at any depth, with a key that is a map, or an array that holds a map at any depth, is refused whole, as Python LXMF refuses it (RNS umsgpack raises UnhashableKeyException): on the direct path and on the distro path, with a log line, and never shown, stored or applied. An array key that holds no map is read (key_equality empty_array_twice, array_holding_an_array_twice). Order, as umsgpack reads: a key is read whole before it is judged; a map key is refused before its value is read; an array key's value is read before the key is hashed.",
+            "key_equality: a fields map {a: 0, b: 1} for each pair of keys keys_hex = [a, b], and the message from M to D carrying it (packed_hex as in refused); refused is whether the reference takes a and b for one key and refuses the message. Python's equality: an integer, float or boolean of one numeric value whatever its encoding is one key (1, 1.0, true); NaN is no key's equal; a str by its code points, a bin by its bytes, a str never a bin; nil; an ext by type and data, a timestamp ext (-1) by its instant to the microsecond; an array key is never compared (umsgpack skips the check for it), and one that holds no map is read. A map key, or an array key holding a map, is refused for another reason (UnhashableKeyException): those are in refused.",
+            "Nesting (RFed SPEC §17.14; decided 2026-10-11): a message whose payload holds any value (an array, a map, a key, a scalar) deeper than nesting_max_depth (493) is refused whole, the payload at depth 0, its fields map at 1, a field's value at 2: a field holds at most 492 nested arrays or maps, the innermost empty, or 491 when the innermost holds anything. That is Python LXMF's measured delivery-path depth for a propagated message (LXMRouter.message_get_response -> lxmf_propagation -> lxmf_delivery -> unpack_from_bytes, the unpack the 10th frame of its thread, recursion limit 1000: umsgpack raises RecursionError one level deeper); a direct delivery over a link (a Resource, the 7th frame) reads up to two levels more. Measured end to end with LXMF-rust tests/delivery_nesting_probe.py (CPython 3.13.5, RNS 1.5.2, LXMF 1.1.1).",
+            "nesting: messages from M to D whose field 0x77 (no reader knows it) nests at the limit (refused false: read) or past it (refused true, reason 'too_deep'), in arrays, in maps, with an int or a str innermost, in a key, and far past it (600 arrays, past any decoder's own limit: still refused whole); packed_hex as in refused. Every client reads or refuses each whole as it says, on the direct path and on the distro path. The generator asserts the reference's verdict for each on the propagated delivery path's stack (10 frames).",
         ],
         "distro": {
             "private_key_hex": D_PRIVATE_KEY.hex(),
@@ -1008,6 +1201,7 @@ def main():
                   "text": POST_TEXT},
         "left_full": LEFT_FULL,
         "max_at_ms": MAX_AT_MS,
+        "nesting_max_depth": NESTING_MAX_DEPTH,
         "invite_space": [ord(c) for c in INVITE_SPACE],
         "ops": ops,
         "variants": variants,
@@ -1018,6 +1212,7 @@ def main():
         "invite_members": invite_cases,
         "refused": refused,
         "key_equality": key_equality,
+        "nesting": nesting,
     }
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "distro_group_sync_vectors.json")
     with open(path, "w") as f:

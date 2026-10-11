@@ -1,7 +1,8 @@
-//! RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity with Python LXMF): a message whose
-//! payload repeats a key is refused whole with ONE log line, on the router's direct path, the
-//! unpack, the distro unwrap, a channel post and a stored container; the router never delivers
-//! it. Its own test binary, because it installs the process's log callback.
+//! RFed SPEC §17.14 "Repeated keys", "Unhashable keys" and "Nesting" (James, 2026-10-11, and
+//! decided 2026-10-11: parity with Python LXMF): a message whose payload repeats a key, holds an
+//! unhashable key or is nested past the limit is refused whole with ONE log line, on the router's
+//! direct path, the unpack, the distro unwrap, a channel post and a stored container; the router
+//! never delivers it. Its own test binary, because it installs the process's log callback.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,8 +19,15 @@ fn hex(s: &str) -> Vec<u8> {
 	(0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
 }
 
+/// Runs on a thread with a 64 MiB stack: the nesting vectors are read to depth 493 or past it,
+/// and rmpv's reader spends about 4.9 KB of stack a level in a debug build (about 260 B in
+/// release), more than a test thread's 2 MiB holds.
 #[test]
 fn a_refusal_is_logged_once_on_each_path_and_never_delivered() {
+	std::thread::Builder::new().stack_size(64 << 20).spawn(refusals_are_logged_once).unwrap().join().unwrap();
+}
+
+fn refusals_are_logged_once() {
 	let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 	let sink = lines.clone();
 	reticulum_rust::ffi::set_log_callback(move |line| sink.lock().unwrap().push(line));
@@ -35,8 +43,21 @@ fn a_refusal_is_logged_once_on_each_path_and_never_delivered() {
 	let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/distro_group_sync_vectors.json");
 	let v: Json = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
 	let mut d = Identity::from_bytes(&hex(v["distro"]["private_key_hex"].as_str().unwrap())).unwrap();
-	let refused: Vec<&Json> = v["refused"].as_array().unwrap().iter().collect();
-	assert!(refused.len() >= 11);
+	// Every message the reference refuses whole: the `refused` set, and the `nesting` vectors past
+	// the limit. Each line names the reason (`reason_text`).
+	let refused: Vec<&Json> = v["refused"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.chain(v["nesting"].as_array().unwrap().iter().filter(|n| n["refused"] == true))
+		.collect();
+	assert_eq!(refused.len(), 22 + 6);
+	let reason_text = |vector: &Json| match vector["reason"].as_str().unwrap() {
+		"repeated_key" => "repeats a key",
+		"unhashable_key" => "cannot hash",
+		"too_deep" => "nested past depth",
+		other => panic!("unknown reason {other}"),
+	};
 
 	let storage = std::env::temp_dir().join(format!("lxmf-repeated-keys-log-{}", std::process::id()));
 	let router = LXMRouter::new(
@@ -49,23 +70,33 @@ fn a_refusal_is_logged_once_on_each_path_and_never_delivered() {
 	router.lock().unwrap().register_delivery_callback(Arc::new(move |_: &LXMessage| *count.lock().unwrap() += 1));
 	said("");
 
-	for vector in refused {
+	// The lines since the last call that say "refused whole:", each of which must say `why`.
+	let refusals = |why: &str, name: &str| -> usize {
+		let mut lines = lines.lock().unwrap();
+		let found: Vec<String> = lines.iter().filter(|l| l.contains(msgpack_keys::REFUSED_WHOLE)).cloned().collect();
+		lines.clear();
+		assert!(found.iter().all(|l| l.contains(why)), "{name}: every refusal line says {why}: {found:#?}");
+		found.len()
+	};
+	for &vector in &refused {
 		let name = vector["name"].as_str().unwrap();
+		let why = reason_text(vector);
 		let packed = hex(vector["packed_hex"].as_str().unwrap());
 
 		assert!(LXMessage::unpack_from_bytes(&packed, None).is_err(), "{name}");
-		assert_eq!(said("repeats a key"), 1, "{name}: the unpack logs its refusal once");
+		assert_eq!(refusals(why, name), 1, "{name}: the unpack logs its refusal once");
 
 		let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
 		assert!(unwrap_blob(&mut d, &blob).is_err(), "{name}");
-		assert_eq!(said("repeats a key"), 1, "{name}: the unwrap logs its refusal once");
+		assert_eq!(refusals(why, name), 1, "{name}: the unwrap logs its refusal once");
 
 		let accepted = router.lock().unwrap().lxmf_delivery(
 			&packed, Some(DestinationType::Single), None, None, Some(LXMessage::DIRECT), true, true,
 		);
 		assert!(!accepted, "{name}: the router refuses it");
 		let lines_now = lines.lock().unwrap().clone();
-		assert_eq!(said("repeats a key"), 1, "{name}: the router's refusal is one line: {lines_now:#?}");
+		assert!(!lines_now.iter().any(|l| l.contains("unpack FAILED")), "{name}: the router adds no line of its own: {lines_now:#?}");
+		assert_eq!(refusals(why, name), 1, "{name}: the router's refusal is one line: {lines_now:#?}");
 	}
 	assert_eq!(*delivered.lock().unwrap(), 0, "nothing refused is delivered");
 
@@ -81,7 +112,7 @@ fn a_refusal_is_logged_once_on_each_path_and_never_delivered() {
 	// whose prelude key binds to its source: refused with one line, an error is_refusal knows,
 	// and the sender's key never remembered.
 	const CHANNEL: &str = "public.repeated-keys";
-	for vector in v["refused"].as_array().unwrap() {
+	for &vector in &refused {
 		let name = vector["name"].as_str().unwrap();
 		let packed = hex(vector["packed_hex"].as_str().unwrap());
 		let sender = Identity::new(true);
@@ -96,7 +127,7 @@ fn a_refusal_is_logged_once_on_each_path_and_never_delivered() {
 
 		let err = channel::unpack(CHANNEL, &wire).expect_err(name);
 		assert!(msgpack_keys::is_refusal(&err), "{name}: the channel unpack's error is a refusal: {err}");
-		assert_eq!(said("repeats a key"), 1, "{name}: the channel unpack logs its refusal once");
+		assert_eq!(refusals(reason_text(vector), name), 1, "{name}: the channel unpack logs its refusal once");
 		assert_eq!(Identity::recall_public_key(&source), None, "{name}: the sender's key is not remembered");
 	}
 

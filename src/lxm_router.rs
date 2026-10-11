@@ -3824,7 +3824,8 @@ impl LXMRouter {
 				msg
 			}
 			Err(e) => {
-				// A repeated key's refusal has logged its one line already.
+				// A refusal as Python LXMF refuses it (RFed SPEC §17.14) has
+				// logged its one line already.
 				if !crate::msgpack_keys::is_refusal(&e) {
 					log(
 						&format!("[LXMF-DELIVERY] unpack FAILED: {}", e),

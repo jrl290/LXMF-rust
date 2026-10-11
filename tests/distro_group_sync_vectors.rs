@@ -12,7 +12,7 @@ use lxmf_rust::distro::{
 	DISTRO_MARKERS, GROUP_SYNC_LEFT_MAX, MAX_AT_MS,
 };
 use lxmf_rust::lx_message::LXMessage;
-use lxmf_rust::msgpack_keys::repeated_key;
+use lxmf_rust::msgpack_keys::{is_refusal, refusal, Refusal, NESTING_MAX_DEPTH, NESTING_MAX_IN_A_FIELD};
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::{full_hash, Identity};
 use rmpv::Value;
@@ -256,49 +256,149 @@ fn the_ext_bin_0xfd_and_repeated_key_vectors_are_present() {
 		"retichat_field_nested_map_repeats_a_key",
 		"non_group_field_twice",
 		"non_group_field_nested_repeat",
+		"map_key_beside_group_id",
+		"map_key_not_empty",
+		"array_key_holding_a_map",
+		"array_key_holding_a_map_deeper",
+		"retichat_field_map_key",
+		"non_group_field_nested_map_key",
+		"g_leave_map_key",
+		"map_key_that_repeats_a_key",
+		"map_key_whose_value_repeats_a_key",
+		"array_key_holding_a_map_whose_value_repeats_a_key",
+		"array_key_holding_a_map_then_a_repeat",
 	] {
 		assert!(has("refused", name), "refused {name} missing");
 	}
+	for name in [
+		"arrays_at_the_limit",
+		"arrays_past_the_limit",
+		"maps_at_the_limit",
+		"maps_past_the_limit",
+		"int_at_the_limit",
+		"int_past_the_limit",
+		"str_at_the_limit",
+		"str_past_the_limit",
+		"key_at_the_limit",
+		"key_past_the_limit",
+		"far_past_the_limit",
+	] {
+		assert!(has("nesting", name), "nesting {name} missing");
+	}
 	let pairs = v["key_equality"].as_array().unwrap();
 	assert!(pairs.iter().any(|p| p["refused"] == true) && pairs.iter().any(|p| p["refused"] == false), "both outcomes");
-	for name in ["true_and_int_1", "int_and_float64", "nan_twice", "str_and_bin", "array_twice", "timestamp_32_and_64"] {
+	for name in [
+		"true_and_int_1",
+		"int_and_float64",
+		"nan_twice",
+		"str_and_bin",
+		"array_twice",
+		"timestamp_32_and_64",
+		"empty_array_twice",
+		"array_holding_an_array_twice",
+	] {
 		assert!(has("key_equality", name), "key_equality {name} missing");
 	}
 	let fields = |hex_str: &str| rmpv::decode::read_value(&mut Cursor::new(hex(hex_str))).expect("fields msgpack");
 	for set in ["ops", "variants", "at_ms_encodings", "rejects", "sealed", "group_entries"] {
 		for vector in v[set].as_array().unwrap() {
-			let found = repeated_key(&fields(vector["fields_hex"].as_str().unwrap()));
-			assert_eq!(found, None, "{set} {}: no vector outside refused repeats a key", vector["name"]);
+			let found = refusal(&fields(vector["fields_hex"].as_str().unwrap()));
+			assert_eq!(found, None, "{set} {}: no vector outside refused, key_equality and nesting is refused", vector["name"]);
 		}
 	}
 	for vector in v["refused"].as_array().unwrap() {
-		assert!(repeated_key(&fields(vector["fields_hex"].as_str().unwrap())).is_some(), "{}", vector["name"]);
+		let found = refusal(&fields(vector["fields_hex"].as_str().unwrap()));
+		let reason = match found {
+			Some(Refusal::RepeatedKey { .. }) => "repeated_key",
+			Some(Refusal::UnhashableKey { .. }) => "unhashable_key",
+			other => panic!("{}: {other:?}", vector["name"]),
+		};
+		assert_eq!(vector["reason"], reason, "{}: the reference's reason, the first umsgpack meets", vector["name"]);
 	}
 }
 
-/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity with Python LXMF, whose umsgpack
-/// raises DuplicateKeyException in `LXMessage.unpack_from_bytes`): a message whose payload holds a
-/// map, at any depth, that repeats a key is refused whole on the direct path (the router's unpack)
-/// and on the distro path (the unwrap), for the repeat and nothing else; each is signed by its
-/// source. So no reader of the group entries or the group sync ever sees such a map.
+/// What a refusal's text says for each `reason` of the vectors (RFed SPEC §17.14 "Repeated keys",
+/// "Unhashable keys", "Nesting"): the reference's own reason, read as umsgpack reads the bytes.
+fn reason_text(reason: &str) -> &'static str {
+	match reason {
+		"repeated_key" => "repeats a key",
+		"unhashable_key" => "cannot hash",
+		"too_deep" => "nested past depth",
+		other => panic!("unknown reason {other}"),
+	}
+}
+
+/// RFed SPEC §17.14 "Repeated keys" and "Unhashable keys" (James, 2026-10-11, and decided
+/// 2026-10-11: parity with Python LXMF, whose umsgpack raises DuplicateKeyException or
+/// UnhashableKeyException in `LXMessage.unpack_from_bytes`): a message whose payload holds a map,
+/// at any depth, that repeats a key, or whose key is a map or an array holding one, is refused
+/// whole on the direct path (the router's unpack) and on the distro path (the unwrap), for the
+/// reason the reference gives and nothing else; each is signed by its source. So no reader of the
+/// group entries or the group sync ever sees such a map.
 #[test]
-fn a_message_that_repeats_a_key_is_refused_whole_on_the_direct_and_the_distro_path() {
+fn a_message_python_refuses_for_a_key_is_refused_whole_on_the_direct_and_the_distro_path() {
 	let v = vectors();
 	let mut d = identity(&v, "distro");
 	let refused = v["refused"].as_array().expect("refused");
-	assert_eq!(refused.len(), 11);
+	assert_eq!(refused.len(), 22);
 	for vector in refused {
 		let name = vector["name"].as_str().unwrap();
+		let why = reason_text(vector["reason"].as_str().unwrap());
 		let packed = bytes(vector, "packed_hex");
 		assert!(to_hex(&packed).ends_with(vector["fields_hex"].as_str().unwrap()), "{name}: the fields end the payload");
 		match LXMessage::unpack_from_bytes(&packed, None) {
 			Ok(_) => panic!("{name}: the direct path must refuse it"),
-			Err(e) => assert!(e.contains("repeats a key"), "{name}: refused for the repeat, not for {e}"),
+			Err(e) => assert!(is_refusal(&e) && e.contains(why), "{name}: refused because it {why}, not for {e}"),
 		}
 		let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
 		match unwrap_blob(&mut d, &blob) {
 			Ok(m) => panic!("{name}: the distro path must refuse it, not read {:?}", m.map(|m| m.to_json())),
-			Err(e) => assert!(e.contains("repeats a key"), "{name}: refused for the repeat, not for {e}"),
+			Err(e) => assert!(is_refusal(&e) && e.contains(why), "{name}: refused because it {why}, not for {e}"),
+		}
+	}
+}
+
+/// RFed SPEC §17.14 "Nesting" (decided 2026-10-11: one limit, Python's measured delivery-path
+/// depth): a message whose payload holds any value deeper than `nesting_max_depth` (493: the
+/// payload at depth 0, the fields map at 1, a field's value at 2) is refused whole on the direct
+/// path and on the distro path, as Python LXMF refuses it on its propagated delivery path; one at
+/// the limit is read, its fields as sent. The web follows the same vectors.
+#[test]
+fn a_message_nested_past_the_limit_is_refused_whole_and_one_at_it_is_read() {
+	on_a_large_stack(nesting_vectors);
+}
+
+/// Runs `f` on a thread with a 64 MiB stack. rmpv's reader spends about 4.9 KB of stack a level
+/// in a debug build (about 260 B in release), so a payload at the limit needs about 2.4 MB here,
+/// more than a test thread's 2 MiB; a release build needs about 130 KB.
+fn on_a_large_stack(f: fn()) {
+	std::thread::Builder::new().stack_size(64 << 20).spawn(f).unwrap().join().unwrap();
+}
+
+fn nesting_vectors() {
+	let v = vectors();
+	let mut d = identity(&v, "distro");
+	assert_eq!(v["nesting_max_depth"], NESTING_MAX_DEPTH);
+	assert_eq!((NESTING_MAX_DEPTH, NESTING_MAX_IN_A_FIELD), (493, 492));
+	let nesting = v["nesting"].as_array().expect("nesting");
+	assert_eq!(nesting.len(), 11);
+	for vector in nesting {
+		let name = vector["name"].as_str().unwrap();
+		let refused = vector["refused"].as_bool().unwrap();
+		let packed = bytes(vector, "packed_hex");
+		let direct = LXMessage::unpack_from_bytes(&packed, None);
+		let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
+		let distro = unwrap_blob(&mut d, &blob);
+		if refused {
+			let why = reason_text(vector["reason"].as_str().unwrap());
+			for (path, result) in [("direct", direct.err()), ("distro", distro.err())] {
+				let e = result.unwrap_or_else(|| panic!("{name}: the {path} path must refuse it"));
+				assert!(is_refusal(&e) && e.contains(why), "{name}: the {path} path refuses it because it is {why}, not for {e}");
+			}
+		} else {
+			assert!(direct.is_ok(), "{name}: the direct path reads it: {:?}", direct.err());
+			let out = json(&distro.unwrap_or_else(|e| panic!("{name}: the distro path reads it: {e}")).expect("a blob for D").to_json());
+			assert_eq!(STANDARD.decode(out["fields"].as_str().unwrap()).unwrap(), bytes(vector, "fields_hex"), "{name}");
 		}
 	}
 }
@@ -312,7 +412,7 @@ fn two_keys_are_one_key_exactly_when_python_takes_them_for_one() {
 	let v = vectors();
 	let mut d = identity(&v, "distro");
 	let pairs = v["key_equality"].as_array().expect("key_equality");
-	assert_eq!(pairs.len(), 22);
+	assert_eq!(pairs.len(), 24);
 	for vector in pairs {
 		let name = vector["name"].as_str().unwrap();
 		let refused = vector["refused"].as_bool().unwrap();

@@ -1195,13 +1195,14 @@ impl LXMessage {
 			.to_vec();
 		let packed_payload = lxmf_bytes[2 * Self::DESTINATION_LENGTH + Self::SIGNATURE_LENGTH..].to_vec();
 
-		let payload_value = decode_value(&packed_payload)?;
-		// RFed SPEC §17.14 "Repeated keys": a payload holding a map, at any
-		// depth, that repeats a key is refused whole, as LXMF.py's umsgpack
-		// refuses it (logged once, there).
-		crate::msgpack_keys::refuse_repeated_keys(
-			&payload_value,
+		// RFed SPEC §17.14 "Repeated keys", "Unhashable keys", "Nesting": a
+		// payload that repeats a key, holds an unhashable key or nests past the
+		// limit is refused whole, as LXMF.py's umsgpack refuses it (logged
+		// once, there).
+		let payload_value = crate::msgpack_keys::read_refusing(
+			&packed_payload,
 			&format!("LXMF message from {}", hexrep(&source_hash, false)),
+			|e| format!("msgpack decode error: {}", e),
 		)?;
 		let payload_items = payload_value
 			.as_array()
@@ -1313,10 +1314,11 @@ impl LXMessage {
 			.map_err(|e| format!("Could not clone LXMessage file handle: {}", e))?
 			.read_to_end(&mut buffer)
 			.map_err(|e| format!("Could not read LXMessage file handle: {}", e))?;
-		let container_value = decode_value(&buffer)?;
-		// LXMF.py reads the container with umsgpack too, which refuses a map
-		// that repeats a key (RFed SPEC §17.14 "Repeated keys").
-		crate::msgpack_keys::refuse_repeated_keys(&container_value, "stored LXMF container")?;
+		// LXMF.py reads the container with umsgpack too, which refuses it whole
+		// as it refuses a payload (RFed SPEC §17.14 "Repeated keys").
+		let container_value = crate::msgpack_keys::read_refusing(&buffer, "stored LXMF container", |e| {
+			format!("msgpack decode error: {}", e)
+		})?;
 		let container = container_value
 			.as_map()
 			.ok_or("LXMF container is not a map")?
@@ -1833,11 +1835,6 @@ fn encode_value(value: Value) -> Result<Vec<u8>, String> {
 	let mut buf = Vec::new();
 	write_value(&mut buf, &value).map_err(|e| format!("msgpack encode error: {}", e))?;
 	Ok(buf)
-}
-
-fn decode_value(data: &[u8]) -> Result<Value, String> {
-	let mut cursor = std::io::Cursor::new(data);
-	rmpv::decode::read_value(&mut cursor).map_err(|e| format!("msgpack decode error: {}", e))
 }
 
 fn value_to_binary(value: &Value) -> Option<Vec<u8>> {

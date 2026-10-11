@@ -25,10 +25,13 @@
 //! (GROUPS-DISTRO-DESIGN.md §7, §10, §17.1).
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::Cursor;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rmpv::decode::{read_value, read_value_ref};
+#[cfg(test)]
+use rmpv::decode::read_value;
+use rmpv::decode::read_value_ref;
 use rmpv::encode::write_value;
 use rmpv::Value;
 
@@ -773,12 +776,14 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
     let source_hash = plaintext[..DEST_HASH_LEN].to_vec();
     let payload = &plaintext[LXMF_HEADER_LEN..];
 
-    let mut cur = Cursor::new(payload);
-    let parsed = read_value(&mut cur).map_err(|e| format!("msgpack decode: {e}"))?;
-    // RFed SPEC §17.14 "Repeated keys": refused whole, as on the direct path
-    // (`LXMessage::unpack_from_bytes`) and as LXMF.py refuses it, before any
-    // field is read; logged once, there.
-    crate::msgpack_keys::refuse_repeated_keys(&parsed, &format!("distro message from {}", hex(&source_hash)))?;
+    // RFed SPEC §17.14 "Repeated keys", "Unhashable keys", "Nesting": refused
+    // whole, as on the direct path (`LXMessage::unpack_from_bytes`) and as
+    // LXMF.py refuses it, before any field is read; logged once, there.
+    let parsed = crate::msgpack_keys::read_refusing(
+        payload,
+        &format!("distro message from {}", hex(&source_hash)),
+        |e| format!("msgpack decode: {e}"),
+    )?;
     let arr = match parsed {
         Value::Array(a) if a.len() >= 3 => a,
         other => return Err(format!("expected an LXMF payload array, got {other:?}")),
