@@ -3824,12 +3824,15 @@ impl LXMRouter {
 				msg
 			}
 			Err(e) => {
-				log(
-					&format!("[LXMF-DELIVERY] unpack FAILED: {}", e),
-					LOG_NOTICE,
-					false,
-					false,
-				);
+				// A repeated key's refusal has logged its one line already.
+				if !crate::msgpack_keys::is_refusal(&e) {
+					log(
+						&format!("[LXMF-DELIVERY] unpack FAILED: {}", e),
+						LOG_NOTICE,
+						false,
+						false,
+					);
+				}
 				return false;
 			}
 		};

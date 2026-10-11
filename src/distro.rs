@@ -750,7 +750,9 @@ pub fn verify_sync_claim(claim: &SyncClaim, transient_id: &[u8], lxmf_data: &[u8
 /// Returns `Ok(None)` when the blob is addressed to a different distro — a node
 /// may legitimately hand over blobs for an address this device does not hold.
 /// Returns `Err` for a §17.11 sent-copy that claims the distro as its source
-/// but is not signed by the distro key.
+/// but is not signed by the distro key, and for a payload holding a map, at
+/// any depth, that repeats a key: refused whole, as Python LXMF refuses it
+/// (RFed SPEC §17.14 "Repeated keys"), with one log line.
 pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMessage>, String> {
     if blob.len() < DEST_HASH_LEN + LXMF_HEADER_LEN {
         return Err(format!("blob too short: {} bytes", blob.len()));
@@ -773,6 +775,10 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
 
     let mut cur = Cursor::new(payload);
     let parsed = read_value(&mut cur).map_err(|e| format!("msgpack decode: {e}"))?;
+    // RFed SPEC §17.14 "Repeated keys": refused whole, as on the direct path
+    // (`LXMessage::unpack_from_bytes`) and as LXMF.py refuses it, before any
+    // field is read; logged once, there.
+    crate::msgpack_keys::refuse_repeated_keys(&parsed, &format!("distro message from {}", hex(&source_hash)))?;
     let arr = match parsed {
         Value::Array(a) if a.len() >= 3 => a,
         other => return Err(format!("expected an LXMF payload array, got {other:?}")),
@@ -1000,23 +1006,22 @@ fn value_to_string(value: &Value) -> String {
 // tests/distro_group_sync_vectors.json, made with the Python reference.
 // ---------------------------------------------------------------------------
 
-/// `fields[0xFB]` as text when it is a str or a bin, else `None`; the last
-/// entry with that key wins, as in the readers above (RFed SPEC §17.14
-/// "Repeated keys"; a group entry is read from the first, `retichat_field::
-/// top_level`). The Python reference has no such rule: RNS's umsgpack refuses
-/// a map that repeats a key, so LXMF.py drops the message whole. Pinned by the
-/// `*_twice*` vectors of tests/distro_group_sync_vectors.json.
+/// `fields[0xFB]` as text when it is a str or a bin, else `None`. The fields
+/// never repeat a key: [`unwrap_blob`] refuses such a message whole first, as
+/// Python LXMF does (RFed SPEC §17.14 "Repeated keys"; the `refused` vectors of
+/// tests/distro_group_sync_vectors.json).
 fn custom_type(entries: &[(Value, Value)]) -> Option<String> {
-    match entries.iter().rev().find(|(k, _)| k.as_u64() == Some(FIELD_CUSTOM_TYPE)).map(|(_, v)| v)? {
+    match custom_field(entries, FIELD_CUSTOM_TYPE)? {
         Value::String(s) => Some(String::from_utf8_lossy(s.as_bytes()).into_owned()),
         Value::Binary(b) => Some(String::from_utf8_lossy(b).into_owned()),
         _ => None,
     }
 }
 
-/// `entries`' value for the top-level field `field` (the last such entry).
+/// `entries`' value for the top-level field `field` (a key the fields never
+/// repeat, see [`custom_type`]).
 fn custom_field(entries: &[(Value, Value)], field: u64) -> Option<&Value> {
-    entries.iter().rev().find(|(k, _)| k.as_u64() == Some(field)).map(|(_, v)| v)
+    entries.iter().find(|(k, _)| k.as_u64() == Some(field)).map(|(_, v)| v)
 }
 
 /// `s` lowercased when it is exactly 32 hex characters (either case).
@@ -1397,6 +1402,9 @@ fn parse_group_sync(items: &[Value], d_hex: &str) -> Result<GroupSync, String> {
 /// The receiver's reading of a group sync (§11.1 rule 4, GROUPS-DISTRO-DESIGN.md
 /// §7): `None` unless `fields[0xFB]` is [`DISTRO_GROUP_TYPE`]; otherwise `by`
 /// and the form of `fields[0xFC]` for the distro `d_hex`, or why it fails.
+/// `by` is `fields[0xFD]` as text, lowercased, when it is a str or a bin, else
+/// `""` (absent, nil, an int, an array, ...), as the web reads it. `entries`
+/// never repeat a key ([`unwrap_blob`] has refused such a message whole).
 /// `at_ms` is read by value in any integer encoding (`as_u64`, then the 2^53 -
 /// 1 bound); `name` and `text` may be str or bin; `left` is an array of at
 /// most 32 str of 32 hex; elements after `left` are ignored. Rules 0-3 and 5-6
@@ -1405,7 +1413,10 @@ pub fn read_group_sync(entries: &[(Value, Value)], d_hex: &str) -> Option<GroupS
     if custom_type(entries).as_deref() != Some(DISTRO_GROUP_TYPE) {
         return None;
     }
-    let by = custom_field(entries, FIELD_CUSTOM_META).map(value_to_string).unwrap_or_default().to_ascii_lowercase();
+    let by = match custom_field(entries, FIELD_CUSTOM_META) {
+        Some(v @ (Value::String(_) | Value::Binary(_))) => value_to_string(v).to_ascii_lowercase(),
+        _ => String::new(),
+    };
     let sync = match custom_field(entries, FIELD_CUSTOM_DATA) {
         Some(Value::Array(items)) => parse_group_sync(items, &d_hex.to_ascii_lowercase()),
         Some(Value::Binary(_)) => Err("0xFC is a bin, not a native array (CHECK_THESE_THINGS_FIRST §11)".into()),

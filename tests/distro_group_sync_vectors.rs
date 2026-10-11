@@ -12,6 +12,7 @@ use lxmf_rust::distro::{
 	DISTRO_MARKERS, GROUP_SYNC_LEFT_MAX, MAX_AT_MS,
 };
 use lxmf_rust::lx_message::LXMessage;
+use lxmf_rust::msgpack_keys::repeated_key;
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::{full_hash, Identity};
 use rmpv::Value;
@@ -223,33 +224,111 @@ fn the_invite_parser_splits_on_the_code_point_comma() {
 	}
 }
 
-/// RFed SPEC §17.14 "Repeated keys": a group entry is read from the first entry with its key (of
-/// the fields map, or of 0xD1), 0xFB from the last; ext values beside a group id are skipped, and
-/// a bin GROUP_ID is no id in either form. The vectors that pin it are present, so a generator
-/// that lost them fails here rather than passing on fewer cases.
+/// The vectors that pin the ext and bin readings, the 0xFD forms, the members csv split, and the
+/// repeated keys (RFed SPEC §17.14 "Repeated keys": refused whole, as Python LXMF refuses them)
+/// are present, so a generator that lost them fails here rather than passing on fewer cases. No
+/// set but `refused` and `key_equality` holds a map that repeats a key.
 #[test]
-fn the_repeated_key_ext_and_bin_vectors_are_present() {
+fn the_ext_bin_0xfd_and_repeated_key_vectors_are_present() {
 	let v = vectors();
 	let has = |set: &str, name: &str| v[set].as_array().unwrap().iter().any(|x| x["name"] == name);
 	for name in [
-		"group_id_twice_the_first_read",
-		"group_id_twice_the_first_malformed",
-		"retichat_field_group_id_twice",
-		"retichat_field_twice",
-		"group_action_and_name_twice",
 		"group_id_bin_in_both_forms",
 		"group_id_bin_in_0xd1_str_in_0xa0",
 		"ext_beside_group_id",
 		"ext_beside_group_id_in_retichat_field",
-		"custom_type_twice_the_last_not_a_marker",
-		"custom_type_twice_the_last_a_marker",
 	] {
 		assert!(has("group_entries", name), "group_entries {name} missing");
 	}
-	for name in ["leave_0xfb_twice_the_last_the_marker", "accept_members_combining_mark_after_a_comma"] {
+	for name in ["leave_0xfd_int", "leave_0xfd_array", "leave_without_0xfd", "accept_members_combining_mark_after_a_comma"] {
 		assert!(has("variants", name), "variants {name} missing");
 	}
 	assert!(has("rejects", "members_naming_d_after_a_combining_mark"), "rejects members_naming_d_after_a_combining_mark missing");
+	for name in [
+		"group_id_twice",
+		"group_id_twice_one_malformed",
+		"retichat_field_group_id_twice",
+		"retichat_field_twice",
+		"group_action_and_name_twice",
+		"custom_type_twice_marker_first",
+		"custom_type_twice_marker_last",
+		"g_leave_0xfb_twice",
+		"retichat_field_nested_map_repeats_a_key",
+		"non_group_field_twice",
+		"non_group_field_nested_repeat",
+	] {
+		assert!(has("refused", name), "refused {name} missing");
+	}
+	let pairs = v["key_equality"].as_array().unwrap();
+	assert!(pairs.iter().any(|p| p["refused"] == true) && pairs.iter().any(|p| p["refused"] == false), "both outcomes");
+	for name in ["true_and_int_1", "int_and_float64", "nan_twice", "str_and_bin", "array_twice", "timestamp_32_and_64"] {
+		assert!(has("key_equality", name), "key_equality {name} missing");
+	}
+	let fields = |hex_str: &str| rmpv::decode::read_value(&mut Cursor::new(hex(hex_str))).expect("fields msgpack");
+	for set in ["ops", "variants", "at_ms_encodings", "rejects", "sealed", "group_entries"] {
+		for vector in v[set].as_array().unwrap() {
+			let found = repeated_key(&fields(vector["fields_hex"].as_str().unwrap()));
+			assert_eq!(found, None, "{set} {}: no vector outside refused repeats a key", vector["name"]);
+		}
+	}
+	for vector in v["refused"].as_array().unwrap() {
+		assert!(repeated_key(&fields(vector["fields_hex"].as_str().unwrap())).is_some(), "{}", vector["name"]);
+	}
+}
+
+/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity with Python LXMF, whose umsgpack
+/// raises DuplicateKeyException in `LXMessage.unpack_from_bytes`): a message whose payload holds a
+/// map, at any depth, that repeats a key is refused whole on the direct path (the router's unpack)
+/// and on the distro path (the unwrap), for the repeat and nothing else; each is signed by its
+/// source. So no reader of the group entries or the group sync ever sees such a map.
+#[test]
+fn a_message_that_repeats_a_key_is_refused_whole_on_the_direct_and_the_distro_path() {
+	let v = vectors();
+	let mut d = identity(&v, "distro");
+	let refused = v["refused"].as_array().expect("refused");
+	assert_eq!(refused.len(), 11);
+	for vector in refused {
+		let name = vector["name"].as_str().unwrap();
+		let packed = bytes(vector, "packed_hex");
+		assert!(to_hex(&packed).ends_with(vector["fields_hex"].as_str().unwrap()), "{name}: the fields end the payload");
+		match LXMessage::unpack_from_bytes(&packed, None) {
+			Ok(_) => panic!("{name}: the direct path must refuse it"),
+			Err(e) => assert!(e.contains("repeats a key"), "{name}: refused for the repeat, not for {e}"),
+		}
+		let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
+		match unwrap_blob(&mut d, &blob) {
+			Ok(m) => panic!("{name}: the distro path must refuse it, not read {:?}", m.map(|m| m.to_json())),
+			Err(e) => assert!(e.contains("repeats a key"), "{name}: refused for the repeat, not for {e}"),
+		}
+	}
+}
+
+/// Two keys are one key exactly when Python takes them for one (`key_equality`): an integer, a
+/// float and a boolean of one value whatever the encoding, a str by its code points and never a
+/// bin, an ext by type and data (a timestamp by its instant), NaN no key's equal, an array key
+/// never compared. A message the reference reads is read here, its fields as sent.
+#[test]
+fn two_keys_are_one_key_exactly_when_python_takes_them_for_one() {
+	let v = vectors();
+	let mut d = identity(&v, "distro");
+	let pairs = v["key_equality"].as_array().expect("key_equality");
+	assert_eq!(pairs.len(), 22);
+	for vector in pairs {
+		let name = vector["name"].as_str().unwrap();
+		let refused = vector["refused"].as_bool().unwrap();
+		let packed = bytes(vector, "packed_hex");
+		let direct = LXMessage::unpack_from_bytes(&packed, None);
+		assert_eq!(direct.is_err(), refused, "{name}: direct path, {:?}", direct.err());
+		let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
+		match unwrap_blob(&mut d, &blob) {
+			Err(e) => assert!(refused && e.contains("repeats a key"), "{name}: distro path refused it: {e}"),
+			Ok(m) => {
+				assert!(!refused, "{name}: the distro path must refuse it");
+				let out = json(&m.expect("a blob for D").to_json());
+				assert_eq!(STANDARD.decode(out["fields"].as_str().unwrap()).unwrap(), bytes(vector, "fields_hex"), "{name}");
+			}
+		}
+	}
 }
 
 /// §19.1: the unwrap reports the hash Python computed and `packed == blob[..16] | plaintext`,

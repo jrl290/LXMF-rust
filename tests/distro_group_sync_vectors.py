@@ -24,11 +24,15 @@ The script also reads every vector back with its own reading of §11.1 rule 4
 (read_group_sync below, a second implementation of the rule) and stops when a
 vector says something that reading does not.
 
-A fields map that repeats a key (the *_twice* vectors) is one the reference
-refuses whole (RNS umsgpack raises DuplicateKeyException, so LXMF.py drops the
-message); the script asserts that, and their readings are LXMF-rust's, pinned
-by RFed SPEC §17.14 "Repeated keys": a group entry from the first entry with
-its key, 0xFB from the last.
+Repeated keys (RFed SPEC §17.14, James's ruling of 2026-10-11: parity). The
+reference refuses an LXMF message whole when its payload holds a map, at any
+depth, that repeats a key: RNS's umsgpack raises DuplicateKeyException, so
+LXMessage.unpack_from_bytes raises and LXMRouter.lxmf_delivery drops the
+message. Every client does the same, on the direct path and on the distro path.
+`refused` holds such messages and `key_equality` the pairs of keys umsgpack
+takes for one key (or not); the script asserts that the reference refuses each
+refused message, and refuses or reads each key_equality message as it says. No
+other vector repeats a key, which the script also asserts.
 """
 
 import base64
@@ -294,11 +298,21 @@ def raw_map(pairs):
 def reference_refuses(fields_bytes):
     """Whether the reference refuses these bytes: RNS's umsgpack raises
     DuplicateKeyException on a map, at any depth, that repeats a key, so
-    LXMF.py (LXMessage.unpack_from_bytes) drops such a message whole. The
-    readings of a repeated key in these vectors are LXMF-rust's, pinned by
-    RFed SPEC §17.14, not the reference's."""
+    LXMF.py (LXMessage.unpack_from_bytes) drops such a message whole."""
     try:
         msgpack.unpackb(fields_bytes)
+    except msgpack.DuplicateKeyException:
+        return True
+    return False
+
+
+def reference_refuses_message(packed):
+    """Whether the reference's own LXMessage.unpack_from_bytes refuses the
+    packed message for a repeated key (LXMRouter.lxmf_delivery then drops it:
+    "Could not assemble LXMF message from received data"). Any other outcome
+    but reading it is an error here."""
+    try:
+        LXMessage.unpack_from_bytes(packed)
     except msgpack.DuplicateKeyException:
         return True
     return False
@@ -330,10 +344,12 @@ def read_group_sync(fields, d_hex):
         marker = marker.decode("utf-8", "replace")
     if marker != DISTRO_GROUP_TYPE:
         return None
-    by = fields.get(FIELD_CUSTOM_META, "")
+    # by: 0xFD as text when it is a str or a bin, else "" (absent, nil, an
+    # int, an array, ...), lowercased.
+    by = fields.get(FIELD_CUSTOM_META)
     if isinstance(by, bytes):
         by = by.decode("utf-8", "replace")
-    by = str(by).lower()
+    by = by.lower() if isinstance(by, str) else ""
     empty = {k: None for k in ("op", "group_id", "at_ms", "name", "members", "keys", "creator", "text", "left")}
 
     def bad(why):
@@ -420,9 +436,7 @@ def pack(signer, dest_hash, src_hash, timestamp, title, content, fields, substit
     """An LXMF message packed as LXMessage.pack packs it: dest | src |
     signature | msgpack [timestamp, title, content, fields], signed over dest |
     src | payload | full_hash(dest | src | payload). Read back with the
-    reference's own LXMessage.unpack_from_bytes for its hash; a fields map
-    with a repeated key the reference refuses whole (see reference_refuses),
-    so that one is hashed here only."""
+    reference's own LXMessage.unpack_from_bytes for its hash."""
     payload = substituted(msgpack.packb([timestamp, title, content, fields]), substitute)
     fields_bytes = substituted(msgpack.packb(fields), substitute)
     assert payload.endswith(fields_bytes)
@@ -430,12 +444,22 @@ def pack(signer, dest_hash, src_hash, timestamp, title, content, fields, substit
     message_hash = RNS.Identity.full_hash(hashed_part)
     signature = signer.sign(hashed_part + message_hash)
     packed = dest_hash + src_hash + signature + payload
-    if reference_refuses(fields_bytes):
-        return packed, message_hash, fields_bytes
+    assert not reference_refuses(fields_bytes), "only `refused` and `key_equality` repeat a key"
     reference = LXMessage.unpack_from_bytes(packed)
     assert reference.hash == message_hash
     assert reference.fields == msgpack.unpackb(fields_bytes)
     return packed, message_hash, fields_bytes
+
+
+def pack_raw(signer, dest_hash, src_hash, timestamp, title, content, fields_raw):
+    """An LXMF message whose fields are the msgpack bytes `fields_raw` as
+    given (a map that may repeat a key, which no dict can hold), packed and
+    signed as `pack` does: the payload is a fixarray of 4, then timestamp,
+    title and content as umsgpack packs them, then `fields_raw`."""
+    payload = b"\x94" + msgpack.packb(timestamp) + msgpack.packb(title) + msgpack.packb(content) + fields_raw
+    hashed_part = dest_hash + src_hash + payload
+    signature = signer.sign(hashed_part + RNS.Identity.full_hash(hashed_part))
+    return dest_hash + src_hash + signature + payload
 
 
 def main():
@@ -471,13 +495,10 @@ def main():
         e.update(s)
         return e
 
-    def g_vector(name, why, s, fields, timestamp, substitute=None, expect=None, last_of_each=None):
-        # last_of_each: for fields with a repeated key, which the reference
-        # refuses, the pairs as LXMF-rust reads 0xFB-0xFD (the last of each).
+    def g_vector(name, why, s, fields, timestamp, substitute=None, expect=None):
         packed, message_hash, fields_bytes = pack(d, d_hash, d_hash, timestamp, b"", b"", fields, substitute)
         expect = expect or expected(s)
-        assert reference_refuses(fields_bytes) == (last_of_each is not None), name
-        got = read_group_sync(dict(last_of_each) if last_of_each else msgpack.unpackb(fields_bytes), d_hex)
+        got = read_group_sync(msgpack.unpackb(fields_bytes), d_hex)
         assert got == expect, f"{name}: {got} != {expect}"
         return {
             "name": name,
@@ -555,15 +576,15 @@ def main():
     s = sync("leave", [])
     variants.append(g_vector("leave_0xfd_uppercase", "by is 0xFD lowercased", s,
                              g_fields(custom_data(s), device=DEVICE.upper()), OPS["leave"][0] + 4))
-    # Repeated keys (§17.14): 0xFB is read from the last entry with its key.
+    # by is 0xFD as text only when 0xFD is a str or a bin; any other type gives "".
     s = sync("leave", [])
-    fields = g_fields(custom_data(s))
-    pairs = [(FIELD_TICKET, b""), (FIELD_CUSTOM_TYPE, "app.example"), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE),
-             (FIELD_CUSTOM_DATA, custom_data(s)), (FIELD_CUSTOM_META, DEVICE)]
-    variants.append(g_vector("leave_0xfb_twice_the_last_the_marker",
-                             "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G",
-                             s, fields, OPS["leave"][0] + 5, substitute=(msgpack.packb(fields), raw_map(pairs)),
-                             last_of_each=pairs))
+    variants.append(g_vector("leave_0xfd_int", "by is \"\" when 0xFD is not a str or a bin, here an int", s,
+                             {**g_fields(custom_data(s)), FIELD_CUSTOM_META: 5}, OPS["leave"][0] + 5,
+                             expect=expected(s, by="")))
+    s = sync("leave", [])
+    variants.append(g_vector("leave_0xfd_array", "by is \"\" when 0xFD is not a str or a bin, here an array of D's device",
+                             s, {**g_fields(custom_data(s)), FIELD_CUSTOM_META: [DEVICE]}, OPS["leave"][0] + 6,
+                             expect=expected(s, by="")))
     # The members csv is split on the code point ',', never on grapheme clusters.
     s = sync("accept", [])
     s["members"] = f"{m_hex},{d_hex},́"
@@ -779,11 +800,10 @@ def main():
     # 6. The group entries the unwrap reports, by the fields alone (has_group_id,
     #    group_id, group_action, group_name; group_sync present or not).
     def entries(name, why, fields, has, gid, action, gname, is_sync=False):
-        # fields: a dict, or Raw bytes from raw_map (a repeated key).
-        fields_bytes = fields if isinstance(fields, Raw) else msgpack.packb(fields)
-        # The reference refuses exactly the raw maps (each repeats a key); it
-        # reads the others, an unknown ext as an Ext.
-        assert reference_refuses(fields_bytes) == isinstance(fields, Raw), name
+        fields_bytes = msgpack.packb(fields)
+        # The reference reads each (an unknown ext as an Ext); a map that
+        # repeats a key is a `refused` vector, never one of these.
+        assert not reference_refuses(fields_bytes), name
         return {"name": name, "why": why, "fields_hex": hexs(fields_bytes),
                 "expected": {"has_group_id": has, "group_id": gid, "group_action": action, "group_name": gname,
                              "group_sync": is_sync}}
@@ -819,25 +839,8 @@ def main():
         for marker in DISTRO_MARKERS
     ]
 
-    # Repeated keys (§17.14): a group entry is read from the first entry with
-    # its key, of the fields map or of 0xD1, whatever that entry holds; 0xFB
-    # from the last. A dict keeps the last of each, so these are raw maps.
-    other_id = LEFT_FULL[0]
-    leave_arr = custom_data(sync("leave", []))
+    # A bin GROUP_ID, and an ext of a type no reader knows beside a group id.
     group_entries += [
-        entries("group_id_twice_the_first_read", "two 0xA0 entries: the first is read",
-                raw_map([(0xA0, GROUP_ID), (0xA0, other_id)]), True, GROUP_ID, None, None),
-        entries("group_id_twice_the_first_malformed",
-                "two 0xA0 entries: the first is read even when it is not a group id, so the group message has no id",
-                raw_map([(0xA0, "x"), (0xA0, GROUP_ID)]), True, None, None, None),
-        entries("retichat_field_group_id_twice", "key 1 twice in 0xD1: the first is read",
-                raw_map([(FIELD_RETICHAT, raw_map([(1, GROUP_ID), (1, other_id)]))]), True, GROUP_ID, None, None),
-        entries("retichat_field_twice", "two 0xD1 fields: the first is read whole, the second not at all",
-                raw_map([(FIELD_RETICHAT, {1: GROUP_ID, 4: "accept"}), (FIELD_RETICHAT, {1: other_id, 3: GROUP_NAME})]),
-                True, GROUP_ID, "accept", None),
-        entries("group_action_and_name_twice", "0xA3 and 0xA2 twice each: the first of each is read",
-                raw_map([(0xA0, GROUP_ID), (0xA3, "invite"), (0xA2, GROUP_NAME), (0xA3, "leave"), (0xA2, "Another name")]),
-                True, GROUP_ID, "invite", GROUP_NAME),
         entries("group_id_bin_in_both_forms",
                 "a GROUP_ID that is a bin, in 0xD1 and in 0xA0: a group entry is a str, so a group message with no id",
                 {FIELD_RETICHAT: {1: GROUP_ID.encode()}, 0xA0: GROUP_ID.encode()}, True, None, None, None),
@@ -849,16 +852,6 @@ def main():
                 "an ext of a type no reader knows (9) beside key 1 of 0xD1 is skipped; the map is read",
                 {FIELD_RETICHAT: {1: GROUP_ID, 4: "accept", 10: msgpack.Ext(9, b"\x01\x02\x03\x04")}}, True, GROUP_ID,
                 "accept", None),
-        entries("custom_type_twice_the_last_not_a_marker",
-                "two 0xFB entries: the last is read, here a type that is not a distro marker after the group sync marker, so the group entries are read and the message is no G",
-                raw_map([(FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE), (FIELD_CUSTOM_TYPE, "app.example"),
-                         (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE), (0xA0, GROUP_ID), (0xA3, "leave")]),
-                True, GROUP_ID, "leave", None),
-        entries("custom_type_twice_the_last_a_marker",
-                "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G and its group entries are not read",
-                raw_map([(FIELD_CUSTOM_TYPE, "app.example"), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE),
-                         (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE), (0xA0, GROUP_ID), (0xA3, "leave")]),
-                False, None, None, None, is_sync=True),
     ]
     assert len({e["name"] for e in group_entries}) == len(group_entries)
 
@@ -876,6 +869,102 @@ def main():
         assert invite_members(csv) == want, f"{name}: {invite_members(csv)}"
         invite_cases.append({"name": name, "why": why, "csv": csv, "members": want})
 
+    # 8. Repeated keys (RFed SPEC §17.14; James, 2026-10-11: parity). A message
+    #    whose payload holds a map, at any depth, that repeats a key is refused
+    #    whole, on the direct path and on the distro path, as the reference's
+    #    LXMessage.unpack_from_bytes refuses it. Each is signed by its source, so
+    #    nothing but the repeat refuses it. A dict holds each key once, so these
+    #    are raw maps.
+    other_id = LEFT_FULL[0]
+    leave_arr = custom_data(sync("leave", []))
+    refused_specs = [
+        # name, why, signer, src, fields as msgpack bytes
+        ("group_id_twice", "two 0xA0 entries, each a group id", m, m_hash,
+         raw_map([(0xA0, GROUP_ID), (0xA0, other_id)])),
+        ("group_id_twice_one_malformed", "two 0xA0 entries, the first not a group id", m, m_hash,
+         raw_map([(0xA0, "x"), (0xA0, GROUP_ID)])),
+        ("retichat_field_group_id_twice", "key 1 twice in the Retichat field 0xD1", m, m_hash,
+         raw_map([(FIELD_RETICHAT, raw_map([(1, GROUP_ID), (1, other_id)]))])),
+        ("retichat_field_twice", "two 0xD1 fields", m, m_hash,
+         raw_map([(FIELD_RETICHAT, {1: GROUP_ID, 4: "accept"}), (FIELD_RETICHAT, {1: other_id, 3: GROUP_NAME})])),
+        ("group_action_and_name_twice", "0xA3 and 0xA2 twice each beside one 0xA0", m, m_hash,
+         raw_map([(0xA0, GROUP_ID), (0xA3, "invite"), (0xA2, GROUP_NAME), (0xA3, "leave"), (0xA2, "Another name")])),
+        ("custom_type_twice_marker_first",
+         "two 0xFB entries, the group sync marker then a type that is not a distro marker, beside group entries", m, m_hash,
+         raw_map([(FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE), (FIELD_CUSTOM_TYPE, "app.example"),
+                  (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE), (0xA0, GROUP_ID), (0xA3, "leave")])),
+        ("custom_type_twice_marker_last",
+         "two 0xFB entries, a type that is not a distro marker then the group sync marker, beside group entries", m, m_hash,
+         raw_map([(FIELD_CUSTOM_TYPE, "app.example"), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE),
+                  (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE), (0xA0, GROUP_ID), (0xA3, "leave")])),
+        ("g_leave_0xfb_twice", "a leave G from D whose 0xFB is given twice, another type then the group sync marker", d, d_hash,
+         raw_map([(FIELD_TICKET, b""), (FIELD_CUSTOM_TYPE, "app.example"), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE),
+                  (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE)])),
+        ("retichat_field_nested_map_repeats_a_key",
+         "well-formed group entries in 0xD1 beside its key 10 (no reader knows it), a map that repeats its key 0", m, m_hash,
+         raw_map([(FIELD_RETICHAT, raw_map([(1, GROUP_ID), (4, "accept"), (10, raw_map([(0, "a"), (0, "b")]))]))])),
+        ("non_group_field_twice", "a plain message, no group entry, whose renderer field 0x0F is given twice", m, m_hash,
+         raw_map([(0x0F, 2), (0x0F, 0)])),
+        ("non_group_field_nested_repeat",
+         "a group post whose commands field 0x09 is an array holding one map that repeats its key 1", m, m_hash,
+         raw_map([(0xA0, GROUP_ID), (0xA4, m_hex), (0x09, Raw(b"\x91" + raw_map([(1, b"a"), (1, b"b")])))])),
+    ]
+    refused = []
+    for i, (name, why, signer, src, fields_raw) in enumerate(refused_specs):
+        content = b"" if src == d_hash else b"x"
+        timestamp = 1790000600.5 + i
+        packed = pack_raw(signer, d_hash, src, timestamp, b"", content, fields_raw)
+        assert reference_refuses(fields_raw), f"{name}: the fields repeat a key"
+        assert reference_refuses_message(packed), f"{name}: LXMF.py refuses the message"
+        refused.append({"name": name, "why": why, "source": "distro" if src == d_hash else "member",
+                        "timestamp": timestamp, "content": content.decode(), "fields_hex": hexs(fields_raw),
+                        "packed_hex": hexs(packed)})
+    assert len({r["name"] for r in refused}) == len(refused)
+
+    # 9. Which two keys are one key: Python's equality, as umsgpack's `k in d`
+    #    tests it. Each is a fields map of two entries, {a: 0, b: 1}.
+    key_equality = []
+    for i, (name, a, b, is_refused, why) in enumerate([
+        ("int_fixint_and_uint8", "01", "cc01", True, "1 as a positive fixint and as uint 8"),
+        ("int_uint16_and_int64", "cd00a0", "d300000000000000a0", True, "0xA0 as uint 16 and as int 64"),
+        ("int_and_float64", "01", "cb3ff0000000000000", True, "the int 1 and the float 64 1.0"),
+        ("int_and_float32", "01", "ca3f800000", True, "the int 1 and the float 32 1.0"),
+        ("true_and_int_1", "c3", "01", True, "true and the int 1"),
+        ("false_and_int_0", "c2", "00", True, "false and the int 0"),
+        ("int_0_and_float_minus_0", "00", "cb8000000000000000", True, "the int 0 and the float 64 -0.0"),
+        ("float32_and_float64", "ca3fc00000", "cb3ff8000000000000", True, "1.5 as float 32 and as float 64"),
+        ("infinity_float32_and_float64", "ca7f800000", "cb7ff0000000000000", True, "infinity as float 32 and as float 64"),
+        ("int_minus_1_int8_and_fixint", "d0ff", "ff", True, "-1 as int 8 and as a negative fixint"),
+        ("uint64_max_and_float_2_64", "cfffffffffffffffff", "cb43f0000000000000", False,
+         "2^64 - 1 (uint 64) and the float 64 2^64: not one value"),
+        ("nan_twice", "cb7ff8000000000000", "cb7ff8000000000000", False, "NaN twice: NaN equals nothing, not even NaN"),
+        ("nil_twice", "c0", "c0", True, "nil twice"),
+        ("empty_str_twice", "a0", "a0", True, "the empty str twice"),
+        ("str_and_bin", "a161", "c40161", False, "the str 'a' and the bin 'a': a str is never a bin"),
+        ("int_and_str", "01", "a131", False, "the int 1 and the str '1'"),
+        ("str_not_normalised", "a2c3a9", "a365cc81", False,
+         "U+00E9 and U+0065 U+0301: a str is compared by its code points, never normalised"),
+        ("ext_twice", "d40500", "d40500", True, "the ext (5, 00) twice"),
+        ("ext_fixext1_and_ext8", "d40500", "c7010500", True, "the ext (5, 00) as fixext 1 and as ext 8"),
+        ("ext_other_type", "d40500", "d40600", False, "the exts (5, 00) and (6, 00)"),
+        ("timestamp_32_and_64", "d6ff00000000", "d7ff0000000000000000", True,
+         "the timestamp ext (-1) of the epoch as timestamp 32 and as timestamp 64: one instant"),
+        ("array_twice", "9101", "9101", False,
+         "the array [1] twice: umsgpack never compares an array key (it makes it a tuple and skips the check)"),
+    ]):
+        fields_raw = b"\x82" + bytes.fromhex(a) + b"\x00" + bytes.fromhex(b) + b"\x01"
+        packed = pack_raw(m, d_hash, m_hash, 1790000700.5 + i, b"", b"x", fields_raw)
+        assert reference_refuses(fields_raw) == is_refused, name
+        assert reference_refuses_message(packed) == is_refused, name
+        key_equality.append({"name": name, "why": why, "keys_hex": [a, b], "refused": is_refused,
+                             "fields_hex": hexs(fields_raw), "packed_hex": hexs(packed)})
+    assert len({k["name"] for k in key_equality}) == len(key_equality)
+
+    for set_name, vectors in [("ops", ops), ("variants", variants), ("at_ms_encodings", at_ms_encodings),
+                              ("rejects", rejects), ("sealed", sealed), ("group_entries", group_entries)]:
+        for vector in vectors:
+            assert not reference_refuses(bytes.fromhex(vector["fields_hex"])), f"{set_name}: {vector.get('name', vector.get('why'))}"
+
     out = {
         "spec": "RFed-rust SPEC.md §17.14 (groups and the distro); GROUPS-DISTRO-DESIGN.md §7, §10, §11.1, §17.1, §19.1",
         "notes": [
@@ -883,15 +972,18 @@ def main():
             "All *_hex values are lowercase hex. Identities: private_key_hex is the X25519 private key (32) | Ed25519 seed (32); lxmf_delivery_hash_hex is Destination.hash(identity, 'lxmf', 'delivery'). D is the distro (the same key as distro_sync_vectors.json), M a member, X a key that is not M's.",
             "A G is the LXMF message D packs to itself (dest = src = D): empty title and content, fields {0x0C: bin '', 0xFB: 'rfed.distro.group', 0xFC: native array [op, group_id, at_ms, ...], 0xFD: the sending device's address}, in that order. packed_hex = dest(16) | src(16) | signature(64) | msgpack [timestamp f64, bin title, bin content, fields]; hash_hex = full_hash(dest | src | payload), the LXMF message hash; fields_hex = the fields map alone.",
             "ops: each op with an empty and a full (32) left, as set_group_sync_fields writes it from `sync` (the §7 group_sync object without by and problem) and a timestamp: an implementation that writes `sync` on a message from D to D with that timestamp and packs it must produce packed_hex exactly. `expected` is the §7 group_sync object a receiver reports for it.",
-            "variants: forms a receiver must read that a Rust writer does not make (the web's int 64 at_ms, bin name or text, elements after left, uppercase ids, 0xFD absent or uppercase, ...), each with its expected reading.",
+            "variants: forms a receiver must read that a Rust writer does not make (the web's int 64 at_ms, bin name or text, elements after left, uppercase ids, 0xFD absent or uppercase, ...), each with its expected reading. by is 0xFD as text, lowercased, when 0xFD is a str or a bin, else \"\" (absent, an int, an array, ...).",
             "at_ms_encodings: fields of a leave G whose at_ms is written in the encoding at_ms_hex; accepted ones read as at_ms, the others are refused (problem set).",
             "rejects: fields of a G that fails §11.1 rule 4; the reading has `by` and a non-null `problem`, and every other key null. The problem text is each implementation's own.",
             "members is parsed with the phones' invite parser (iOS/Android DeliveryPolicy.members): split on ',', each entry trimmed of invite_space (Unicode Zs and U+0009) at both ends, kept when it is exactly 32 lowercase hex, the first of each; it must name D. creator (an accept) is 32 hex, read lowercased, listed, not D.",
             "invite_space: the code points the invite parser trims, Unicode Zs and U+0009 (Swift's CharacterSet.whitespaces), and no other.",
             "sealed: blobs as RFed hands them to D's devices (blob_hex = D_hash | D.encrypt(packed[16:]); the encryption is random, so these bytes are fixed input), each with the unwrap's expected hash (hash_hex; LXMF.py's: full_hash(dest | src | payload) over the payload as received, packed again only to drop a stamp; g_accept_web_form_int64_at_ms is not in the form a packer makes, so a reader that always packs the payload again gets another hash and a failed signature), packed (packed_hex = blob[0:16] | plaintext) and the §7 keys after each phone's group receipt; sender_key_hex is the 128-hex key (null when none), packed true when the JSON's packed is the base64 of packed_hex, false when null. M is not known to the receiver.",
             "group_entries: the unwrap's has_group_id, group_id, group_action and group_name for a fields map alone, and whether group_sync is set (true) or null (false).",
-            "Repeated keys (RFed SPEC §17.14): a fields map, and the Retichat field 0xD1, may hold a key more than once. A group entry (0xA0-0xA8, the field 0xD1 itself, and keys 1-9 inside it) is read from the first entry with its key, even when that entry is not of the entry's type; 0xFB is read from the last. A reader that decodes the map into a dictionary keeps the last of each key and must read the group entries from the bytes. These readings are LXMF-rust's: the Python reference refuses a map that repeats a key, at any depth, whole (RNS umsgpack DuplicateKeyException), so they are not checked against it. group_entries (*_twice*, the custom_type_twice_* pair) and variants (leave_0xfb_twice_the_last_the_marker) pin it; group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
+            "group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
             "invite_members: csv strings and the members the invite parser lists for each. The csv is split on the code point ',' (U+002C), never on grapheme clusters: a combining mark after a comma does not join it (Swift's String.split on Character would), and a combining mark before an entry is part of that entry. variants accept_members_combining_mark_after_a_comma and rejects members_naming_d_after_a_combining_mark are the same two cases in a G.",
+            "Repeated keys (RFed SPEC §17.14; James, 2026-10-11: parity): a message whose payload holds a map, at any depth, that repeats a key is refused whole, as Python LXMF refuses it (RNS umsgpack raises DuplicateKeyException in LXMessage.unpack_from_bytes): on the direct path and on the distro path, with a log line, and never shown, stored or applied. No reader of the group entries, the group sync or a channel membership message ever sees such a map. No vector outside refused and key_equality repeats a key.",
+            "refused: messages to D whose payload repeats a key, each signed by its source (source 'member' is M, 'distro' is D); packed_hex = dest(16) | src(16) | signature(64) | msgpack [timestamp f64, bin title '', bin content, fields as fields_hex]. Every client refuses each whole: the direct path's unpack of packed_hex, and the distro unwrap of packed_hex[0:16] | D.encrypt(packed_hex[16:]). The generator asserts the reference refuses each.",
+            "key_equality: a fields map {a: 0, b: 1} for each pair of keys keys_hex = [a, b], and the message from M to D carrying it (packed_hex as in refused); refused is whether the reference takes a and b for one key and refuses the message. Python's equality: an integer, float or boolean of one numeric value whatever its encoding is one key (1, 1.0, true); NaN is no key's equal; a str by its code points, a bin by its bytes, a str never a bin; nil; an ext by type and data, a timestamp ext (-1) by its instant to the microsecond; an array key is never compared (umsgpack skips the check for it). A map key is refused by umsgpack for another reason (UnhashableKeyException), not pinned here.",
         ],
         "distro": {
             "private_key_hex": D_PRIVATE_KEY.hex(),
@@ -924,6 +1016,8 @@ def main():
         "sealed": sealed,
         "group_entries": group_entries,
         "invite_members": invite_cases,
+        "refused": refused,
+        "key_equality": key_equality,
     }
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "distro_group_sync_vectors.json")
     with open(path, "w") as f:

@@ -1196,6 +1196,13 @@ impl LXMessage {
 		let packed_payload = lxmf_bytes[2 * Self::DESTINATION_LENGTH + Self::SIGNATURE_LENGTH..].to_vec();
 
 		let payload_value = decode_value(&packed_payload)?;
+		// RFed SPEC §17.14 "Repeated keys": a payload holding a map, at any
+		// depth, that repeats a key is refused whole, as LXMF.py's umsgpack
+		// refuses it (logged once, there).
+		crate::msgpack_keys::refuse_repeated_keys(
+			&payload_value,
+			&format!("LXMF message from {}", hexrep(&source_hash, false)),
+		)?;
 		let payload_items = payload_value
 			.as_array()
 			.ok_or("LXMF payload is not an array")?
@@ -1307,6 +1314,9 @@ impl LXMessage {
 			.read_to_end(&mut buffer)
 			.map_err(|e| format!("Could not read LXMessage file handle: {}", e))?;
 		let container_value = decode_value(&buffer)?;
+		// LXMF.py reads the container with umsgpack too, which refuses a map
+		// that repeats a key (RFed SPEC §17.14 "Repeated keys").
+		crate::msgpack_keys::refuse_repeated_keys(&container_value, "stored LXMF container")?;
 		let container = container_value
 			.as_map()
 			.ok_or("LXMF container is not a map")?

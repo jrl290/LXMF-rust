@@ -9,6 +9,7 @@ pub mod lx_stamper;
 pub mod lxmf;
 pub mod lxm_peer;
 pub mod lxm_router;
+pub mod msgpack_keys;
 pub mod name_ledger;
 pub mod retichat_field;
 pub mod utilities;
