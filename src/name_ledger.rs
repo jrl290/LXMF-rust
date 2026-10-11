@@ -23,7 +23,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use reticulum_rust::{hexrep, log, LOG_ERROR, LOG_NOTICE};
 
 use crate::display_name::{self, NameField, DIGEST_LEN, NAME_REFRESH_SECS};
-use crate::distro::{DISTRO_SENT_TYPE, DISTRO_TRANSFER_TYPE};
+use crate::distro::DISTRO_MARKERS;
 use crate::lx_message::LXMessage;
 use crate::lxmf::FIELD_CUSTOM_TYPE;
 use crate::retichat_field::{self, key_is, RF_DISPLAY_NAME};
@@ -72,15 +72,16 @@ pub fn decide(message_name: Option<&str>, row: Option<&LedgerRow>, now: i64) -> 
 }
 
 /// §4.1: messages to one's own devices carry no name — distro sent-copies
-/// (RFed SPEC §17.11) and distro identity transfers (§17.9), recognised by
-/// their `FIELD_CUSTOM_TYPE`.
+/// (RFed SPEC §17.11), distro identity transfers (§17.9), channel membership
+/// messages (§17.12) and group syncs (§17.14): every distro marker
+/// (`DISTRO_MARKERS`), recognised by its `FIELD_CUSTOM_TYPE`.
 pub fn is_own_devices_message(fields: &Value) -> bool {
 	let Value::Map(entries) = fields else { return false };
 	entries.iter().any(|(key, value)| {
 		key_is(key, FIELD_CUSTOM_TYPE)
 			&& match value {
-				Value::String(s) => matches!(s.as_str(), Some(DISTRO_SENT_TYPE) | Some(DISTRO_TRANSFER_TYPE)),
-				Value::Binary(b) => b == DISTRO_SENT_TYPE.as_bytes() || b == DISTRO_TRANSFER_TYPE.as_bytes(),
+				Value::String(s) => s.as_str().is_some_and(|s| DISTRO_MARKERS.contains(&s)),
+				Value::Binary(b) => DISTRO_MARKERS.iter().any(|m| b == m.as_bytes()),
 				_ => false,
 			}
 	})
@@ -267,6 +268,7 @@ impl NameLedger {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::distro::{DISTRO_SENT_TYPE, DISTRO_TRANSFER_TYPE};
 	use crate::display_name::decode_field;
 	use reticulum_rust::destination::{Destination, DestinationType};
 	use reticulum_rust::identity::Identity;
@@ -536,6 +538,29 @@ mod tests {
 		let mut lxm = message(&p, Some(fields));
 		ledger.prepare_outbound(Some("Alice"), &mut lxm, 1_000);
 		assert_eq!(decode_field(&lxm.fields), NameField::Name("Alice".into()));
+	}
+
+	/// RFed SPEC §17.12 and §17.14 (GROUPS-DISTRO-DESIGN.md §17.1): the
+	/// channel membership message and the group sync go to one's own devices
+	/// too, so they carry no name either (DISPLAY_NAMES "Posting as the
+	/// distro").
+	#[test]
+	fn distro_channel_and_group_syncs_carry_no_name() {
+		let ledger = NameLedger::open(&temp_dir("exclusions-syncs"));
+		let p = pair();
+		for custom_type in ["rfed.distro.channel", "rfed.distro.group"] {
+			for value in [Value::String(custom_type.into()), Value::Binary(custom_type.as_bytes().to_vec())] {
+				let fields = Value::Map(vec![(Value::from(FIELD_CUSTOM_TYPE as i64), value)]);
+				assert!(is_own_devices_message(&fields), "{custom_type}");
+				let mut lxm = message(&p, Some(fields));
+				ledger.prepare_outbound(Some("Alice"), &mut lxm, 1_000);
+				assert_eq!(decode_field(&lxm.fields), NameField::Absent, "{custom_type}");
+			}
+		}
+		assert!(!is_own_devices_message(&Value::Map(vec![(
+			Value::from(FIELD_CUSTOM_TYPE as i64),
+			Value::String("rfed.distro.groups".into())
+		)])));
 	}
 
 	/// The packed field order after the router's key 0 decision, pinned

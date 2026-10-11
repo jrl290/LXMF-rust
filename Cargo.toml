@@ -49,6 +49,5 @@ ctrlc = "3.4"
 # as Reticulum-rust's known destinations store, so every dependent's
 # Cargo.lock keeps a single rusqlite / libsqlite3-sys.
 rusqlite = { version = "0.31", features = ["bundled"] }
-
-[dev-dependencies]
+# GroupSync::from_json, the phone bridges' input for a group sync (RFed SPEC §17.14).
 serde_json = "1.0"

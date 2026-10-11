@@ -17,7 +17,12 @@
 //! `parse_distro_announce_payload`; see RFed SPEC §17.5 and §17.9. The
 //! sent-message sync marker read by `unwrap_blob` is RFed SPEC §17.11. The
 //! distro sync proof (`seal_for_sync`, `sealed_upload`,
-//! `decode_sync_extension`, `verify_sync_claim`) is RFed SPEC §17.13.
+//! `decode_sync_extension`, `verify_sync_claim`) is RFed SPEC §17.13. The
+//! group sync (`set_group_sync_fields`, `read_group_sync`, `GroupSync`) and
+//! the unwrap's group keys (`hash`, `packed`, `has_group_id`, `group_id`,
+//! `group_action`, `group_name`, `group_sync`, and the JSON of
+//! `DistroMessage::to_json_with_receipt`) are RFed SPEC §17.14
+//! (GROUPS-DISTRO-DESIGN.md §7, §10, §17.1).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -94,35 +99,104 @@ pub struct DistroMessage {
     /// they take for a direct message. `None` when the payload has no fields
     /// map. An empty map is `Some(vec![0x80])`.
     pub fields: Option<Vec<u8>>,
+    /// The LXMF message hash (32 bytes), as LXMF/LXMF.py
+    /// `LXMessage.unpack_from_bytes` computes it: `full_hash(dest | src |
+    /// payload)`, the payload packed again without a stamp when it carries one.
+    /// RFed SPEC §17.14 keys group messages and group syncs by it.
+    pub hash: Vec<u8>,
+    /// The message as received: `blob[..16] | plaintext`, that is `dest |
+    /// src | signature | payload` (a stamp with it). For the phones' group
+    /// receipt (`group_status::receipt_parts`), which reports it back for an
+    /// accept or leave a creator keeps; never put in the JSON whole.
+    pub packed: Vec<u8>,
+    /// GROUPS-DISTRO-DESIGN.md §7: the fields carry a GROUP_ID entry in either
+    /// form (key 1 of 0xD1, or 0xA0), of any type, and 0xFB is not a distro
+    /// marker ([`DISTRO_MARKERS`]). This, not `group_id`, routes a message to
+    /// the group branch, so a malformed id is dropped there.
+    pub has_group_id: bool,
+    /// GROUP_ID by Group.md's reader rule (`retichat_field::read_group_entry`)
+    /// when it is a str of exactly 32 hex characters, lowercased; else `None`.
+    /// `None` whenever `has_group_id` is false.
+    pub group_id: Option<String>,
+    /// GROUP_ACTION by the same rule, as sent; `None` when absent or when
+    /// `has_group_id` is false.
+    pub group_action: Option<String>,
+    /// GROUP_NAME by the same rule (an invite's notification text); `None`
+    /// when absent or when `has_group_id` is false.
+    pub group_name: Option<String>,
+    /// RFed SPEC §17.14: the group sync, `Some` exactly when 0xFB is
+    /// [`DISTRO_GROUP_TYPE`] ([`read_group_sync`] against this distro).
+    pub group_sync: Option<GroupSyncRead>,
+}
+
+/// The verdict and the extras the §7 JSON reports for a message: the
+/// unwrap's own ([`DistroMessage::receipt`]), or the one each phone's group
+/// receipt (`group_status::receipt_parts`) makes of it. GROUPS-DISTRO-DESIGN.md
+/// §7, §17.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistroReceipt {
+    pub validated: bool,
+    /// 0 validated, `LXMessage::SOURCE_UNKNOWN` (1), `LXMessage::SIGNATURE_INVALID` (2).
+    pub unverified_reason: u8,
+    /// The 64-byte key an accept or leave carries for its own sender, when it binds.
+    pub sender_key: Option<Vec<u8>>,
+    /// The packed message of an accept or leave a creator may keep.
+    pub packed: Option<Vec<u8>>,
 }
 
 impl DistroMessage {
+    /// The unwrap's own verdict, with no key and no packed copy: what
+    /// [`DistroMessage::to_json`] reports.
+    pub fn receipt(&self) -> DistroReceipt {
+        DistroReceipt {
+            validated: self.signature_validated,
+            unverified_reason: self.unverified_reason.unwrap_or(0),
+            sender_key: None,
+            packed: None,
+        }
+    }
+
+    /// [`DistroMessage::to_json_with_receipt`] with the unwrap's own verdict.
+    pub fn to_json(&self) -> String {
+        self.to_json_with_receipt(&self.receipt())
+    }
+
     /// The JSON both native bridges return from their distro unwrap
     /// (`retichat_distro_unwrap`, `nativeDistroUnwrap`): one definition, so the
-    /// keys cannot drift between iOS and Android.
+    /// keys cannot drift between iOS and Android. Each bridge passes the
+    /// verdict of its own group receipt (GROUPS-DISTRO-DESIGN.md §7, §17.2).
     ///
     /// Keys: `source_hash` (hex), `timestamp`, `title`, `content`,
     /// `is_delivery_notification`, `ticket`, `distro_transfer_key`, `sent_to`,
     /// `sent_by`, `display_name_state` (0 absent, 1 clear, 2 name),
-    /// `display_name` (null unless 2), `signature_validated`,
+    /// `display_name` (null unless 2), `signature_validated` and
     /// `unverified_reason` (0 ok, 1 source unknown, 2 signature invalid),
-    /// `fields`: the LXMF fields map as msgpack (`DistroMessage::fields`,
-    /// the bytes as the sender packed them), base64 with the standard
-    /// alphabet and `=` padding (RFC 4648 §4) — what iOS
+    /// both `receipt`'s; `fields`: the LXMF fields map as msgpack
+    /// (`DistroMessage::fields`, the bytes as the sender packed them), base64
+    /// with the standard alphabet and `=` padding (RFC 4648 §4) — what iOS
     /// `Data(base64Encoded:)` and Android `Base64.decode(_, DEFAULT)` read —
     /// or null when the payload has no fields map. The decoded bytes go
     /// straight to the apps' field decoders, as for a direct message.
-    pub fn to_json(&self) -> String {
+    ///
+    /// Then (RFed SPEC §17.14, GROUPS-DISTRO-DESIGN.md §7): `hash` (64
+    /// lowercase hex), `has_group_id` (bool), `group_id`, `group_action`,
+    /// `group_name` (string or null), `group_sync` (null, or the object of
+    /// [`GroupSyncRead::to_json`]), `sender_key` (`receipt`'s, 128 lowercase
+    /// hex, or null) and `packed` (`receipt`'s, base64 as `fields`, or null).
+    pub fn to_json_with_receipt(&self, receipt: &DistroReceipt) -> String {
         let opt = |v: &Option<String>| v.as_deref().map(json_string).unwrap_or_else(|| "null".into());
+        let b64 = |v: Option<&[u8]>| v.map(|f| format!("\"{}\"", STANDARD.encode(f))).unwrap_or_else(|| "null".into());
         format!(
             concat!(
                 r#"{{"source_hash":"{}","timestamp":{},"title":{},"content":{},"#,
                 r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{},"#,
                 r#""sent_to":{},"sent_by":{},"#,
                 r#""display_name_state":{},"display_name":{},"signature_validated":{},"unverified_reason":{},"#,
-                r#""fields":{}}}"#
+                r#""fields":{},"#,
+                r#""hash":"{}","has_group_id":{},"group_id":{},"group_action":{},"group_name":{},"group_sync":{},"#,
+                r#""sender_key":{},"packed":{}}}"#
             ),
-            self.source_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            hex(&self.source_hash),
             self.timestamp,
             json_string(&self.title),
             json_string(&self.content),
@@ -133,12 +207,24 @@ impl DistroMessage {
             opt(&self.sent_by),
             self.display_name.state_byte(),
             self.display_name.name().map(json_string).unwrap_or_else(|| "null".into()),
-            self.signature_validated,
-            self.unverified_reason.unwrap_or(0),
+            receipt.validated,
+            receipt.unverified_reason,
             // Base64 needs no JSON escaping.
-            self.fields.as_deref().map(|f| format!("\"{}\"", STANDARD.encode(f))).unwrap_or_else(|| "null".into()),
+            b64(self.fields.as_deref()),
+            hex(&self.hash),
+            self.has_group_id,
+            opt(&self.group_id),
+            opt(&self.group_action),
+            opt(&self.group_name),
+            self.group_sync.as_ref().map(GroupSyncRead::to_json).unwrap_or_else(|| "null".into()),
+            receipt.sender_key.as_deref().map(|k| format!("\"{}\"", hex(k))).unwrap_or_else(|| "null".into()),
+            b64(receipt.packed.as_deref()),
         )
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A JSON string literal (the escaping both bridges used before this moved here).
@@ -180,6 +266,20 @@ pub const DISTRO_TRANSFER_TYPE: &str = "rfed.distro.transfer";
 /// a device that sent a message as the distro copies it to the distro itself
 /// so every sibling device shows it as sent.
 pub const DISTRO_SENT_TYPE: &str = "rfed.distro.sent";
+/// The FIELD_CUSTOM_TYPE value of a channel membership message (RFed SPEC
+/// §17.12). The phones write it in their own glue (`distro_outbox.rs`).
+pub const DISTRO_CHANNEL_TYPE: &str = "rfed.distro.channel";
+/// The FIELD_CUSTOM_TYPE value of a group sync G (RFed SPEC §17.14).
+pub const DISTRO_GROUP_TYPE: &str = "rfed.distro.group";
+/// The distro markers, exactly (RFed SPEC §17.14 "Group messages through the
+/// distro"): a message whose `fields[0xFB]` is one of these is never a group
+/// message, and its group entries are not read. Any other value is not one.
+pub const DISTRO_MARKERS: [&str; 4] = [DISTRO_TRANSFER_TYPE, DISTRO_SENT_TYPE, DISTRO_CHANNEL_TYPE, DISTRO_GROUP_TYPE];
+/// `at_ms` is an integer from 0 to 2^53 - 1 on every client (§17.12 "`at_ms`
+/// on the wire"), exact in every JSON reader.
+pub const MAX_AT_MS: u64 = (1u64 << 53) - 1;
+/// A group sync's `left` holds at most this many group ids (§17.14).
+pub const GROUP_SYNC_LEFT_MAX: usize = 32;
 
 fn encode(value: &Value) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -723,6 +823,25 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
     let is_delivery_notification = ticket.is_some() && content.is_empty() && !carries_attachment;
     let fields = fields_map_bytes(payload).map(<[u8]>::to_vec);
 
+    // RFed SPEC §17.14: the LXMF hash and the message as received, for the
+    // group branch's seen keys and the phones' group receipt; the group
+    // entries, unless a distro marker says the message is none; the group sync.
+    let hash = full_hash(&hashed_part(&expected, &source_hash, payload, &arr));
+    let packed = [&blob[..DEST_HASH_LEN], &plaintext[..]].concat();
+    let fields_value = arr.get(3).filter(|f| matches!(f, Value::Map(_)));
+    let marked = match fields_value {
+        Some(Value::Map(entries)) => custom_type(entries).is_some_and(|t| DISTRO_MARKERS.contains(&t.as_str())),
+        _ => false,
+    };
+    let (has_group_id, group_id, group_action, group_name) = match fields_value {
+        Some(fields) if !marked => group_entries(fields),
+        _ => (false, None, None, None),
+    };
+    let group_sync = match fields_value {
+        Some(Value::Map(entries)) => read_group_sync(entries, &hex(&expected)),
+        _ => None,
+    };
+
     Ok(Some(DistroMessage {
         source_hash,
         timestamp,
@@ -737,6 +856,13 @@ pub fn unwrap_blob(distro: &mut Identity, blob: &[u8]) -> Result<Option<DistroMe
         signature_validated,
         unverified_reason,
         fields,
+        hash,
+        packed,
+        has_group_id,
+        group_id,
+        group_action,
+        group_name,
+        group_sync,
     }))
 }
 
@@ -821,6 +947,18 @@ fn lxmf_signature_valid(
     items: &[Value],
     signature: &[u8],
 ) -> bool {
+    let hashed_part = hashed_part(dest, src, packed_payload, items);
+    let mut signed_part = hashed_part.clone();
+    signed_part.extend_from_slice(&full_hash(&hashed_part));
+    signer.validate(signature, &signed_part)
+}
+
+/// LXMF's hashed part, as LXMF/LXMF.py `LXMessage.unpack_from_bytes` builds
+/// it: `dest || src || packed_payload`, where a payload carrying a stamp (a
+/// 5th element) is packed again without it and any other payload is taken as
+/// received. Its `full_hash` is the message hash; the signature covers it and
+/// that hash.
+fn hashed_part(dest: &[u8], src: &[u8], packed_payload: &[u8], items: &[Value]) -> Vec<u8> {
     let restamped;
     let packed = if items.len() > 4 {
         restamped = encode(&Value::Array(items[..4].to_vec()));
@@ -832,9 +970,7 @@ fn lxmf_signature_valid(
     hashed_part.extend_from_slice(dest);
     hashed_part.extend_from_slice(src);
     hashed_part.extend_from_slice(packed);
-    let mut signed_part = hashed_part.clone();
-    signed_part.extend_from_slice(&full_hash(&hashed_part));
-    signer.validate(signature, &signed_part)
+    hashed_part
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -844,6 +980,457 @@ fn value_to_string(value: &Value) -> String {
         Value::Nil => String::new(),
         other => other.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Groups and the distro (RFed-rust SPEC.md §17.14; GROUPS-DISTRO-DESIGN.md §7,
+// §10, §11.1, §17.1). The format of the group sync G, written and read here
+// once, for both phone bridges; the golden vectors are
+// tests/distro_group_sync_vectors.json, made with the Python reference.
+// ---------------------------------------------------------------------------
+
+/// `fields[0xFB]` as text when it is a str or a bin, else `None`; the last
+/// entry with that key wins, as in the readers above and in Python's dict.
+fn custom_type(entries: &[(Value, Value)]) -> Option<String> {
+    match entries.iter().rev().find(|(k, _)| k.as_u64() == Some(FIELD_CUSTOM_TYPE)).map(|(_, v)| v)? {
+        Value::String(s) => Some(String::from_utf8_lossy(s.as_bytes()).into_owned()),
+        Value::Binary(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }
+}
+
+/// `entries`' value for the top-level field `field` (the last such entry).
+fn custom_field(entries: &[(Value, Value)], field: u64) -> Option<&Value> {
+    entries.iter().rev().find(|(k, _)| k.as_u64() == Some(field)).map(|(_, v)| v)
+}
+
+/// `s` lowercased when it is exactly 32 hex characters (either case).
+fn hex32(s: &str) -> Option<String> {
+    (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// GROUPS-DISTRO-DESIGN.md §7: `(has_group_id, group_id, group_action,
+/// group_name)` of a fields map that carries no distro marker. A GROUP_ID
+/// entry of any type in either form (key 1 of 0xD1, or 0xA0) makes it a group
+/// message; the values are read by Group.md's reader rule
+/// (`retichat_field::read_group_entry`: the Retichat field when it holds the
+/// entry with its type, else the old field), the id kept only when it is 32
+/// hex characters.
+fn group_entries(fields: &Value) -> (bool, Option<String>, Option<String>, Option<String>) {
+    use crate::retichat_field::{self as rf, GroupValue, RF_GROUP_ACTION, RF_GROUP_ID, RF_GROUP_NAME};
+    let legacy_id = rf::group_entry(RF_GROUP_ID).map(|(field, _)| field).unwrap_or(0xA0);
+    let has = rf::read_entry(fields, RF_GROUP_ID).is_some() || rf::top_level(fields, legacy_id).is_some();
+    if !has {
+        return (false, None, None, None);
+    }
+    let text = |key| match rf::read_group_entry(fields, key) {
+        Some(GroupValue::Str(s)) => Some(s),
+        _ => None,
+    };
+    (true, text(RF_GROUP_ID).and_then(|id| hex32(&id)), text(RF_GROUP_ACTION), text(RF_GROUP_NAME))
+}
+
+/// The phones' invite parser for a `GROUP_MEMBERS` csv (iOS and Android
+/// `DeliveryPolicy.members`): split on `,`, each entry trimmed, kept when it
+/// is exactly 32 lowercase hex characters, the first of each kept. A group
+/// sync's `members` is read with it (§17.14: "read with the invite's own
+/// parser") and must name D.
+pub fn invite_members(csv: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in csv.split(',').map(str::trim) {
+        if entry.len() == 32 && entry.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) && !out.iter().any(|m| m == entry) {
+            out.push(entry.to_string());
+        }
+    }
+    out
+}
+
+/// A group sync's op (RFed SPEC §17.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSyncOp {
+    /// The user created the group as D: `[op, group_id, at_ms, name, members, keys, left]`.
+    Create,
+    /// The user accepted the invite as D: `[op, group_id, at_ms, name, members, keys, creator, left]`.
+    Accept,
+    /// The user declined, left or deleted the group as D: `[op, group_id, at_ms, left]`.
+    Leave,
+    /// The user posted in the group as D: `[op, group_id, at_ms, text, left]`.
+    Post,
+}
+
+impl GroupSyncOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GroupSyncOp::Create => "create",
+            GroupSyncOp::Accept => "accept",
+            GroupSyncOp::Leave => "leave",
+            GroupSyncOp::Post => "post",
+        }
+    }
+
+    /// The op named exactly `op`, or `None`.
+    pub fn parse(op: &str) -> Option<GroupSyncOp> {
+        match op {
+            "create" => Some(GroupSyncOp::Create),
+            "accept" => Some(GroupSyncOp::Accept),
+            "leave" => Some(GroupSyncOp::Leave),
+            "post" => Some(GroupSyncOp::Post),
+            _ => None,
+        }
+    }
+
+    /// "a create", "an accept", "a leave", "a post": for messages.
+    fn a(self) -> &'static str {
+        match self {
+            GroupSyncOp::Create => "a create",
+            GroupSyncOp::Accept => "an accept",
+            GroupSyncOp::Leave => "a leave",
+            GroupSyncOp::Post => "a post",
+        }
+    }
+
+    /// The elements of its 0xFC array, `left` the last of them.
+    fn elements(self) -> usize {
+        match self {
+            GroupSyncOp::Create => 7,
+            GroupSyncOp::Accept => 8,
+            GroupSyncOp::Leave => 4,
+            GroupSyncOp::Post => 5,
+        }
+    }
+
+    /// Whether it carries the group's description (`name`, `members`, `keys`).
+    fn describes_the_group(self) -> bool {
+        matches!(self, GroupSyncOp::Create | GroupSyncOp::Accept)
+    }
+}
+
+/// A group sync's `fields[0xFC]`, read or to be written (RFed SPEC §17.14).
+/// Ids are lowercase when read; `members` and `keys` are verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSync {
+    pub op: GroupSyncOp,
+    /// 32 hex characters.
+    pub group_id: String,
+    /// The time of the user's action (a post's own time), 0 to [`MAX_AT_MS`].
+    pub at_ms: u64,
+    /// `create`, `accept`: GROUP_NAME as the group holds it, possibly empty.
+    pub name: Option<String>,
+    /// `create`, `accept`: the GROUP_MEMBERS csv exactly as the invite carried it.
+    pub members: Option<String>,
+    /// `create`, `accept`: GROUP_MEMBER_KEYS entries (`<32 hex>:<base64 key>`),
+    /// possibly none. Empty for the other ops.
+    pub keys: Vec<String>,
+    /// `accept`: the invite's authenticated source, listed, not D.
+    pub creator: Option<String>,
+    /// `post`: the post's content, possibly empty (attachments are not copied).
+    pub text: Option<String>,
+    /// Every op: the group ids the sending device holds as left by D, most
+    /// recent first, at most [`GROUP_SYNC_LEFT_MAX`].
+    pub left: Vec<String>,
+}
+
+/// A received group sync: `by` (`fields[0xFD]` lowercased, `""` when absent)
+/// and the form of `fields[0xFC]`, or why it fails §11.1 rule 4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSyncRead {
+    pub by: String,
+    pub sync: Result<GroupSync, String>,
+}
+
+impl GroupSync {
+    /// The JSON form: the `group_sync` object of GROUPS-DISTRO-DESIGN.md §7
+    /// without `by` and `problem`. Keys, every one always present, in order:
+    /// `op` (string), `group_id` (string), `at_ms` (integer), `name`,
+    /// `members` (string, or null unless create/accept), `keys` (array of
+    /// string, or null unless create/accept), `creator` (string, or null
+    /// unless accept), `text` (string, or null unless post), `left` (array of
+    /// string).
+    pub fn to_json(&self) -> String {
+        let opt = |v: &Option<String>| v.as_deref().map(json_string).unwrap_or_else(|| "null".into());
+        let list = |v: &[String]| format!("[{}]", v.iter().map(|s| json_string(s)).collect::<Vec<_>>().join(","));
+        format!(
+            r#"{{"op":"{}","group_id":{},"at_ms":{},"name":{},"members":{},"keys":{},"creator":{},"text":{},"left":{}}}"#,
+            self.op.as_str(),
+            json_string(&self.group_id),
+            self.at_ms,
+            opt(&self.name),
+            opt(&self.members),
+            if self.op.describes_the_group() { list(&self.keys) } else { "null".into() },
+            opt(&self.creator),
+            opt(&self.text),
+            list(&self.left),
+        )
+    }
+
+    /// The writers' input (both phone bridges): the JSON form of
+    /// [`GroupSync::to_json`]. `op`, `group_id`, `at_ms` (an integer) and
+    /// `left` (an array of strings, empty when the device holds no left group)
+    /// are required; `name`, `members` and `keys` exactly for create and
+    /// accept, `creator` exactly for accept, `text` exactly for post. A key that
+    /// is not part of the op must be absent or null; other keys (`by`,
+    /// `problem`) are ignored. The values themselves are checked by
+    /// [`set_group_sync_fields`].
+    pub fn from_json(json: &str) -> Result<GroupSync, String> {
+        use serde_json::Value as Json;
+        let parsed: Json = serde_json::from_str(json).map_err(|e| format!("the group sync is not JSON: {e}"))?;
+        let object = parsed.as_object().ok_or("the group sync is not a JSON object")?;
+        let get = |key: &str| object.get(key).filter(|v| !v.is_null());
+        let string = |key: &str| -> Result<Option<String>, String> {
+            match get(key) {
+                None => Ok(None),
+                Some(Json::String(s)) => Ok(Some(s.clone())),
+                Some(other) => Err(format!("{key} is not a string: {other}")),
+            }
+        };
+        let strings = |key: &str| -> Result<Option<Vec<String>>, String> {
+            match get(key) {
+                None => Ok(None),
+                Some(Json::Array(items)) => items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_string).ok_or_else(|| format!("{key} holds {item}, not a string")))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Some),
+                Some(other) => Err(format!("{key} is not an array: {other}")),
+            }
+        };
+        let op_name = string("op")?.ok_or("op is missing")?;
+        let op = GroupSyncOp::parse(&op_name).ok_or_else(|| format!("op {op_name:?} is not create, accept, leave or post"))?;
+        let group_id = string("group_id")?.ok_or("group_id is missing")?;
+        let at_ms = match get("at_ms") {
+            Some(n) => n.as_u64().ok_or_else(|| format!("at_ms {n} is not a non-negative integer"))?,
+            None => return Err("at_ms is missing".into()),
+        };
+        let left = strings("left")?.ok_or("left is missing (an empty array when this device holds no group left by D)")?;
+        let (name, members, keys, creator, text) = (string("name")?, string("members")?, strings("keys")?, string("creator")?, string("text")?);
+        let present = |key: &str, is: bool, wanted: bool| -> Result<(), String> {
+            match (is, wanted) {
+                (false, true) => Err(format!("{} carries {key}", op.a())),
+                (true, false) => Err(format!("{key} is not part of {}", op.a())),
+                _ => Ok(()),
+            }
+        };
+        present("name", name.is_some(), op.describes_the_group())?;
+        present("members", members.is_some(), op.describes_the_group())?;
+        present("keys", keys.is_some(), op.describes_the_group())?;
+        present("creator", creator.is_some(), op == GroupSyncOp::Accept)?;
+        present("text", text.is_some(), op == GroupSyncOp::Post)?;
+        Ok(GroupSync { op, group_id, at_ms, name, members, keys: keys.unwrap_or_default(), creator, text, left })
+    }
+
+    /// `fields[0xFC]` as written: a native array (never a bin of packed
+    /// msgpack, CHECK_THESE_THINGS_FIRST §11), ids lowercased, `at_ms` a
+    /// `Value::from(u64)` (rmpv packs uint 64, 0xcf, for any time after
+    /// 1970-02-19). `Err` when a field the op carries is missing or a field it
+    /// does not carry is set.
+    fn custom_data(&self) -> Result<Value, String> {
+        let a = self.op.a();
+        let need = |v: &Option<String>, what: &str| v.clone().ok_or_else(|| format!("{a} carries {what}"));
+        let none = |set: bool, what: &str| if set { Err(format!("{what} is not part of {a}")) } else { Ok(()) };
+        let mut items = vec![Value::from(self.op.as_str()), Value::from(self.group_id.to_ascii_lowercase()), Value::from(self.at_ms)];
+        if self.op.describes_the_group() {
+            items.push(Value::from(need(&self.name, "name")?));
+            items.push(Value::from(need(&self.members, "members")?));
+            items.push(Value::Array(self.keys.iter().map(|k| Value::from(k.as_str())).collect()));
+        } else {
+            none(self.name.is_some(), "name")?;
+            none(self.members.is_some(), "members")?;
+            none(!self.keys.is_empty(), "keys")?;
+        }
+        if self.op == GroupSyncOp::Accept {
+            items.push(Value::from(need(&self.creator, "creator")?.to_ascii_lowercase()));
+        } else {
+            none(self.creator.is_some(), "creator")?;
+        }
+        if self.op == GroupSyncOp::Post {
+            items.push(Value::from(need(&self.text, "text")?));
+        } else {
+            none(self.text.is_some(), "text")?;
+        }
+        items.push(Value::Array(self.left.iter().map(|id| Value::from(id.to_ascii_lowercase())).collect()));
+        Ok(Value::Array(items))
+    }
+}
+
+impl GroupSyncRead {
+    /// The `group_sync` object of the unwrap JSON (GROUPS-DISTRO-DESIGN.md §7):
+    /// `by`, `problem` (null when the form passes §11.1 rule 4, else why not),
+    /// then the keys of [`GroupSync::to_json`], every one null when `problem`
+    /// is set.
+    pub fn to_json(&self) -> String {
+        match &self.sync {
+            Ok(sync) => format!(r#"{{"by":{},"problem":null,{}"#, json_string(&self.by), &sync.to_json()[1..]),
+            Err(problem) => format!(
+                concat!(
+                    r#"{{"by":{},"problem":{},"op":null,"group_id":null,"at_ms":null,"name":null,"members":null,"#,
+                    r#""keys":null,"creator":null,"text":null,"left":null}}"#
+                ),
+                json_string(&self.by),
+                json_string(problem)
+            ),
+        }
+    }
+}
+
+/// A msgpack value's kind, for a problem's wording.
+fn kind(value: &Value) -> &'static str {
+    match value {
+        Value::Nil => "nil",
+        Value::Boolean(_) => "a bool",
+        Value::Integer(_) => "an int",
+        Value::F32(_) | Value::F64(_) => "a float",
+        Value::String(_) => "a str",
+        Value::Binary(_) => "a bin",
+        Value::Array(_) => "an array",
+        Value::Map(_) => "a map",
+        Value::Ext(..) => "an ext",
+    }
+}
+
+/// A str of 32 hex characters, lowercased.
+fn hex32_value(value: &Value, what: &str) -> Result<String, String> {
+    match value {
+        Value::String(s) => s.as_str().and_then(hex32).ok_or_else(|| format!("{what} is not 32 hex characters")),
+        other => Err(format!("{what} is {}, not a str", kind(other))),
+    }
+}
+
+/// A str or a bin, as UTF-8 text (§17.14: name and text; receivers accept bin).
+fn text_value(value: &Value, what: &str) -> Result<String, String> {
+    match value {
+        Value::String(s) => Ok(String::from_utf8_lossy(s.as_bytes()).into_owned()),
+        Value::Binary(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        other => Err(format!("{what} is {}, not a str or bin", kind(other))),
+    }
+}
+
+/// A str that is valid UTF-8.
+fn str_value(value: &Value, what: &str) -> Result<String, String> {
+    match value {
+        Value::String(s) => s.as_str().map(str::to_string).ok_or_else(|| format!("{what} is not valid UTF-8")),
+        other => Err(format!("{what} is {}, not a str", kind(other))),
+    }
+}
+
+/// §11.1 rule 4 on the elements of `fields[0xFC]`: the form of G for the
+/// distro whose `lxmf.delivery` address is `d_hex` (lowercase). Elements
+/// after `left` are ignored.
+fn parse_group_sync(items: &[Value], d_hex: &str) -> Result<GroupSync, String> {
+    let op_name = str_value(items.first().ok_or("0xFC is an empty array")?, "op")?;
+    let op = GroupSyncOp::parse(&op_name).ok_or_else(|| format!("op {op_name:?} is not create, accept, leave or post"))?;
+    if items.len() < op.elements() {
+        return Err(format!("{} has {} elements, not {}", op.a(), items.len(), op.elements()));
+    }
+    let group_id = hex32_value(&items[1], "group_id")?;
+    let at_ms = items[2]
+        .as_u64()
+        .filter(|at| *at <= MAX_AT_MS)
+        .ok_or_else(|| format!("at_ms ({}) is not an integer from 0 to 2^53 - 1", kind(&items[2])))?;
+    let mut sync = GroupSync { op, group_id, at_ms, name: None, members: None, keys: Vec::new(), creator: None, text: None, left: Vec::new() };
+    if op.describes_the_group() {
+        sync.name = Some(text_value(&items[3], "name")?);
+        let members = str_value(&items[4], "members")?;
+        let listed = invite_members(&members);
+        if !listed.iter().any(|m| m == d_hex) {
+            return Err("members does not name D".into());
+        }
+        sync.keys = match &items[5] {
+            Value::Array(keys) => keys.iter().map(|k| str_value(k, "a keys entry")).collect::<Result<_, _>>()?,
+            other => return Err(format!("keys is {}, not an array", kind(other))),
+        };
+        if op == GroupSyncOp::Accept {
+            let creator = hex32_value(&items[6], "creator")?;
+            if creator == d_hex {
+                return Err("creator is D".into());
+            }
+            if !listed.contains(&creator) {
+                return Err("creator is not listed in members".into());
+            }
+            sync.creator = Some(creator);
+        }
+        sync.members = Some(members);
+    }
+    if op == GroupSyncOp::Post {
+        sync.text = Some(text_value(&items[3], "text")?);
+    }
+    sync.left = match &items[op.elements() - 1] {
+        Value::Array(ids) if ids.len() > GROUP_SYNC_LEFT_MAX => {
+            return Err(format!("left holds {} ids, more than {GROUP_SYNC_LEFT_MAX}", ids.len()))
+        }
+        Value::Array(ids) => ids.iter().map(|id| hex32_value(id, "a left id")).collect::<Result<_, _>>()?,
+        other => return Err(format!("left is {}, not an array", kind(other))),
+    };
+    Ok(sync)
+}
+
+/// The receiver's reading of a group sync (§11.1 rule 4, GROUPS-DISTRO-DESIGN.md
+/// §7): `None` unless `fields[0xFB]` is [`DISTRO_GROUP_TYPE`]; otherwise `by`
+/// and the form of `fields[0xFC]` for the distro `d_hex`, or why it fails.
+/// `at_ms` is read by value in any integer encoding (`as_u64`, then the 2^53 -
+/// 1 bound); `name` and `text` may be str or bin; `left` is an array of at
+/// most 32 str of 32 hex; elements after `left` are ignored. Rules 0-3 and 5-6
+/// (repeat, source, signature, own echo, own address, apply) are the client's.
+pub fn read_group_sync(entries: &[(Value, Value)], d_hex: &str) -> Option<GroupSyncRead> {
+    if custom_type(entries).as_deref() != Some(DISTRO_GROUP_TYPE) {
+        return None;
+    }
+    let by = custom_field(entries, FIELD_CUSTOM_META).map(value_to_string).unwrap_or_default().to_ascii_lowercase();
+    let sync = match custom_field(entries, FIELD_CUSTOM_DATA) {
+        Some(Value::Array(items)) => parse_group_sync(items, &d_hex.to_ascii_lowercase()),
+        Some(Value::Binary(_)) => Err("0xFC is a bin, not a native array (CHECK_THESE_THINGS_FIRST §11)".into()),
+        Some(other) => Err(format!("0xFC is {}, not an array", kind(other))),
+        None => Err("0xFC is absent".into()),
+    };
+    Some(GroupSyncRead { by, sync })
+}
+
+/// Write G's fields on `msg`, a message from D to D (RFed SPEC §17.14):
+///
+/// | field | value |
+/// |---|---|
+/// | 0x0C | an empty bin (no ticket: older clients take G for a delivery notification and drop it) |
+/// | 0xFB | the str `"rfed.distro.group"` |
+/// | 0xFC | the native array of [`GroupSync`]'s op |
+/// | 0xFD | `device_hex`, the sending device's own `lxmf.delivery` address, lowercased |
+///
+/// `Err`, with the message unchanged, when the array would fail the
+/// receiver's §11.1 rule 4 for D (`d_hex`): `members` must name D, `creator`
+/// be listed and not D, `at_ms` at most 2^53 - 1, `left` at most 32 ids of 32
+/// hex; when `d_hex` or `device_hex` is not 32 hex characters; when `msg` is
+/// not from D to D; and when `msg` has a title or content (a post's text goes
+/// in 0xFC), a 0xD1 or 0xA0-0xA8 field (nothing may take G for a group
+/// message) or an attachment field (attachments are not copied).
+pub fn set_group_sync_fields(msg: &mut LXMessage, sync: &GroupSync, d_hex: &str, device_hex: &str) -> Result<(), String> {
+    let d = hex32(d_hex).ok_or("d_hex is D's lxmf.delivery address, 32 hex characters")?;
+    let device = hex32(device_hex).ok_or("0xFD is the sending device's own lxmf.delivery address, 32 hex characters")?;
+    if hex(&msg.destination_hash) != d || hex(&msg.source_hash) != d {
+        return Err("a group sync goes from D to D".into());
+    }
+    if !msg.title.is_empty() || !msg.content.is_empty() {
+        return Err("a group sync has an empty title and content (a post's text goes in 0xFC)".into());
+    }
+    if let Value::Map(entries) = &msg.fields {
+        for (key, _) in entries {
+            match key.as_u64() {
+                Some(field) if field == crate::lxmf::FIELD_RETICHAT as u64 || (0xA0..=0xA8).contains(&field) => {
+                    return Err(format!("a group sync carries no group field (0x{field:02X})"));
+                }
+                Some(FIELD_FILE_ATTACHMENTS | FIELD_IMAGE | FIELD_AUDIO) => {
+                    return Err("a group sync carries no attachment (attachments are not copied)".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    let data = sync.custom_data()?;
+    if let Value::Array(items) = &data {
+        parse_group_sync(items, &d)?;
+    }
+    msg.set_field(FIELD_TICKET as u8, Value::Binary(Vec::new()));
+    msg.set_field(FIELD_CUSTOM_TYPE as u8, Value::from(DISTRO_GROUP_TYPE));
+    msg.set_field(FIELD_CUSTOM_DATA as u8, data);
+    msg.set_field(FIELD_CUSTOM_META as u8, Value::from(device));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1217,7 +1804,7 @@ mod tests {
         let blob = lxmf_blob(&distro, &s, &sender, Vec::new(), false);
         let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
         assert_eq!(msg.fields.as_deref(), Some(&[0x80u8][..]), "an empty map is a map");
-        assert!(msg.to_json().ends_with(r#","fields":"gA=="}"#));
+        assert!(msg.to_json().contains(r#","fields":"gA==","hash":""#));
 
         let three = packed_head(3, b"no map");
         let blob = lxmf_blob_packed(&distro, &s, &sender, &three);
@@ -1229,7 +1816,7 @@ mod tests {
         let blob = lxmf_blob_packed(&distro, &s, &sender, &nil);
         let msg = unwrap_blob(&mut distro, &blob).unwrap().unwrap();
         assert_eq!((msg.content.as_str(), msg.fields.as_deref()), ("nil map", None));
-        assert!(msg.to_json().ends_with(r#","fields":null}"#));
+        assert!(msg.to_json().contains(r#","fields":null,"hash":""#));
     }
 
     /// A delivery notification (a ticket and no content) is still flagged as
@@ -1414,7 +2001,19 @@ mod tests {
             signature_validated: false,
             unverified_reason: Some(LXMessage::SOURCE_UNKNOWN),
             fields: None,
+            hash: vec![0x5a; 32],
+            packed: vec![1, 2, 3],
+            has_group_id: false,
+            group_id: None,
+            group_action: None,
+            group_name: None,
+            group_sync: None,
         };
+        const NO_GROUP: &str = concat!(
+            r#""hash":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a","#,
+            r#""has_group_id":false,"group_id":null,"group_action":null,"group_name":null,"group_sync":null,"#,
+            r#""sender_key":null,"packed":null}"#
+        );
         assert_eq!(
             msg.to_json(),
             format!(
@@ -1423,21 +2022,24 @@ mod tests {
                     r#""is_delivery_notification":false,"ticket":null,"distro_transfer_key":null,"#,
                     r#""sent_to":"{}","sent_by":null,"#,
                     r#""display_name_state":2,"display_name":"Bob \"B\"","signature_validated":false,"unverified_reason":1,"#,
-                    r#""fields":null}}"#
+                    r#""fields":null,{}"#
                 ),
                 "ab".repeat(16),
-                "cd".repeat(16)
+                "cd".repeat(16),
+                NO_GROUP
             )
         );
         let validated = DistroMessage { display_name: NameField::Clear, signature_validated: true, unverified_reason: None, ..msg };
-        assert!(validated.to_json().ends_with(r#""display_name_state":1,"display_name":null,"signature_validated":true,"unverified_reason":0,"fields":null}"#));
+        assert!(validated.to_json().ends_with(&format!(
+            r#""display_name_state":1,"display_name":null,"signature_validated":true,"unverified_reason":0,"fields":null,{NO_GROUP}"#
+        )));
         // {0x06: ["png", bin fb ff]} = 81 06 92 a3 70 6e 67 c4 02 fb ff, whose
         // base64 has a '+', a '/' and a '='.
         let with_fields = DistroMessage {
             fields: Some(vec![0x81, 0x06, 0x92, 0xa3, b'p', b'n', b'g', 0xc4, 0x02, 0xfb, 0xff]),
             ..validated
         };
-        assert!(with_fields.to_json().ends_with(r#""unverified_reason":0,"fields":"gQaSo3BuZ8QC+/8="}"#),
+        assert!(with_fields.to_json().ends_with(&format!(r#""unverified_reason":0,"fields":"gQaSo3BuZ8QC+/8=",{NO_GROUP}"#)),
             "standard alphabet (+ and / not - and _), padded: {}", with_fields.to_json());
     }
 
@@ -2007,5 +2609,225 @@ mod sync_proof_tests {
         ]));
         assert_eq!(rfed_verdict(&upload), Err("distro key is not the message's destination"));
         assert!(sealed_upload(&theirs, &STAMP, Some(&forged), 1.0).is_err());
+    }
+}
+
+/// RFed SPEC §17.14, the group sync and the unwrap's group keys
+/// (GROUPS-DISTRO-DESIGN.md §7, §17.1, §19.1). The golden vectors, made with
+/// the Python reference, are checked by tests/distro_group_sync_vectors.rs;
+/// these are the writer's refusals and the JSON's edges.
+#[cfg(test)]
+mod group_sync_tests {
+    use super::*;
+    use reticulum_rust::destination::{Destination, DestinationType};
+
+    const DEVICE: &str = "0123456789abcdef0123456789abcdef";
+    const GROUP: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    const MEMBER: &str = "cf0b2a4a8d2a0b6978b71290da7cc80e";
+
+    fn distro() -> (Identity, String) {
+        let d = Identity::new(true);
+        let h = hex(&delivery_hash(&d).unwrap());
+        (d, h)
+    }
+
+    /// A message from `from` (its source is `from`'s lxmf.delivery) to the address `to`.
+    fn message(from: &Identity, to: &str) -> LXMessage {
+        let source = Destination::new_inbound(Some(from.clone()), DestinationType::Single, "lxmf".into(), vec!["delivery".into()]).unwrap();
+        let to = (0..32).step_by(2).map(|i| u8::from_str_radix(&to[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        LXMessage::new(None, Some(source), Some(Vec::new()), Some(Vec::new()), None, Some(LXMessage::DIRECT), Some(to), None, None, false).unwrap()
+    }
+
+    fn sync(op: GroupSyncOp, d_hex: &str) -> GroupSync {
+        let describes = op.describes_the_group();
+        GroupSync {
+            op,
+            group_id: GROUP.into(),
+            at_ms: 1_790_000_000_123,
+            name: describes.then(|| "Hike".to_string()),
+            members: describes.then(|| format!("{d_hex},{MEMBER}")),
+            keys: Vec::new(),
+            creator: (op == GroupSyncOp::Accept).then(|| MEMBER.to_string()),
+            text: (op == GroupSyncOp::Post).then(|| "hi".to_string()),
+            left: Vec::new(),
+        }
+    }
+
+    const OPS: [GroupSyncOp; 4] = [GroupSyncOp::Create, GroupSyncOp::Accept, GroupSyncOp::Leave, GroupSyncOp::Post];
+
+    #[test]
+    fn every_op_is_written_as_the_four_fields_and_read_back_as_written() {
+        let (d, d_hex) = distro();
+        for op in OPS {
+            let mut msg = message(&d, &d_hex);
+            let mut s = sync(op, &d_hex);
+            s.left = vec!["AB".repeat(16)];
+            set_group_sync_fields(&mut msg, &s, &d_hex.to_ascii_uppercase(), &DEVICE.to_ascii_uppercase()).unwrap();
+            let Value::Map(entries) = &msg.fields else { panic!("fields are a map") };
+            let keys: Vec<u64> = entries.iter().map(|(k, _)| k.as_u64().unwrap()).collect();
+            assert_eq!(keys, [0x0C, 0xFB, 0xFC, 0xFD], "{op:?}");
+            assert_eq!(entries[0].1, Value::Binary(Vec::new()), "an empty bin, no ticket");
+            assert!(matches!(entries[2].1, Value::Array(_)), "0xFC is a native array, never a bin");
+            let read = read_group_sync(entries, &d_hex).unwrap();
+            assert_eq!(read.by, DEVICE, "0xFD lowercased");
+            s.left = vec!["ab".repeat(16)];
+            assert_eq!(read.sync, Ok(s), "{op:?}");
+        }
+    }
+
+    /// Each refusal leaves the message as it was.
+    #[test]
+    fn the_writer_refuses_what_a_receiver_would_drop_and_changes_nothing() {
+        let (d, d_hex) = distro();
+        let refused = |msg: &mut LXMessage, s: &GroupSync, d_hex: &str, device: &str, why: &str| {
+            let before = msg.fields.clone();
+            let err = set_group_sync_fields(msg, s, d_hex, device).expect_err(why);
+            assert!(err.contains(why), "{why}: {err}");
+            assert_eq!(msg.fields, before, "{why}: unchanged");
+        };
+        let mut msg = message(&d, &d_hex);
+        let accept = sync(GroupSyncOp::Accept, &d_hex);
+        let with = |change: &dyn Fn(&mut GroupSync)| {
+            let mut s = accept.clone();
+            change(&mut s);
+            s
+        };
+        refused(&mut msg, &with(&|s| s.members = Some(MEMBER.into())), &d_hex, DEVICE, "does not name D");
+        refused(&mut msg, &with(&|s| s.members = Some(format!("{},{MEMBER}", d_hex.to_ascii_uppercase()))), &d_hex, DEVICE, "does not name D");
+        refused(&mut msg, &with(&|s| s.creator = Some(d_hex.clone())), &d_hex, DEVICE, "creator is D");
+        refused(&mut msg, &with(&|s| s.creator = Some("ab".repeat(16))), &d_hex, DEVICE, "not listed");
+        refused(&mut msg, &with(&|s| s.creator = None), &d_hex, DEVICE, "carries creator");
+        refused(&mut msg, &with(&|s| s.text = Some("x".into())), &d_hex, DEVICE, "text is not part of an accept");
+        refused(&mut msg, &with(&|s| s.at_ms = MAX_AT_MS + 1), &d_hex, DEVICE, "2^53");
+        refused(&mut msg, &with(&|s| s.group_id = GROUP[..31].into()), &d_hex, DEVICE, "group_id");
+        refused(&mut msg, &with(&|s| s.left = vec!["ab".repeat(16); 33]), &d_hex, DEVICE, "more than 32");
+        refused(&mut msg, &with(&|s| s.left = vec!["ab".repeat(15) + "a"]), &d_hex, DEVICE, "left id");
+        refused(&mut msg, &accept, &d_hex, "xyz", "0xFD");
+        refused(&mut msg, &accept, &d_hex, &"g".repeat(32), "0xFD");
+        refused(&mut msg, &accept, "xyz", DEVICE, "d_hex");
+        let mut leave = sync(GroupSyncOp::Leave, &d_hex);
+        leave.keys = vec!["k".into()];
+        refused(&mut msg, &leave, &d_hex, DEVICE, "keys is not part of a leave");
+        // 2^53 - 1 and 32 ids are the last that pass.
+        let ok = with(&|s| {
+            s.at_ms = MAX_AT_MS;
+            s.left = vec!["cd".repeat(16); 32];
+        });
+        set_group_sync_fields(&mut message(&d, &d_hex), &ok, &d_hex, DEVICE).unwrap();
+
+        // The message itself: from D to D, empty, with no group or attachment field.
+        let device = Identity::new(true);
+        let device_hex = hex(&delivery_hash(&device).unwrap());
+        refused(&mut message(&device, &d_hex), &accept, &d_hex, DEVICE, "from D to D");
+        refused(&mut message(&d, &device_hex), &accept, &d_hex, DEVICE, "from D to D");
+        let mut content = message(&d, &d_hex);
+        content.content = b"hi".to_vec();
+        refused(&mut content, &accept, &d_hex, DEVICE, "empty title and content");
+        let mut title = message(&d, &d_hex);
+        title.title = b"t".to_vec();
+        refused(&mut title, &accept, &d_hex, DEVICE, "empty title and content");
+        for (field, why) in [(0xD1u8, "no group field"), (0xA0, "no group field"), (0xA8, "no group field"), (0x05, "no attachment"), (0x06, "no attachment"), (0x07, "no attachment")] {
+            let mut m = message(&d, &d_hex);
+            m.set_field(field, Value::from("x"));
+            refused(&mut m, &accept, &d_hex, DEVICE, why);
+        }
+    }
+
+    #[test]
+    fn the_json_form_round_trips_and_says_what_it_refuses() {
+        let (_, d_hex) = distro();
+        for op in OPS {
+            let s = sync(op, &d_hex);
+            assert_eq!(GroupSync::from_json(&s.to_json()), Ok(s));
+        }
+        let leave = r#"{"op":"leave","group_id":"9f8e7d6c5b4a39281706f5e4d3c2b1a0","at_ms":5,"left":[]}"#;
+        assert_eq!(GroupSync::from_json(leave).unwrap().op, GroupSyncOp::Leave, "absent keys are null");
+        let with_by = r#"{"by":"x","problem":null,"op":"leave","group_id":"9f8e7d6c5b4a39281706f5e4d3c2b1a0","at_ms":5,"name":null,"left":[]}"#;
+        assert!(GroupSync::from_json(with_by).is_ok(), "by and problem are ignored, null is absent");
+        for (json, why) in [
+            ("[]", "not a JSON object"),
+            ("{", "not JSON"),
+            (r#"{"group_id":"x","at_ms":5,"left":[]}"#, "op is missing"),
+            (r#"{"op":"Leave","group_id":"x","at_ms":5,"left":[]}"#, "is not create"),
+            (r#"{"op":"leave","at_ms":5,"left":[]}"#, "group_id is missing"),
+            (r#"{"op":"leave","group_id":"x","left":[]}"#, "at_ms is missing"),
+            (r#"{"op":"leave","group_id":"x","at_ms":-1,"left":[]}"#, "non-negative integer"),
+            (r#"{"op":"leave","group_id":"x","at_ms":1.5,"left":[]}"#, "non-negative integer"),
+            (r#"{"op":"leave","group_id":"x","at_ms":5}"#, "left is missing"),
+            (r#"{"op":"leave","group_id":"x","at_ms":5,"left":[1]}"#, "not a string"),
+            (r#"{"op":"leave","group_id":"x","at_ms":5,"left":[],"text":"t"}"#, "text is not part of a leave"),
+            (r#"{"op":"post","group_id":"x","at_ms":5,"left":[]}"#, "a post carries text"),
+            (r#"{"op":"create","group_id":"x","at_ms":5,"left":[],"name":"n","members":"m"}"#, "a create carries keys"),
+            (r#"{"op":"accept","group_id":"x","at_ms":5,"left":[],"name":"n","members":"m","keys":[]}"#, "an accept carries creator"),
+        ] {
+            let err = GroupSync::from_json(json).expect_err(json);
+            assert!(err.contains(why), "{json}: {err}");
+        }
+    }
+
+    /// GROUPS-DISTRO-DESIGN.md §7: the receipt's key as 128 lowercase hex and its packed copy as
+    /// standard padded base64; the receipt's verdict, not the unwrap's.
+    #[test]
+    fn the_json_carries_the_receipts_verdict_key_and_packed_copy() {
+        let (mut d, _) = distro();
+        let sender = Identity::new(true);
+        let s = delivery_hash(&sender).unwrap();
+        let fields = vec![(Value::from(0xA0u8), Value::from(GROUP.to_ascii_uppercase())), (Value::from(0xA3u8), Value::from("accept"))];
+        let blob = super::tests_support::blob(&d, &s, &sender, fields);
+        let msg = unwrap_blob(&mut d, &blob).unwrap().unwrap();
+        assert_eq!((msg.has_group_id, msg.group_id.as_deref(), msg.group_action.as_deref()), (true, Some(GROUP), Some("accept")));
+        let receipt = DistroReceipt { validated: true, unverified_reason: 0, sender_key: Some(vec![0xab; 64]), packed: Some(vec![0xfb, 0xff]) };
+        let json: serde_json::Value = serde_json::from_str(&msg.to_json_with_receipt(&receipt)).unwrap();
+        assert_eq!(json["sender_key"], serde_json::Value::String("ab".repeat(64)));
+        assert_eq!(json["packed"], serde_json::Value::String("+/8=".into()));
+        assert_eq!((json["signature_validated"].as_bool(), json["unverified_reason"].as_u64()), (Some(true), Some(0)));
+        let own: serde_json::Value = serde_json::from_str(&msg.to_json()).unwrap();
+        assert_eq!((own["signature_validated"].as_bool(), own["unverified_reason"].as_u64()), (Some(false), Some(1)));
+        assert_eq!((own["sender_key"].is_null(), own["packed"].is_null()), (true, true));
+    }
+
+    /// The hash is LXMF's: a stamp (a 5th payload element) is not part of it, as it is not signed.
+    #[test]
+    fn a_stamped_message_has_the_hash_of_its_unstamped_payload() {
+        let (mut d, _) = distro();
+        let sender = Identity::new(true);
+        let s = delivery_hash(&sender).unwrap();
+        let (plain, stamped) = (
+            super::tests_support::blob_stamped(&d, &s, &sender, false),
+            super::tests_support::blob_stamped(&d, &s, &sender, true),
+        );
+        let plain = unwrap_blob(&mut d, &plain).unwrap().unwrap();
+        let stamped = unwrap_blob(&mut d, &stamped).unwrap().unwrap();
+        assert_eq!(plain.hash, stamped.hash);
+        assert_ne!(plain.packed, stamped.packed, "packed is the message as received, its stamp with it");
+        assert_eq!(plain.packed.len() + 34, stamped.packed.len(), "bin 8 of 32 bytes");
+    }
+}
+
+/// Blobs to a distro for the group sync tests.
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+
+    fn build(distro: &Identity, src: &[u8], signer: &Identity, fields: Vec<(Value, Value)>, stamp: bool) -> Vec<u8> {
+        let dest = delivery_hash(distro).unwrap();
+        let mut items = vec![Value::F64(1_790_000_000.5), Value::Binary(Vec::new()), Value::Binary(b"x".to_vec()), Value::Map(fields)];
+        let mut hashed_part = [dest.clone(), src.to_vec(), encode(&Value::Array(items.clone()))].concat();
+        let hash = full_hash(&hashed_part);
+        hashed_part.extend_from_slice(&hash);
+        let sig = signer.sign(&hashed_part);
+        if stamp {
+            items.push(Value::Binary(vec![7u8; 32]));
+        }
+        let plaintext = [src.to_vec(), sig, encode(&Value::Array(items))].concat();
+        [dest, distro.encrypt(&plaintext).unwrap()].concat()
+    }
+
+    pub(super) fn blob(distro: &Identity, src: &[u8], signer: &Identity, fields: Vec<(Value, Value)>) -> Vec<u8> {
+        build(distro, src, signer, fields, false)
+    }
+
+    pub(super) fn blob_stamped(distro: &Identity, src: &[u8], signer: &Identity, stamp: bool) -> Vec<u8> {
+        build(distro, src, signer, Vec::new(), stamp)
     }
 }
