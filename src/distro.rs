@@ -913,14 +913,15 @@ fn fields_map_bytes(payload: &[u8]) -> Option<&[u8]> {
 /// RFed SPEC §17.9: the transferred distro key, when the message's
 /// FIELD_CUSTOM_TYPE is `DISTRO_TRANSFER_TYPE`; the key travels in
 /// FIELD_CUSTOM_DATA. Any other custom type, or the pre-2026-09-24 field
-/// 0x0D, is not a transfer.
+/// 0x0D, is not a transfer. Both are read only from a str or a bin (RFed SPEC
+/// §17.14, as every client reads them): a 0xFC of any other type is no key.
 fn transfer_key_from_fields(entries: &[(Value, Value)]) -> Option<String> {
     let mut custom_type = None;
     let mut custom_data = None;
     for (k, v) in entries {
         match k.as_u64() {
-            Some(FIELD_CUSTOM_TYPE) => custom_type = Some(value_to_string(v)),
-            Some(FIELD_CUSTOM_DATA) => custom_data = Some(value_to_string(v)),
+            Some(FIELD_CUSTOM_TYPE) => custom_type = field_text(v),
+            Some(FIELD_CUSTOM_DATA) => custom_data = field_text(v),
             _ => {}
         }
     }
@@ -933,16 +934,18 @@ fn transfer_key_from_fields(entries: &[(Value, Value)]) -> Option<String> {
 /// is `None`; `sent_by` (0xFD) is lowercased and is `Some` whenever the type
 /// matches, so the marker's presence survives a malformed 0xFC and the client
 /// can drop the copy with a log line instead of showing it as an ordinary
-/// message from the distro.
+/// message from the distro. All three are read only from a str or a bin (RFed
+/// SPEC §17.14, as every client reads them): a 0xFC of any other type is no
+/// recipient, and a 0xFD of any other type is the sender "".
 fn sent_marker_from_fields(entries: &[(Value, Value)]) -> (Option<String>, Option<String>) {
     let mut custom_type = None;
     let mut custom_data = None;
     let mut custom_meta = None;
     for (k, v) in entries {
         match k.as_u64() {
-            Some(FIELD_CUSTOM_TYPE) => custom_type = Some(value_to_string(v)),
-            Some(FIELD_CUSTOM_DATA) => custom_data = Some(value_to_string(v)),
-            Some(FIELD_CUSTOM_META) => custom_meta = Some(value_to_string(v)),
+            Some(FIELD_CUSTOM_TYPE) => custom_type = field_text(v),
+            Some(FIELD_CUSTOM_DATA) => custom_data = field_text(v),
+            Some(FIELD_CUSTOM_META) => custom_meta = field_text(v),
             _ => {}
         }
     }
@@ -1016,7 +1019,13 @@ fn value_to_string(value: &Value) -> String {
 /// Python LXMF does (RFed SPEC §17.14 "Repeated keys"; the `refused` vectors of
 /// tests/distro_group_sync_vectors.json).
 fn custom_type(entries: &[(Value, Value)]) -> Option<String> {
-    match custom_field(entries, FIELD_CUSTOM_TYPE)? {
+    field_text(custom_field(entries, FIELD_CUSTOM_TYPE)?)
+}
+
+/// A field's value as text when it is a str or a bin, else `None` (RFed SPEC
+/// §17.14: the custom triple is read only from a str or a bin).
+fn field_text(value: &Value) -> Option<String> {
+    match value {
         Value::String(s) => Some(String::from_utf8_lossy(s.as_bytes()).into_owned()),
         Value::Binary(b) => Some(String::from_utf8_lossy(b).into_owned()),
         _ => None,
@@ -1591,6 +1600,47 @@ mod tests {
     #[test]
     fn no_fields_means_no_sent_marker() {
         assert_eq!(sent_marker_from_fields(&[]), (None, None));
+    }
+
+    /// RFed SPEC §17.14: a marker (0xFB), a transfer's key (0xFC) and a sent
+    /// copy's recipient and sender (0xFC, 0xFD) are read only from a str or a
+    /// bin, as every client reads them; a value of any other type is none (a
+    /// 0xFC of 5 is no key, and a 0xFD that is no text is the sender "", as
+    /// `read_group_sync` reads `by`).
+    #[test]
+    fn the_custom_triple_is_read_only_from_a_str_or_a_bin() {
+        let triple = |ty: Value, data: Value, meta: Value| {
+            vec![
+                (Value::Integer(FIELD_CUSTOM_TYPE.into()), ty),
+                (Value::Integer(FIELD_CUSTOM_DATA.into()), data),
+                (Value::Integer(FIELD_CUSTOM_META.into()), meta),
+            ]
+        };
+        let bin = |s: &str| Value::Binary(s.as_bytes().to_vec());
+        let key_hex = "ab".repeat(64);
+        let transfer = |data: Value| transfer_key_from_fields(&triple(bin(DISTRO_TRANSFER_TYPE), data, Value::Nil));
+        assert_eq!(transfer(bin(&key_hex)).as_deref(), Some(key_hex.as_str()), "a bin type and a bin key are text");
+        assert_eq!(transfer(Value::String(key_hex.clone().into())).as_deref(), Some(key_hex.as_str()));
+        for not_text in [Value::from(5u8), Value::Nil, Value::Boolean(true), Value::F64(1.5), Value::Array(vec![bin(&key_hex)]), Value::Ext(5, vec![0])] {
+            assert_eq!(transfer(not_text.clone()), None, "a 0xFC of {not_text} is no key");
+        }
+        assert_eq!(
+            transfer_key_from_fields(&triple(Value::from(5u8), bin(&key_hex), Value::Nil)),
+            None,
+            "a 0xFB that is no text is no marker"
+        );
+
+        let sent = |data: Value, meta: Value| sent_marker_from_fields(&triple(bin(DISTRO_SENT_TYPE), data, meta));
+        let to = "ab".repeat(16);
+        let by = "cd".repeat(16);
+        assert_eq!(sent(bin(&to), bin(&by)), (Some(to.clone()), Some(by.clone())), "bin is text");
+        for not_text in [Value::from(7u8), Value::Nil, Value::Array(vec![bin(&by)]), Value::Map(vec![])] {
+            assert_eq!(sent(bin(&to), not_text.clone()), (Some(to.clone()), Some(String::new())), "a 0xFD of {not_text}");
+            assert_eq!(sent(not_text.clone(), bin(&by)), (None, Some(by.clone())), "a 0xFC of {not_text}");
+        }
+        // An int recipient whose digits would pass as 32 hex if read as text is still none.
+        let digits = Value::from(12345678901234567890u64);
+        assert_eq!(sent(digits, bin(&by)), (None, Some(by.clone())));
     }
 
     /// Mirrors rfed's verify_signed_payload: decode the triple, check the
