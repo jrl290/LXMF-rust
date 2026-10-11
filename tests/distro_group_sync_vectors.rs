@@ -8,8 +8,8 @@ use std::io::Cursor;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use lxmf_rust::distro::{
-	delivery_hash, read_group_sync, set_group_sync_fields, unwrap_blob, GroupSync, DISTRO_GROUP_TYPE, DISTRO_MARKERS,
-	GROUP_SYNC_LEFT_MAX, MAX_AT_MS,
+	delivery_hash, invite_members, read_group_sync, set_group_sync_fields, unwrap_blob, GroupSync, DISTRO_GROUP_TYPE,
+	DISTRO_MARKERS, GROUP_SYNC_LEFT_MAX, MAX_AT_MS,
 };
 use lxmf_rust::lx_message::LXMessage;
 use reticulum_rust::destination::{Destination, DestinationType};
@@ -177,6 +177,34 @@ fn each_rule_4_failure_has_a_problem_and_nothing_else() {
 	}
 }
 
+/// §17.14 "read with the invite's own parser": each entry is trimmed of Unicode Zs and U+0009 and
+/// nothing else (`invite_space`, made from Python's Unicode database), the one set every phone's
+/// own trim takes, so a G whose members name D here names D in each phone's own reading. Every
+/// scalar value is tried around D.
+#[test]
+fn the_invite_parser_trims_exactly_zs_and_tab() {
+	let v = vectors();
+	let d = d_hex(&v);
+	let m = v["member"]["lxmf_delivery_hash_hex"].as_str().unwrap();
+	let space: Vec<char> = v["invite_space"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|c| char::from_u32(c.as_u64().unwrap() as u32).unwrap())
+		.collect();
+	assert_eq!(space.len(), 18, "Zs (17) and U+0009");
+	let mut wrong = Vec::new();
+	for c in (0..=0x10FFFFu32).filter_map(char::from_u32).filter(|&c| c != ',') {
+		let listed = invite_members(&format!("{m},{c}{d}{c}{c},{c}"));
+		let names_d = listed.iter().any(|x| *x == d);
+		if names_d != space.contains(&c) {
+			wrong.push(format!("U+{:04X}", c as u32));
+		}
+		assert!(listed.iter().all(|x| x.len() == 32), "U+{:04X}: {listed:?}", c as u32);
+	}
+	assert!(wrong.is_empty(), "trimmed or kept against invite_space: {wrong:?}");
+}
+
 /// §19.1: the unwrap reports the hash Python computed and `packed == blob[..16] | plaintext`,
 /// the group entries and the group sync; the verdict here is the unwrap's own (the phones'
 /// group receipt then decides an accept or leave under the key it carries).
@@ -186,6 +214,15 @@ fn the_unwrap_reports_hash_packed_group_entries_and_group_sync() {
 	let mut d = identity(&v, "distro");
 	let member_hash = hex(v["member"]["lxmf_delivery_hash_hex"].as_str().unwrap());
 	assert!(Identity::recall(&member_hash).is_none(), "M must not be known here");
+	// §17.14 rule 2: G is hashed and verified over the payload bytes as received. The web's G (at_ms
+	// as int 64, 0xd3) is not the form rmpv packs, so an unwrap that packed the payload again would
+	// give it another hash and a failed signature; this vector holds that form.
+	let web = v["sealed"].as_array().unwrap().iter().find(|s| s["name"] == "g_accept_web_form_int64_at_ms").expect("the web's G");
+	let web_packed = bytes(web, "packed_hex");
+	let mut repacked = Vec::new();
+	rmpv::encode::write_value(&mut repacked, &rmpv::decode::read_value(&mut Cursor::new(&web_packed[96..])).unwrap()).unwrap();
+	assert_ne!(repacked, web_packed[96..], "the web's G is not in the form rmpv packs");
+	assert_ne!(full_hash(&[&web_packed[..32], &repacked[..]].concat()), bytes(web, "hash_hex"));
 	for vector in v["sealed"].as_array().unwrap() {
 		let name = vector["name"].as_str().unwrap();
 		let expected = &vector["expected"];

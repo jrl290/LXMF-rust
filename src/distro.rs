@@ -101,8 +101,19 @@ pub struct DistroMessage {
     pub fields: Option<Vec<u8>>,
     /// The LXMF message hash (32 bytes), as LXMF/LXMF.py
     /// `LXMessage.unpack_from_bytes` computes it: `full_hash(dest | src |
-    /// payload)`, the payload packed again without a stamp when it carries one.
-    /// RFed SPEC §17.14 keys group messages and group syncs by it.
+    /// payload)` over the payload bytes as received, packed again only to drop
+    /// a stamp (a fifth element) when it carries one. RFed SPEC §17.14 keys
+    /// group messages and group syncs by it (rule 2 hashes and verifies G over
+    /// the payload as received).
+    ///
+    /// It is not always what [`LXMessage::unpack_from_bytes`] computes for the
+    /// same bytes: that one packs the first four elements again with rmpv
+    /// every time, so for a payload not in rmpv's form (the web writes a G's
+    /// `at_ms` as int 64, `0xd3`, where rmpv writes `0xcf`) it gives another
+    /// hash, and fails the sender's signature. So key a group message, a G and
+    /// an owed entry by this hash (or by the packer's own), never by unpacking
+    /// stored `packed` bytes again. tests/distro_group_sync_vectors.json's
+    /// sealed `g_accept_web_form_int64_at_ms` pins it.
     pub hash: Vec<u8>,
     /// The message as received: `blob[..16] | plaintext`, that is `dest |
     /// src | signature | payload` (a stamp with it). For the phones' group
@@ -1030,14 +1041,30 @@ fn group_entries(fields: &Value) -> (bool, Option<String>, Option<String>, Optio
     (true, text(RF_GROUP_ID).and_then(|id| hex32(&id)), text(RF_GROUP_ACTION), text(RF_GROUP_NAME))
 }
 
+/// What [`invite_members`] trims from each end of an entry: Unicode Zs (the
+/// space separators) and U+0009, exactly Swift's `CharacterSet.whitespaces`
+/// (iOS `DeliveryPolicy.members`), and the set every client's own trim
+/// includes. Not `char::is_whitespace`: that also takes U+000A–U+000D, U+0085,
+/// U+2028 and U+2029, which iOS keeps, so an entry wrapped in a newline would
+/// name D here and not on iOS. Android's `trim()` and the web's take more
+/// again (and not the same more); an entry this keeps, they keep too.
+/// `invite_space` in tests/distro_group_sync_vectors.json, from Python's Unicode
+/// database, pins it.
+pub fn is_invite_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
 /// The phones' invite parser for a `GROUP_MEMBERS` csv (iOS and Android
-/// `DeliveryPolicy.members`): split on `,`, each entry trimmed, kept when it
-/// is exactly 32 lowercase hex characters, the first of each kept. A group
-/// sync's `members` is read with it (§17.14: "read with the invite's own
-/// parser") and must name D.
+/// `DeliveryPolicy.members`): split on `,`, each entry trimmed of
+/// [`is_invite_space`] at both ends, kept when it is exactly 32 lowercase hex
+/// characters, the first of each kept. A group sync's `members` is read with
+/// it (§17.14: "read with the invite's own parser") and must name D.
 pub fn invite_members(csv: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for entry in csv.split(',').map(str::trim) {
+    for entry in csv.split(',').map(|entry| entry.trim_matches(is_invite_space)) {
         if entry.len() == 32 && entry.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) && !out.iter().any(|m| m == entry) {
             out.push(entry.to_string());
         }

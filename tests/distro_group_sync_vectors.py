@@ -14,9 +14,11 @@ Run from anywhere with the workspace venv:
 The output is the same on every run: every key is fixed, every message is
 packed from fixed values, and Ed25519 is deterministic. Only encryption to D is
 random (an ephemeral key and an IV), so ENCRYPTED holds the output of one RNS
-Identity.encrypt per sealed message, made once with --new-sealed and fixed
-here. The script checks that each decrypts to its packed message before using
-it. Do not replace them: every pinned value that follows from them would move.
+Identity.encrypt per sealed message, made once with --new-sealed (which prints
+one for each sealed message ENCRYPTED does not hold yet, never the others) and
+fixed here. The script checks that each decrypts to its packed message before
+using it. Do not replace them: every pinned value that follows from them would
+move.
 
 The script also reads every vector back with its own reading of §11.1 rule 4
 (read_group_sync below, a second implementation of the rule) and stops when a
@@ -28,6 +30,7 @@ import hashlib
 import json
 import os
 import sys
+import unicodedata
 
 import RNS
 import RNS.vendor.umsgpack as msgpack
@@ -69,6 +72,13 @@ OPS = {
 
 # 32 distinct group ids for a full `left`, none of them GROUP_ID.
 LEFT_FULL = [hashlib.sha256(b"distro group sync left %d" % i).hexdigest()[:32] for i in range(LEFT_MAX)]
+
+# What the invite parser trims from each entry: Unicode Zs (space separators)
+# and U+0009, exactly the set Swift's CharacterSet.whitespaces is, and the one
+# every client's own trim includes (Kotlin trim(), Rust char::is_whitespace,
+# JavaScript trim(), Python str.strip() each take more, and not the same more).
+# main() checks it against this Python's Unicode database.
+INVITE_SPACE = "\t \u00a0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200B)) + "\u202f\u205f\u3000"
 
 # A placeholder at_ms whose uint 64 bytes occur once, replaced by the encoding
 # under test (umsgpack, like rmpv, writes a non-negative int in its shortest
@@ -182,6 +192,64 @@ ENCRYPTED = {
         "d3eab699e11fd1f50a356cdb2790b6605fde5eae35c4ba12c3c07eee93e4b57e"
         "c1c76836c48440e285454af51ed6869b1cb0d3cbe2a52a07b2bc5c62b88cffa4"
     ),
+    "g_accept_web_form_int64_at_ms": (
+        "7b9a5728a01dfa62d9b1686de6020e58186ef3c792deb8d211b2404bb2bf6330"
+        "71c6b07277e61eeaff630f01d96882ff7071f608be92aa0fac82681e3f341a1d"
+        "39a22a42a1bcfca4be11273b4c98a348ab536199fcda554015e05c24d6bb2930"
+        "b50fbb34139f5d1956af838a70da1bdb93d73cedbca8933d695ee5e0479614cb"
+        "8d4573526b594d34b86b2469a8fe324213901fa6c339c7975592b77d5600050a"
+        "8328e6087cd3629d2449dae7ad3ba57e85b0da3fbf4eb7a148e12fcd8ad5bcfe"
+        "b941e99e75f674bbe88836634d6747a41d8b87246fc69aa372ea9c24a9a78b12"
+        "9fcbaa5f321c3c1a167deb303fae6bad79c3c918cfcd8a46ad57daf5471e50f6"
+        "11dc151db5508cd5de1dfbe29928885908a32585379cd1d791765c359842be01"
+        "232b07d38dd72120d6a12c0c37acda6db77ae613c7a709f63088a53b37241bf9"
+        "f6ed4fdfac159b89911c3fa6f523e2b82e50df207a9da70db858441aed3d1c71"
+        "e167051a8acb71fc739e9b08ae75ea926ee93c089213c04b125e6bf79ccff0ca"
+        "17b1dd05d56e393a24f2d93fe50459e5c9fb9fbb5f4a29c69a066e1c8cda8a06"
+        "c7234fe4d6b6407bb74a9a468c719cb10110b65296622a308da5ba126362ba24"
+        "5b815283dacc36bc7667a838d91b33a815d494d99bb8de47095200dafd5f6b8c"
+        "c3d40e40ccf0e79196f04665cf2df70d14f9e92cb7f5dd0792db104bf90892d8"
+        "108c408023fc072ff618ba4e6656070218c5fad12d2f173f6be9a20dcd551416"
+        "4976307d1c20ca12f2ab661c98d26a19c4aa9053a1c42eaec6e3856802f8fef4"
+        "d5c37ecb7ed9f397160e567f3b0ed75379e2cf744e1992c2a2304ee585bb3a48"
+        "875ebc8da7f8359947bbf008f1cf3c940a279bdf07a547d4ea32b9ffbb696e11"
+        "99443f1dfbc966984e817ec52e8f8b89adc85c815f19acc89bef8faac01d6d94"
+        "8268db11715172f3181ad705a83214ce6c2dd871b10f2cc33fa100cdc072eb3b"
+        "3a83a19865fdb59ce5b04da8356cb019675cffa2c3887705dac3c191f79ff848"
+        "619a257fde548ef14639c57ec604b32ceda41a7687fae7e2b9d2df2e9f446c61"
+        "d173750efc36b0c763fce7ba85da99baaf52d5b8b75ea41facd7dba346fde166"
+        "1b74029120dbefde340ac67f23c3d8a692270d0693f9b75a6603e9d750b1578e"
+        "c70e6923fe1a99c0ec997d9cd6a37de993664aebf165aab79010df87e203fc0d"
+        "4d3d6cf020805dc27a919baea78d2d7017151272c5e31b80ad09168b9d5b5b53"
+        "ff3b254bf6d2907f91e068191fdc25aaaddb8bbed877a34a60751bcab6d32b3e"
+        "244f31315ea0441dd516bd1069a0c4b99afa9b8a2623fedcad396c8a1414c575"
+        "ca0559a487f9fbb71f5d7b344e781dec68ac560df538c49d878e7426aa9a1b02"
+        "f33f4bfe8266a712bde1418c89125a60d959b6c91065479898b6f2132be5a051"
+        "e6f759ef5a62bf8e4dce81f9d27f9908329658c7c51913e883c09caa380a6f3d"
+        "a18fc451344104e85013d8af7828a62ffe3f0d260609ed13eb748b4e9237332e"
+        "aadc0d764a85391ddbbbfdd30317adb1482fd7e10f36bb3510dda66b1c92c054"
+        "c927e15690045b420d1baeb52436b4322b0084cc479b3812de23f46b6a399024"
+        "d4ddfe0201f9c8dc8a9cf31c1fa1557458553e9563842afa157cd62ec6c151a0"
+        "ffa8445a45384d00b72637408f1f59632a11f42950782c6b68ae098adac72662"
+        "c3c928e5a483c365bdbcc39b828d0ad457614af73495a25969d62689f27d0cd9"
+        "ca9704cea4ec26ab7b2d8c61cacd30ce0f91249f919b4815a96c2fb7d71a6ecd"
+        "927257c60d0a2096f3befcfd8947a9782f34bc04e0176e6f568f72274d0d0add"
+        "02e0d6da4123c75df893d335ba4f7708648c8c116113bebb48bcd14c4a3d4f05"
+        "35e65a95331f8a60bd2bd36b44ef75411fea038b8d48357c71fe3da1c354a1c8"
+        "10ab4a20dca67425f14f9081d7db0a28e06585b6d341be48363ef66865cac06f"
+        "ab37848b407e38192b9fa80c4c084297401e5f9f6eb616bed04cccc9ef1a6946"
+        "c67f9eb9b850d1687e947681f692a7a2755b08c94fab151d8dd1a7854423d303"
+        "7dca2bc8921f0a163b7ed1d2420a50164abd8a9d14fd8b07879668949b87c34f"
+        "e2ed5fd61f369bdcca798860bed7b7ac13254e6c53a793bf47c3c78238b57252"
+        "7a80a389de09133e7479395a0ec721cb8daf7e09a9f5f745c760c48237b293d7"
+        "15a52d1faa7cfe3560a41f5963fdd2d0f6be3b08c435b7e95b1dd8e202f63685"
+        "c3af84ef6fa76769ec0b9a14022b5df4170b92d3269f9b6d6d3fb68458bb59ea"
+        "07676d44219e62edb06a1ac46fad0ec1ecc422651cca30ae0d31d587bf777c50"
+        "5380a7a30173586c3894b7c2fef34a2105477d8fbe2f13e5402c8256e14bd184"
+        "3921b61c789deaec5977d3677d1c0ce6d5b62168167480d1062a314c69336ed2"
+        "f0b1893370594b6ddc65a43b10f72b9e7449a782f591923c06e458aa1651061b"
+        "268f7400ad4d24aa3342f11883eeace9"
+    ),
     "member_post_legacy": (
         "f6b72d4f3135509362baf466de272da47ce9eef6d4398e1f0ecd1513dec35b23"
         "f45d58b8df746a4c5e76573fe4bb172b77ae4300cd15eea060fe1e524987a19c"
@@ -212,10 +280,11 @@ def is_hex32(s):
 
 def invite_members(csv):
     """The phones' invite parser (iOS/Android DeliveryPolicy.members): split
-    on ',', trim, keep entries of exactly 32 lowercase hex, first of each."""
+    on ',', trim INVITE_SPACE (Zs and U+0009) from each end, keep entries of
+    exactly 32 lowercase hex, first of each."""
     out = []
     for part in csv.split(","):
-        h = part.strip()
+        h = part.strip(INVITE_SPACE)
         if len(h) == 32 and all(c in "0123456789abcdef" for c in h) and h not in out:
             out.append(h)
     return out
@@ -342,6 +411,8 @@ def main():
     x_hash = RNS.Destination.hash(x, "lxmf", "delivery")
     d_hex, m_hex = d_hash.hex(), m_hash.hex()
     assert len({d_hex, m_hex, x_hash.hex(), OTHER_MEMBER, GROUP_ID}) == 5
+    zs = {chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"}
+    assert set(INVITE_SPACE) == zs | {"\t"} and len(INVITE_SPACE) == len(zs) + 1, "INVITE_SPACE is Zs and U+0009"
     assert GROUP_ID not in LEFT_FULL and len(set(LEFT_FULL)) == LEFT_MAX
 
     members = f"{d_hex},{m_hex},{OTHER_MEMBER}"
@@ -425,6 +496,11 @@ def main():
     variants.append(g_vector("create_members_parsed_like_an_invite",
                              "members is parsed with the invite's parser (trimmed, an entry that is not 32 lowercase hex skipped) and kept verbatim",
                              s, g_fields(custom_data(s)), OPS["create"][0] + 3))
+    s = sync("accept", [])
+    s["members"] = f"\t{d_hex}\u00a0,\u3000{m_hex}\u2009 \u202f,\u205f{OTHER_MEMBER}\u1680\t"
+    variants.append(g_vector("accept_members_trimmed_of_zs_and_tab",
+                             "the invite parser trims Unicode Zs (here U+0020, U+00A0, U+1680, U+2009, U+202F, U+205F, U+3000) and U+0009 from each entry; D and the creator are listed",
+                             s, g_fields(custom_data(s)), OPS["accept"][0] + 2))
     s = sync("post", [])
     s["text"] = ""
     variants.append(g_vector("post_attachment_only", "an attachment-only post copies an empty text", s,
@@ -527,6 +603,18 @@ def main():
                "the invite parser counts only lowercase 32-hex entries, so an uppercase D is not D",
                arr=arr_with("create", 4, f"{d_hex.upper()},{m_hex}")),
         reject("members_empty", "members is empty", arr=arr_with("accept", 4, "")),
+    ] + [
+        reject(f"members_naming_d_wrapped_in_{label}",
+               f"the invite parser trims only Unicode Zs and U+0009, so D wrapped in {label} ({' '.join(f'U+{ord(c):04X}' for c in wrap)}) is not D",
+               arr=arr_with("create", 4, f"{m_hex},{wrap}{d_hex}{wrap}"))
+        for label, wrap in [("newline", "\n"), ("cr_lf", "\r\n"), ("vt", "\x0b"), ("ff", "\x0c"),
+                            ("unit_separator", "\x1f"), ("file_separator", "\x1c"), ("next_line", "\x85"),
+                            ("line_separator", "\u2028"), ("paragraph_separator", "\u2029"),
+                            ("byte_order_mark", "\ufeff"), ("zero_width_space", "\u200b")]
+    ] + [
+        reject("creator_listed_only_wrapped_in_newline",
+               "the creator's entry wrapped in U+000A is not listed by the invite parser",
+               arr=arr_with("accept", 4, f"{d_hex},\n{m_hex}\n,{OTHER_MEMBER}")),
         reject("keys_str", "keys is an array", arr=arr_with("create", 5, keys[0])),
         reject("keys_with_a_bin", "keys is an array of str", arr=arr_with("create", 5, [keys[0], keys[1].encode()])),
         reject("keys_nil", "keys is an array", arr=arr_with("accept", 5, None)),
@@ -555,13 +643,21 @@ def main():
     invite_fields = {FIELD_RETICHAT: {1: GROUP_ID, 2: members, 3: GROUP_NAME, 4: "invite", 5: m_hex,
                                       9: key_entry(d, d_hex)}}
     post_fields = {0xA0: GROUP_ID, 0xA4: m_hex}
+    web_at = OPS["accept"][1]
+    web_form = (b"\xcf" + web_at.to_bytes(8, "big"), b"\xd3" + web_at.to_bytes(8, "big"))
     sealed_specs = [
-        # name, signer, src, timestamp, content, fields, expected
+        # name, signer, src, timestamp, content, fields, expected[, substitute]
         ("g_accept_full_left", d, d_hash, OPS["accept"][0], b"", g_fields(custom_data(sync("accept", LEFT_FULL))),
          {"has_group_id": False, "group_id": None, "group_action": None, "group_name": None,
           "group_sync": expected(sync("accept", LEFT_FULL)), "sender_key_hex": None, "packed": False,
           "signature_validated": True, "unverified_reason": 0,
           "why": "a group sync G from D: validated under the distro key the receiver holds; a distro marker, so no group entries are read"}),
+        ("g_accept_web_form_int64_at_ms", d, d_hash, OPS["accept"][0], b"", g_fields(custom_data(sync("accept", LEFT_FULL))),
+         {"has_group_id": False, "group_id": None, "group_action": None, "group_name": None,
+          "group_sync": expected(sync("accept", LEFT_FULL)), "sender_key_hex": None, "packed": False,
+          "signature_validated": True, "unverified_reason": 0,
+          "why": "the same G as the web writes it, at_ms as int 64 (0xd3), signed over the payload as sent: LXMF hashes and verifies a payload without a stamp as received (§17.14 rule 2), so the hash is Python's and the signature verifies; packing the payload again (0xcf) gives another hash and a failed signature"},
+         web_form),
         ("member_accept_legacy", m, m_hash, 1790000400.5, b"", accept_fields,
          {"has_group_id": True, "group_id": GROUP_ID, "group_action": "accept", "group_name": None,
           "group_sync": None, "sender_key_hex": m.get_public_key().hex(), "packed": True,
@@ -585,12 +681,21 @@ def main():
     ]
 
     built = {}
-    for name, signer, src, timestamp, content, fields, expect in sealed_specs:
-        packed, message_hash, fields_bytes = pack(signer, d_hash, src, timestamp, b"", content, fields)
+    for name, signer, src, timestamp, content, fields, expect, *substitute in sealed_specs:
+        substitute = substitute[0] if substitute else None
+        packed, message_hash, fields_bytes = pack(signer, d_hash, src, timestamp, b"", content, fields, substitute)
+        if substitute is not None:
+            # Not the bytes a packer here makes: the repacked payload hashes otherwise.
+            repacked = msgpack.packb(msgpack.unpackb(packed[96:]))
+            assert repacked != packed[96:]
+            assert RNS.Identity.full_hash(packed[:32] + repacked) != message_hash
         built[name] = (packed, message_hash, fields_bytes, timestamp, content, expect)
+    web_variant = next(x for x in variants if x["name"] == "accept_web_form_int64_at_ms")
+    assert hexs(built["g_accept_web_form_int64_at_ms"][0]) == web_variant["packed_hex"]
 
     if "--new-sealed" in sys.argv:
-        print(json.dumps({name: d.encrypt(b[0][16:]).hex() for name, b in built.items()}, indent=4))
+        print(json.dumps({name: d.encrypt(b[0][16:]).hex() for name, b in built.items() if name not in ENCRYPTED},
+                         indent=4))
         return
     assert set(ENCRYPTED) == set(built), "run once with --new-sealed and fix ENCRYPTED"
 
@@ -661,8 +766,9 @@ def main():
             "variants: forms a receiver must read that a Rust writer does not make (the web's int 64 at_ms, bin name or text, elements after left, uppercase ids, 0xFD absent or uppercase, ...), each with its expected reading.",
             "at_ms_encodings: fields of a leave G whose at_ms is written in the encoding at_ms_hex; accepted ones read as at_ms, the others are refused (problem set).",
             "rejects: fields of a G that fails §11.1 rule 4; the reading has `by` and a non-null `problem`, and every other key null. The problem text is each implementation's own.",
-            "members is parsed with the phones' invite parser (iOS/Android DeliveryPolicy.members): split on ',', each entry trimmed, kept when it is exactly 32 lowercase hex; it must name D. creator (an accept) is 32 hex, read lowercased, listed, not D.",
-            "sealed: blobs as RFed hands them to D's devices (blob_hex = D_hash | D.encrypt(packed[16:]); the encryption is random, so these bytes are fixed input), each with the unwrap's expected hash (hash_hex), packed (packed_hex = blob[0:16] | plaintext) and the §7 keys after each phone's group receipt; sender_key_hex is the 128-hex key (null when none), packed true when the JSON's packed is the base64 of packed_hex, false when null. M is not known to the receiver.",
+            "members is parsed with the phones' invite parser (iOS/Android DeliveryPolicy.members): split on ',', each entry trimmed of invite_space (Unicode Zs and U+0009) at both ends, kept when it is exactly 32 lowercase hex, the first of each; it must name D. creator (an accept) is 32 hex, read lowercased, listed, not D.",
+            "invite_space: the code points the invite parser trims, Unicode Zs and U+0009 (Swift's CharacterSet.whitespaces), and no other.",
+            "sealed: blobs as RFed hands them to D's devices (blob_hex = D_hash | D.encrypt(packed[16:]); the encryption is random, so these bytes are fixed input), each with the unwrap's expected hash (hash_hex; LXMF.py's: full_hash(dest | src | payload) over the payload as received, packed again only to drop a stamp; g_accept_web_form_int64_at_ms is not in the form a packer makes, so a reader that always packs the payload again gets another hash and a failed signature), packed (packed_hex = blob[0:16] | plaintext) and the §7 keys after each phone's group receipt; sender_key_hex is the 128-hex key (null when none), packed true when the JSON's packed is the base64 of packed_hex, false when null. M is not known to the receiver.",
             "group_entries: the unwrap's has_group_id, group_id, group_action and group_name for a fields map alone, and whether group_sync is set (true) or null (false).",
         ],
         "distro": {
@@ -688,6 +794,7 @@ def main():
                   "text": POST_TEXT},
         "left_full": LEFT_FULL,
         "max_at_ms": MAX_AT_MS,
+        "invite_space": [ord(c) for c in INVITE_SPACE],
         "ops": ops,
         "variants": variants,
         "at_ms_encodings": at_ms_encodings,
