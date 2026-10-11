@@ -7,10 +7,11 @@
 //! through and `LXMRouter.lxmf_delivery` drops the message whole. Here
 //! [`refuse_repeated_keys`] does the same for every LXMF payload this crate
 //! reads: `LXMessage::unpack_from_bytes` (the direct path, the propagation
-//! node's deliveries, paper messages, channel posts, the phones' group
-//! receipts) and `distro::unwrap_blob` (the distro path). No reader of the
-//! group entries, the group sync or a channel membership message ever sees
-//! such a map.
+//! node's deliveries, paper messages, the phones' group receipts),
+//! `channel::unpack` (a channel post, before its sender's key is remembered),
+//! `LXMessage::unpack_from_file` (a stored container, as LXMF.py reads it) and
+//! `distro::unwrap_blob` (the distro path). No reader of the group entries,
+//! the group sync or a channel membership message ever sees such a map.
 //!
 //! "Already in the dict" is Python's equality, so two keys of one map are one
 //! key when:
@@ -24,10 +25,17 @@
 //!   instant to the microsecond, as Python's `datetime` compares it.
 //!
 //! An array key is never compared: umsgpack turns it into a tuple and skips
-//! the check. A map key umsgpack refuses for another reason
-//! (`UnhashableKeyException`), which this rule does not cover. The
-//! `key_equality` vectors of tests/distro_group_sync_vectors.json, checked
-//! against the reference, pin each case.
+//! the check. The `key_equality` vectors of
+//! tests/distro_group_sync_vectors.json, checked against the reference, pin
+//! each case.
+//!
+//! Not covered, and not ruled (open for James since 2026-10-11): umsgpack
+//! refuses two more payloads whole, for other reasons than a repeated key. A
+//! map used as a key, or an array key that holds a map, raises
+//! `UnhashableKeyException`; this walk skips both and rmpv reads them. A
+//! payload nested past Python's recursion limit raises `RecursionError`: with
+//! arrays nested in a field, from about 496 of them in a fresh interpreter
+//! (fewer under LXMRouter's stack), while rmpv refuses only from 510.
 
 use std::collections::HashSet;
 use std::fmt;

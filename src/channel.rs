@@ -278,10 +278,13 @@ impl UnpackedPost {
 /// Decrypt and verify a post received from RFed (`data` is the wire payload
 /// `channel_id_hash(16) | EC_encrypted(...)`).
 ///
-/// Rejects a post whose prelude key does not produce its claimed source
-/// hash, before any key is remembered (DISPLAY_NAMES.md §2.3). A post that
-/// passes has its sender key remembered under the source hash, so the LXMF
-/// signature is checked against it.
+/// Rejects, before any key is remembered, a post whose prelude key does not
+/// produce its claimed source hash (DISPLAY_NAMES.md §2.3) and a post whose
+/// LXMF payload cannot be read or repeats a key (refused whole, RFed SPEC
+/// §17.14 "Repeated keys": the error starts with
+/// `msgpack_keys::REFUSED_WHOLE`). A post that passes has its sender key
+/// remembered under the source hash, so the LXMF signature is checked
+/// against it.
 pub fn unpack(channel: &str, data: &[u8]) -> Result<UnpackedPost, String> {
 	if channel.is_empty() {
 		return Err("channel name is empty".into());
@@ -298,7 +301,7 @@ pub fn unpack(channel: &str, data: &[u8]) -> Result<UnpackedPost, String> {
 	}
 	let sender_pub = &decrypted[4..PRELUDE_LEN];
 	let lxmf_tail = &decrypted[PRELUDE_LEN..];
-	if lxmf_tail.len() < HASH_LEN {
+	if lxmf_tail.len() < HASH_LEN + LXMessage::SIGNATURE_LENGTH {
 		return Err("channel: LXMF tail after prelude too short".into());
 	}
 	let claimed_source = &lxmf_tail[..HASH_LEN];
@@ -311,6 +314,19 @@ pub fn unpack(channel: &str, data: &[u8]) -> Result<UnpackedPost, String> {
 			"channel: prelude key does not produce the claimed source {} — post rejected (key binding, DISPLAY_NAMES.md §2.3)",
 			reticulum_rust::hexrep(claimed_source, false)
 		));
+	}
+	// Nothing of a post that is not kept is remembered (as on the web): a
+	// payload that is not an LXMF payload is rejected here, and one that
+	// repeats a key is refused whole (RFed SPEC §17.14 "Repeated keys"; logged
+	// once, there, and its error starts with REFUSED_WHOLE), before the key.
+	let payload = rmpv::decode::read_value(&mut &lxmf_tail[HASH_LEN + LXMessage::SIGNATURE_LENGTH..])
+		.map_err(|e| format!("channel: msgpack decode error: {e}"))?;
+	crate::msgpack_keys::refuse_repeated_keys(
+		&payload,
+		&format!("channel post from {} on #{channel}", reticulum_rust::hexrep(claimed_source, false)),
+	)?;
+	if !payload.is_array() {
+		return Err("channel: LXMF payload is not an array".into());
 	}
 	Identity::remember_destination(claimed_source, sender_pub, None)
 		.map_err(|e| format!("channel: remember_destination failed: {e}"))?;
@@ -373,6 +389,37 @@ mod tests {
 		lxmf_delivery_hash_for_public_key(&identity.get_public_key().unwrap()).unwrap()
 	}
 
+	/// The wire bytes of a post from `sender` whose LXMF message carries
+	/// `fields`, signed over the channel's `lxmf.delivery` hash as `pack`
+	/// signs it.
+	fn post_with_fields(sender: &Identity, fields: rmpv::Value) -> Vec<u8> {
+		let sender_dest = Destination::new_outbound(
+			Some(sender.clone()),
+			DestinationType::Single,
+			LXMF_APP_NAME.to_string(),
+			vec![LXMF_DELIVERY_ASPECT.to_string()],
+		)
+		.unwrap();
+		let mut msg = LXMessage::new(
+			Some(channel_destination(CHANNEL).unwrap()),
+			Some(sender_dest),
+			Some(b"x".to_vec()),
+			Some(Vec::new()),
+			Some(fields),
+			Some(LXMessage::PROPAGATED),
+			None,
+			None,
+			None,
+			false,
+		)
+		.unwrap();
+		msg.pack(false).unwrap();
+		let mut plaintext = PRELUDE_MAGIC.to_vec();
+		plaintext.extend_from_slice(&sender.get_public_key().unwrap());
+		plaintext.extend_from_slice(&msg.packed.unwrap()[HASH_LEN..]);
+		encrypt_post(CHANNEL, &plaintext)
+	}
+
 	/// The wire bytes without a name are exactly the pre-name format: the
 	/// routing label, then (decrypted) RTID | sender key | source | signature
 	/// | [F64 timestamp, bin title, bin content, {}].
@@ -424,33 +471,7 @@ mod tests {
 	#[test]
 	fn unpack_reads_key_0_of_the_map() {
 		let sender = Identity::new(true);
-		let sender_dest = Destination::new_outbound(
-			Some(sender.clone()),
-			DestinationType::Single,
-			LXMF_APP_NAME.to_string(),
-			vec![LXMF_DELIVERY_ASPECT.to_string()],
-		)
-		.unwrap();
-		let post_with = |fields: rmpv::Value| {
-			let mut msg = LXMessage::new(
-				Some(channel_destination(CHANNEL).unwrap()),
-				Some(sender_dest.clone()),
-				Some(b"x".to_vec()),
-				Some(Vec::new()),
-				Some(fields),
-				Some(LXMessage::PROPAGATED),
-				None,
-				None,
-				None,
-				false,
-			)
-			.unwrap();
-			msg.pack(false).unwrap();
-			let mut plaintext = PRELUDE_MAGIC.to_vec();
-			plaintext.extend_from_slice(&sender.get_public_key().unwrap());
-			plaintext.extend_from_slice(&msg.packed.unwrap()[HASH_LEN..]);
-			unpack(CHANNEL, &encrypt_post(CHANNEL, &plaintext)).unwrap()
-		};
+		let post_with = |fields: rmpv::Value| unpack(CHANNEL, &post_with_fields(&sender, fields)).unwrap();
 		use rmpv::Value;
 		let bin_form = Value::Map(vec![(Value::from(0xD1), Value::Binary(b"Bob".to_vec()))]);
 		assert_eq!(post_with(bin_form).display_name, NameField::Absent);
@@ -517,6 +538,58 @@ mod tests {
 		Identity::remember_destination(&victim_hash, &victim.get_public_key().unwrap(), None).unwrap();
 		assert!(unpack(CHANNEL, &forged).is_err());
 		assert_eq!(Identity::recall_public_key(&victim_hash), Some(victim.get_public_key().unwrap()));
+	}
+
+	/// RFed SPEC §17.14 "Repeated keys": a post whose LXMF payload repeats a
+	/// key is refused whole before its key is remembered, as the web keeps
+	/// nothing of a refused post, and its error is one
+	/// `msgpack_keys::is_refusal` knows (logged once already, so the bridges'
+	/// callers say nothing more). The same post without the repeat is kept.
+	#[test]
+	fn a_post_that_repeats_a_key_is_refused_and_nothing_is_remembered() {
+		use rmpv::Value;
+		let sender = Identity::new(true);
+		let source = delivery_hash(&sender);
+		let twice = Value::Map(vec![
+			(Value::from(0xD1), Value::Map(vec![(Value::from(0), Value::from("Bob"))])),
+			(Value::from(0xD1), Value::Map(vec![(Value::from(0), Value::from("Eve"))])),
+		]);
+		let err = unpack(CHANNEL, &post_with_fields(&sender, twice)).expect_err("refused whole");
+		assert!(crate::msgpack_keys::is_refusal(&err) && err.contains("repeats a key"), "{err}");
+		assert_eq!(Identity::recall_public_key(&source), None, "nothing of a refused post is remembered");
+
+		let once = Value::Map(vec![(Value::from(0xD1), Value::Map(vec![(Value::from(0), Value::from("Bob"))]))]);
+		let kept = unpack(CHANNEL, &post_with_fields(&sender, once)).unwrap();
+		assert!(kept.signature_validated);
+		assert_eq!(kept.display_name, NameField::Name("Bob".into()));
+		assert_eq!(Identity::recall_public_key(&source), Some(sender.get_public_key().unwrap()));
+	}
+
+	/// A post whose LXMF payload cannot be read (shorter than a source and a
+	/// signature, truncated msgpack, not an array) is rejected before its key is
+	/// remembered too: only a post that is kept leaves its key behind.
+	#[test]
+	fn an_unreadable_post_is_rejected_and_nothing_is_remembered() {
+		for (why, payload) in [
+			("shorter than a signature", None),
+			("truncated msgpack", Some(vec![0x92, 0x01])),
+			("not an array", Some(vec![0x80])),
+		] {
+			let sender = Identity::new(true);
+			let source = delivery_hash(&sender);
+			let mut plaintext = PRELUDE_MAGIC.to_vec();
+			plaintext.extend_from_slice(&sender.get_public_key().unwrap());
+			plaintext.extend_from_slice(&source);
+			match payload {
+				None => plaintext.extend_from_slice(&[0u8; 10]),
+				Some(payload) => {
+					plaintext.extend_from_slice(&[0u8; LXMessage::SIGNATURE_LENGTH]);
+					plaintext.extend_from_slice(&payload);
+				}
+			}
+			assert!(unpack(CHANNEL, &encrypt_post(CHANNEL, &plaintext)).is_err(), "{why}");
+			assert_eq!(Identity::recall_public_key(&source), None, "{why}: nothing remembered");
+		}
 	}
 
 	/// With the victim's real key in the prelude the binding passes, but the
