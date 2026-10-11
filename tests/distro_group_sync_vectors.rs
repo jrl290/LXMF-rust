@@ -205,6 +205,53 @@ fn the_invite_parser_trims_exactly_zs_and_tab() {
 	assert!(wrong.is_empty(), "trimmed or kept against invite_space: {wrong:?}");
 }
 
+/// The invite parser splits on the code point `,` (U+002C), never on grapheme clusters: a combining
+/// mark after a comma does not join it (Swift's `String.split` on `Character` would), and one before
+/// an entry is part of that entry, which is then not 32 lowercase hex.
+#[test]
+fn the_invite_parser_splits_on_the_code_point_comma() {
+	let v = vectors();
+	let cases = v["invite_members"].as_array().expect("invite_members");
+	let names: Vec<&str> = cases.iter().map(|c| c["name"].as_str().unwrap()).collect();
+	for name in ["combining_mark_after_a_comma", "combining_mark_before_an_entry"] {
+		assert!(names.contains(&name), "{name} missing from invite_members");
+	}
+	for case in cases {
+		let name = case["name"].as_str().unwrap();
+		let want: Vec<String> = case["members"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect();
+		assert_eq!(invite_members(case["csv"].as_str().unwrap()), want, "{name}");
+	}
+}
+
+/// RFed SPEC §17.14 "Repeated keys": a group entry is read from the first entry with its key (of
+/// the fields map, or of 0xD1), 0xFB from the last; ext values beside a group id are skipped, and
+/// a bin GROUP_ID is no id in either form. The vectors that pin it are present, so a generator
+/// that lost them fails here rather than passing on fewer cases.
+#[test]
+fn the_repeated_key_ext_and_bin_vectors_are_present() {
+	let v = vectors();
+	let has = |set: &str, name: &str| v[set].as_array().unwrap().iter().any(|x| x["name"] == name);
+	for name in [
+		"group_id_twice_the_first_read",
+		"group_id_twice_the_first_malformed",
+		"retichat_field_group_id_twice",
+		"retichat_field_twice",
+		"group_action_and_name_twice",
+		"group_id_bin_in_both_forms",
+		"group_id_bin_in_0xd1_str_in_0xa0",
+		"ext_beside_group_id",
+		"ext_beside_group_id_in_retichat_field",
+		"custom_type_twice_the_last_not_a_marker",
+		"custom_type_twice_the_last_a_marker",
+	] {
+		assert!(has("group_entries", name), "group_entries {name} missing");
+	}
+	for name in ["leave_0xfb_twice_the_last_the_marker", "accept_members_combining_mark_after_a_comma"] {
+		assert!(has("variants", name), "variants {name} missing");
+	}
+	assert!(has("rejects", "members_naming_d_after_a_combining_mark"), "rejects members_naming_d_after_a_combining_mark missing");
+}
+
 /// §19.1: the unwrap reports the hash Python computed and `packed == blob[..16] | plaintext`,
 /// the group entries and the group sync; the verdict here is the unwrap's own (the phones'
 /// group receipt then decides an accept or leave under the key it carries).

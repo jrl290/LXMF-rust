@@ -1001,7 +1001,11 @@ fn value_to_string(value: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// `fields[0xFB]` as text when it is a str or a bin, else `None`; the last
-/// entry with that key wins, as in the readers above and in Python's dict.
+/// entry with that key wins, as in the readers above (RFed SPEC §17.14
+/// "Repeated keys"; a group entry is read from the first, `retichat_field::
+/// top_level`). The Python reference has no such rule: RNS's umsgpack refuses
+/// a map that repeats a key, so LXMF.py drops the message whole. Pinned by the
+/// `*_twice*` vectors of tests/distro_group_sync_vectors.json.
 fn custom_type(entries: &[(Value, Value)]) -> Option<String> {
     match entries.iter().rev().find(|(k, _)| k.as_u64() == Some(FIELD_CUSTOM_TYPE)).map(|(_, v)| v)? {
         Value::String(s) => Some(String::from_utf8_lossy(s.as_bytes()).into_owned()),

@@ -23,6 +23,12 @@ move.
 The script also reads every vector back with its own reading of §11.1 rule 4
 (read_group_sync below, a second implementation of the rule) and stops when a
 vector says something that reading does not.
+
+A fields map that repeats a key (the *_twice* vectors) is one the reference
+refuses whole (RNS umsgpack raises DuplicateKeyException, so LXMF.py drops the
+message); the script asserts that, and their readings are LXMF-rust's, pinned
+by RFed SPEC §17.14 "Repeated keys": a group entry from the first entry with
+its key, 0xFB from the last.
 """
 
 import base64
@@ -272,6 +278,32 @@ def key_entry(identity, delivery_hex):
     return f"{delivery_hex}:{base64.b64encode(identity.get_public_key()).decode()}"
 
 
+class Raw(bytes):
+    """Msgpack bytes already packed, written as they are by raw_map."""
+
+
+def raw_map(pairs):
+    """The msgpack map of `pairs` in their order, a key repeated as often as
+    it is given (a dict holds each key once): a fixmap header, then each key
+    and value as umsgpack packs it, or as given when Raw."""
+    assert len(pairs) < 16
+    return Raw(bytes([0x80 | len(pairs)]) + b"".join(
+        msgpack.packb(k) + (v if isinstance(v, Raw) else msgpack.packb(v)) for k, v in pairs))
+
+
+def reference_refuses(fields_bytes):
+    """Whether the reference refuses these bytes: RNS's umsgpack raises
+    DuplicateKeyException on a map, at any depth, that repeats a key, so
+    LXMF.py (LXMessage.unpack_from_bytes) drops such a message whole. The
+    readings of a repeated key in these vectors are LXMF-rust's, pinned by
+    RFed SPEC §17.14, not the reference's."""
+    try:
+        msgpack.unpackb(fields_bytes)
+    except msgpack.DuplicateKeyException:
+        return True
+    return False
+
+
 # --- A second reading of §11.1 rule 4, to check the vectors against --------
 
 def is_hex32(s):
@@ -388,7 +420,9 @@ def pack(signer, dest_hash, src_hash, timestamp, title, content, fields, substit
     """An LXMF message packed as LXMessage.pack packs it: dest | src |
     signature | msgpack [timestamp, title, content, fields], signed over dest |
     src | payload | full_hash(dest | src | payload). Read back with the
-    reference's own LXMessage.unpack_from_bytes for its hash."""
+    reference's own LXMessage.unpack_from_bytes for its hash; a fields map
+    with a repeated key the reference refuses whole (see reference_refuses),
+    so that one is hashed here only."""
     payload = substituted(msgpack.packb([timestamp, title, content, fields]), substitute)
     fields_bytes = substituted(msgpack.packb(fields), substitute)
     assert payload.endswith(fields_bytes)
@@ -396,6 +430,8 @@ def pack(signer, dest_hash, src_hash, timestamp, title, content, fields, substit
     message_hash = RNS.Identity.full_hash(hashed_part)
     signature = signer.sign(hashed_part + message_hash)
     packed = dest_hash + src_hash + signature + payload
+    if reference_refuses(fields_bytes):
+        return packed, message_hash, fields_bytes
     reference = LXMessage.unpack_from_bytes(packed)
     assert reference.hash == message_hash
     assert reference.fields == msgpack.unpackb(fields_bytes)
@@ -435,10 +471,13 @@ def main():
         e.update(s)
         return e
 
-    def g_vector(name, why, s, fields, timestamp, substitute=None, expect=None):
+    def g_vector(name, why, s, fields, timestamp, substitute=None, expect=None, last_of_each=None):
+        # last_of_each: for fields with a repeated key, which the reference
+        # refuses, the pairs as LXMF-rust reads 0xFB-0xFD (the last of each).
         packed, message_hash, fields_bytes = pack(d, d_hash, d_hash, timestamp, b"", b"", fields, substitute)
         expect = expect or expected(s)
-        got = read_group_sync(msgpack.unpackb(fields_bytes), d_hex)
+        assert reference_refuses(fields_bytes) == (last_of_each is not None), name
+        got = read_group_sync(dict(last_of_each) if last_of_each else msgpack.unpackb(fields_bytes), d_hex)
         assert got == expect, f"{name}: {got} != {expect}"
         return {
             "name": name,
@@ -516,6 +555,22 @@ def main():
     s = sync("leave", [])
     variants.append(g_vector("leave_0xfd_uppercase", "by is 0xFD lowercased", s,
                              g_fields(custom_data(s), device=DEVICE.upper()), OPS["leave"][0] + 4))
+    # Repeated keys (§17.14): 0xFB is read from the last entry with its key.
+    s = sync("leave", [])
+    fields = g_fields(custom_data(s))
+    pairs = [(FIELD_TICKET, b""), (FIELD_CUSTOM_TYPE, "app.example"), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE),
+             (FIELD_CUSTOM_DATA, custom_data(s)), (FIELD_CUSTOM_META, DEVICE)]
+    variants.append(g_vector("leave_0xfb_twice_the_last_the_marker",
+                             "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G",
+                             s, fields, OPS["leave"][0] + 5, substitute=(msgpack.packb(fields), raw_map(pairs)),
+                             last_of_each=pairs))
+    # The members csv is split on the code point ',', never on grapheme clusters.
+    s = sync("accept", [])
+    s["members"] = f"{m_hex},{d_hex},́"
+    assert invite_members(s["members"]) == [m_hex, d_hex]
+    variants.append(g_vector("accept_members_combining_mark_after_a_comma",
+                             "members is split on the code point ',' (U+002C), not on grapheme clusters: a combining mark (U+0301) after the last comma is an entry of its own, skipped, and D and the creator M are listed",
+                             s, g_fields(custom_data(s)), OPS["accept"][0] + 3))
 
     # 3. at_ms in every integer encoding, read by value; anything else refused.
     at_ms_encodings = []
@@ -632,6 +687,9 @@ def main():
         reject("left_in_the_wrong_place",
                "a create whose left is where an accept's creator would be: left must be element 6",
                arr=arr_of("create")[:6] + [m_hex, []]),
+        reject("members_naming_d_after_a_combining_mark",
+               "a combining mark (U+0301) after a comma and before D's entry is part of that entry, not of the comma (the csv is split on the code point ','), and the invite parser trims only Zs and U+0009, so D is not listed",
+               arr=arr_with("create", 4, f"{m_hex},́{d_hex}")),
     ]
 
     # 5. Messages from a member M to D, through the distro, for the unwrap and
@@ -721,7 +779,12 @@ def main():
     # 6. The group entries the unwrap reports, by the fields alone (has_group_id,
     #    group_id, group_action, group_name; group_sync present or not).
     def entries(name, why, fields, has, gid, action, gname, is_sync=False):
-        return {"name": name, "why": why, "fields_hex": hexs(msgpack.packb(fields)),
+        # fields: a dict, or Raw bytes from raw_map (a repeated key).
+        fields_bytes = fields if isinstance(fields, Raw) else msgpack.packb(fields)
+        # The reference refuses exactly the raw maps (each repeats a key); it
+        # reads the others, an unknown ext as an Ext.
+        assert reference_refuses(fields_bytes) == isinstance(fields, Raw), name
+        return {"name": name, "why": why, "fields_hex": hexs(fields_bytes),
                 "expected": {"has_group_id": has, "group_id": gid, "group_action": action, "group_name": gname,
                              "group_sync": is_sync}}
 
@@ -756,6 +819,63 @@ def main():
         for marker in DISTRO_MARKERS
     ]
 
+    # Repeated keys (§17.14): a group entry is read from the first entry with
+    # its key, of the fields map or of 0xD1, whatever that entry holds; 0xFB
+    # from the last. A dict keeps the last of each, so these are raw maps.
+    other_id = LEFT_FULL[0]
+    leave_arr = custom_data(sync("leave", []))
+    group_entries += [
+        entries("group_id_twice_the_first_read", "two 0xA0 entries: the first is read",
+                raw_map([(0xA0, GROUP_ID), (0xA0, other_id)]), True, GROUP_ID, None, None),
+        entries("group_id_twice_the_first_malformed",
+                "two 0xA0 entries: the first is read even when it is not a group id, so the group message has no id",
+                raw_map([(0xA0, "x"), (0xA0, GROUP_ID)]), True, None, None, None),
+        entries("retichat_field_group_id_twice", "key 1 twice in 0xD1: the first is read",
+                raw_map([(FIELD_RETICHAT, raw_map([(1, GROUP_ID), (1, other_id)]))]), True, GROUP_ID, None, None),
+        entries("retichat_field_twice", "two 0xD1 fields: the first is read whole, the second not at all",
+                raw_map([(FIELD_RETICHAT, {1: GROUP_ID, 4: "accept"}), (FIELD_RETICHAT, {1: other_id, 3: GROUP_NAME})]),
+                True, GROUP_ID, "accept", None),
+        entries("group_action_and_name_twice", "0xA3 and 0xA2 twice each: the first of each is read",
+                raw_map([(0xA0, GROUP_ID), (0xA3, "invite"), (0xA2, GROUP_NAME), (0xA3, "leave"), (0xA2, "Another name")]),
+                True, GROUP_ID, "invite", GROUP_NAME),
+        entries("group_id_bin_in_both_forms",
+                "a GROUP_ID that is a bin, in 0xD1 and in 0xA0: a group entry is a str, so a group message with no id",
+                {FIELD_RETICHAT: {1: GROUP_ID.encode()}, 0xA0: GROUP_ID.encode()}, True, None, None, None),
+        entries("group_id_bin_in_0xd1_str_in_0xa0", "key 1 of 0xD1 that is a bin gives way to 0xA0's str",
+                {FIELD_RETICHAT: {1: GROUP_ID.encode()}, 0xA0: GROUP_ID}, True, GROUP_ID, None, None),
+        entries("ext_beside_group_id", "an ext of a type no reader knows (5) beside 0xA0 is skipped; the map is read",
+                {0xA0: GROUP_ID, 0x77: msgpack.Ext(5, b"\x00")}, True, GROUP_ID, None, None),
+        entries("ext_beside_group_id_in_retichat_field",
+                "an ext of a type no reader knows (9) beside key 1 of 0xD1 is skipped; the map is read",
+                {FIELD_RETICHAT: {1: GROUP_ID, 4: "accept", 10: msgpack.Ext(9, b"\x01\x02\x03\x04")}}, True, GROUP_ID,
+                "accept", None),
+        entries("custom_type_twice_the_last_not_a_marker",
+                "two 0xFB entries: the last is read, here a type that is not a distro marker after the group sync marker, so the group entries are read and the message is no G",
+                raw_map([(FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE), (FIELD_CUSTOM_TYPE, "app.example"),
+                         (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE), (0xA0, GROUP_ID), (0xA3, "leave")]),
+                True, GROUP_ID, "leave", None),
+        entries("custom_type_twice_the_last_a_marker",
+                "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G and its group entries are not read",
+                raw_map([(FIELD_CUSTOM_TYPE, "app.example"), (FIELD_CUSTOM_TYPE, DISTRO_GROUP_TYPE),
+                         (FIELD_CUSTOM_DATA, leave_arr), (FIELD_CUSTOM_META, DEVICE), (0xA0, GROUP_ID), (0xA3, "leave")]),
+                False, None, None, None, is_sync=True),
+    ]
+    assert len({e["name"] for e in group_entries}) == len(group_entries)
+
+    # 7. The invite parser on its own: the csv is split on the code point ','
+    #    (U+002C), never on grapheme clusters.
+    invite_cases = []
+    for name, why, csv, want in [
+        ("combining_mark_after_a_comma",
+         "a combining mark (U+0301) after the last comma does not join it: it is an entry of its own, skipped",
+         f"{m_hex},{d_hex},́", [m_hex, d_hex]),
+        ("combining_mark_before_an_entry",
+         "a combining mark (U+0301) after a comma is part of the entry that follows, which is then not 32 lowercase hex",
+         f"{m_hex},́{d_hex}", [m_hex]),
+    ]:
+        assert invite_members(csv) == want, f"{name}: {invite_members(csv)}"
+        invite_cases.append({"name": name, "why": why, "csv": csv, "members": want})
+
     out = {
         "spec": "RFed-rust SPEC.md §17.14 (groups and the distro); GROUPS-DISTRO-DESIGN.md §7, §10, §11.1, §17.1, §19.1",
         "notes": [
@@ -770,6 +890,8 @@ def main():
             "invite_space: the code points the invite parser trims, Unicode Zs and U+0009 (Swift's CharacterSet.whitespaces), and no other.",
             "sealed: blobs as RFed hands them to D's devices (blob_hex = D_hash | D.encrypt(packed[16:]); the encryption is random, so these bytes are fixed input), each with the unwrap's expected hash (hash_hex; LXMF.py's: full_hash(dest | src | payload) over the payload as received, packed again only to drop a stamp; g_accept_web_form_int64_at_ms is not in the form a packer makes, so a reader that always packs the payload again gets another hash and a failed signature), packed (packed_hex = blob[0:16] | plaintext) and the §7 keys after each phone's group receipt; sender_key_hex is the 128-hex key (null when none), packed true when the JSON's packed is the base64 of packed_hex, false when null. M is not known to the receiver.",
             "group_entries: the unwrap's has_group_id, group_id, group_action and group_name for a fields map alone, and whether group_sync is set (true) or null (false).",
+            "Repeated keys (RFed SPEC §17.14): a fields map, and the Retichat field 0xD1, may hold a key more than once. A group entry (0xA0-0xA8, the field 0xD1 itself, and keys 1-9 inside it) is read from the first entry with its key, even when that entry is not of the entry's type; 0xFB is read from the last. A reader that decodes the map into a dictionary keeps the last of each key and must read the group entries from the bytes. These readings are LXMF-rust's: the Python reference refuses a map that repeats a key, at any depth, whole (RNS umsgpack DuplicateKeyException), so they are not checked against it. group_entries (*_twice*, the custom_type_twice_* pair) and variants (leave_0xfb_twice_the_last_the_marker) pin it; group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
+            "invite_members: csv strings and the members the invite parser lists for each. The csv is split on the code point ',' (U+002C), never on grapheme clusters: a combining mark after a comma does not join it (Swift's String.split on Character would), and a combining mark before an entry is part of that entry. variants accept_members_combining_mark_after_a_comma and rejects members_naming_d_after_a_combining_mark are the same two cases in a G.",
         ],
         "distro": {
             "private_key_hex": D_PRIVATE_KEY.hex(),
@@ -801,6 +923,7 @@ def main():
         "rejects": rejects,
         "sealed": sealed,
         "group_entries": group_entries,
+        "invite_members": invite_cases,
     }
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "distro_group_sync_vectors.json")
     with open(path, "w") as f:
