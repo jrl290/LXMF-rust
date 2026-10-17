@@ -1104,8 +1104,14 @@ pub enum GroupSyncOp {
     Accept,
     /// The user declined, left or deleted the group as D: `[op, group_id, at_ms, left]`.
     Leave,
-    /// The user posted in the group as D: `[op, group_id, at_ms, text, left]`.
+    /// The user posted in the group as D: `[op, group_id, at_ms, text, left,
+    /// post_id]`, `post_id` (REACTIONS-DESIGN.md §5.3) absent from older
+    /// devices' posts.
     Post,
+    /// The user reacted to a Group post as D (REACTIONS-DESIGN.md §5.3):
+    /// `[op, group_id, at_ms, content, left, post_id]`, `content` in `text`
+    /// (`""` removes the reaction).
+    React,
 }
 
 impl GroupSyncOp {
@@ -1115,6 +1121,7 @@ impl GroupSyncOp {
             GroupSyncOp::Accept => "accept",
             GroupSyncOp::Leave => "leave",
             GroupSyncOp::Post => "post",
+            GroupSyncOp::React => "react",
         }
     }
 
@@ -1125,28 +1132,45 @@ impl GroupSyncOp {
             "accept" => Some(GroupSyncOp::Accept),
             "leave" => Some(GroupSyncOp::Leave),
             "post" => Some(GroupSyncOp::Post),
+            "react" => Some(GroupSyncOp::React),
             _ => None,
         }
     }
 
-    /// "a create", "an accept", "a leave", "a post": for messages.
+    /// "a create", "an accept", "a leave", "a post", "a react": for messages.
     fn a(self) -> &'static str {
         match self {
             GroupSyncOp::Create => "a create",
             GroupSyncOp::Accept => "an accept",
             GroupSyncOp::Leave => "a leave",
             GroupSyncOp::Post => "a post",
+            GroupSyncOp::React => "a react",
         }
     }
 
-    /// The elements of its 0xFC array, `left` the last of them.
+    /// Where `left` is in its 0xFC array: the last element §17.14 requires.
+    /// Receivers ignore elements after it, which is where `post_id` goes.
+    fn left_at(self) -> usize {
+        match self {
+            GroupSyncOp::Create => 6,
+            GroupSyncOp::Accept => 7,
+            GroupSyncOp::Leave => 3,
+            GroupSyncOp::Post | GroupSyncOp::React => 4,
+        }
+    }
+
+    /// The fewest elements of its 0xFC array: up to `left`, and a react's
+    /// `post_id` after it.
     fn elements(self) -> usize {
         match self {
-            GroupSyncOp::Create => 7,
-            GroupSyncOp::Accept => 8,
-            GroupSyncOp::Leave => 4,
-            GroupSyncOp::Post => 5,
+            GroupSyncOp::React => self.left_at() + 2,
+            _ => self.left_at() + 1,
         }
+    }
+
+    /// Whether it carries `text` (a post's content, a react's reaction).
+    fn has_text(self) -> bool {
+        matches!(self, GroupSyncOp::Post | GroupSyncOp::React)
     }
 
     /// Whether it carries the group's description (`name`, `members`, `keys`).
@@ -1174,7 +1198,11 @@ pub struct GroupSync {
     /// `accept`: the invite's authenticated source, listed, not D.
     pub creator: Option<String>,
     /// `post`: the post's content, possibly empty (attachments are not copied).
+    /// `react`: the reaction, `""` to remove it.
     pub text: Option<String>,
+    /// `post` (optional: older devices send none) and `react` (required): the
+    /// Group post id, 32 hex characters (REACTIONS-DESIGN.md §4, §5.3).
+    pub post_id: Option<String>,
     /// Every op: the group ids the sending device holds as left by D, most
     /// recent first, at most [`GROUP_SYNC_LEFT_MAX`].
     pub left: Vec<String>,
@@ -1194,13 +1222,15 @@ impl GroupSync {
     /// `op` (string), `group_id` (string), `at_ms` (integer), `name`,
     /// `members` (string, or null unless create/accept), `keys` (array of
     /// string, or null unless create/accept), `creator` (string, or null
-    /// unless accept), `text` (string, or null unless post), `left` (array of
-    /// string).
+    /// unless accept), `text` (string, or null unless post or react), `left`
+    /// (array of string). Then `post_id` (string), only when the sync carries
+    /// one, so the JSON of every sync made before it is unchanged.
     pub fn to_json(&self) -> String {
         let opt = |v: &Option<String>| v.as_deref().map(json_string).unwrap_or_else(|| "null".into());
         let list = |v: &[String]| format!("[{}]", v.iter().map(|s| json_string(s)).collect::<Vec<_>>().join(","));
+        let post_id = self.post_id.as_deref().map(|id| format!(r#","post_id":{}"#, json_string(id))).unwrap_or_default();
         format!(
-            r#"{{"op":"{}","group_id":{},"at_ms":{},"name":{},"members":{},"keys":{},"creator":{},"text":{},"left":{}}}"#,
+            r#"{{"op":"{}","group_id":{},"at_ms":{},"name":{},"members":{},"keys":{},"creator":{},"text":{},"left":{}{}}}"#,
             self.op.as_str(),
             json_string(&self.group_id),
             self.at_ms,
@@ -1210,6 +1240,7 @@ impl GroupSync {
             opt(&self.creator),
             opt(&self.text),
             list(&self.left),
+            post_id,
         )
     }
 
@@ -1217,7 +1248,8 @@ impl GroupSync {
     /// [`GroupSync::to_json`]. `op`, `group_id`, `at_ms` (an integer) and
     /// `left` (an array of strings, empty when the device holds no left group)
     /// are required; `name`, `members` and `keys` exactly for create and
-    /// accept, `creator` exactly for accept, `text` exactly for post. A key that
+    /// accept, `creator` exactly for accept, `text` exactly for post and react,
+    /// `post_id` for react and optionally for post. A key that
     /// is not part of the op must be absent or null; other keys (`by`,
     /// `problem`) are ignored. The values themselves are checked by
     /// [`set_group_sync_fields`].
@@ -1245,7 +1277,7 @@ impl GroupSync {
             }
         };
         let op_name = string("op")?.ok_or("op is missing")?;
-        let op = GroupSyncOp::parse(&op_name).ok_or_else(|| format!("op {op_name:?} is not create, accept, leave or post"))?;
+        let op = GroupSyncOp::parse(&op_name).ok_or_else(|| format!("op {op_name:?} is not create, accept, leave, post or react"))?;
         let group_id = string("group_id")?.ok_or("group_id is missing")?;
         let at_ms = match get("at_ms") {
             Some(n) => n.as_u64().ok_or_else(|| format!("at_ms {n} is not a non-negative integer"))?,
@@ -1253,6 +1285,7 @@ impl GroupSync {
         };
         let left = strings("left")?.ok_or("left is missing (an empty array when this device holds no group left by D)")?;
         let (name, members, keys, creator, text) = (string("name")?, string("members")?, strings("keys")?, string("creator")?, string("text")?);
+        let post_id = string("post_id")?;
         let present = |key: &str, is: bool, wanted: bool| -> Result<(), String> {
             match (is, wanted) {
                 (false, true) => Err(format!("{} carries {key}", op.a())),
@@ -1264,8 +1297,11 @@ impl GroupSync {
         present("members", members.is_some(), op.describes_the_group())?;
         present("keys", keys.is_some(), op.describes_the_group())?;
         present("creator", creator.is_some(), op == GroupSyncOp::Accept)?;
-        present("text", text.is_some(), op == GroupSyncOp::Post)?;
-        Ok(GroupSync { op, group_id, at_ms, name, members, keys: keys.unwrap_or_default(), creator, text, left })
+        present("text", text.is_some(), op.has_text())?;
+        if op != GroupSyncOp::Post {
+            present("post_id", post_id.is_some(), op == GroupSyncOp::React)?;
+        }
+        Ok(GroupSync { op, group_id, at_ms, name, members, keys: keys.unwrap_or_default(), creator, text, post_id, left })
     }
 
     /// `fields[0xFC]` as written: a native array (never a bin of packed
@@ -1292,12 +1328,21 @@ impl GroupSync {
         } else {
             none(self.creator.is_some(), "creator")?;
         }
-        if self.op == GroupSyncOp::Post {
+        if self.op.has_text() {
             items.push(Value::from(need(&self.text, "text")?));
         } else {
             none(self.text.is_some(), "text")?;
         }
         items.push(Value::Array(self.left.iter().map(|id| Value::from(id.to_ascii_lowercase())).collect()));
+        match self.op {
+            GroupSyncOp::React => items.push(Value::from(need(&self.post_id, "post_id")?.to_ascii_lowercase())),
+            GroupSyncOp::Post => {
+                if let Some(id) = &self.post_id {
+                    items.push(Value::from(id.to_ascii_lowercase()));
+                }
+            }
+            _ => none(self.post_id.is_some(), "post_id")?,
+        }
         Ok(Value::Array(items))
     }
 }
@@ -1364,10 +1409,11 @@ fn str_value(value: &Value, what: &str) -> Result<String, String> {
 
 /// §11.1 rule 4 on the elements of `fields[0xFC]`: the form of G for the
 /// distro whose `lxmf.delivery` address is `d_hex` (lowercase). Elements
-/// after `left` are ignored.
+/// after `left` are ignored, apart from the `post_id` of a post (taken when
+/// it is a str of 32 hex, else ignored) and of a react (required).
 fn parse_group_sync(items: &[Value], d_hex: &str) -> Result<GroupSync, String> {
     let op_name = str_value(items.first().ok_or("0xFC is an empty array")?, "op")?;
-    let op = GroupSyncOp::parse(&op_name).ok_or_else(|| format!("op {op_name:?} is not create, accept, leave or post"))?;
+    let op = GroupSyncOp::parse(&op_name).ok_or_else(|| format!("op {op_name:?} is not create, accept, leave, post or react"))?;
     if items.len() < op.elements() {
         return Err(format!("{} has {} elements, not {}", op.a(), items.len(), op.elements()));
     }
@@ -1376,7 +1422,7 @@ fn parse_group_sync(items: &[Value], d_hex: &str) -> Result<GroupSync, String> {
         .as_u64()
         .filter(|at| *at <= MAX_AT_MS)
         .ok_or_else(|| format!("at_ms ({}) is not an integer from 0 to 2^53 - 1", kind(&items[2])))?;
-    let mut sync = GroupSync { op, group_id, at_ms, name: None, members: None, keys: Vec::new(), creator: None, text: None, left: Vec::new() };
+    let mut sync = GroupSync { op, group_id, at_ms, name: None, members: None, keys: Vec::new(), creator: None, text: None, post_id: None, left: Vec::new() };
     if op.describes_the_group() {
         sync.name = Some(text_value(&items[3], "name")?);
         let members = str_value(&items[4], "members")?;
@@ -1400,10 +1446,15 @@ fn parse_group_sync(items: &[Value], d_hex: &str) -> Result<GroupSync, String> {
         }
         sync.members = Some(members);
     }
-    if op == GroupSyncOp::Post {
+    if op.has_text() {
         sync.text = Some(text_value(&items[3], "text")?);
     }
-    sync.left = match &items[op.elements() - 1] {
+    match op {
+        GroupSyncOp::React => sync.post_id = Some(hex32_value(&items[op.left_at() + 1], "post_id")?),
+        GroupSyncOp::Post => sync.post_id = items.get(op.left_at() + 1).and_then(|v| hex32_value(v, "post_id").ok()),
+        _ => {}
+    }
+    sync.left = match &items[op.left_at()] {
         Value::Array(ids) if ids.len() > GROUP_SYNC_LEFT_MAX => {
             return Err(format!("left holds {} ids, more than {GROUP_SYNC_LEFT_MAX}", ids.len()))
         }
@@ -2745,12 +2796,93 @@ mod group_sync_tests {
             members: describes.then(|| format!("{d_hex},{MEMBER}")),
             keys: Vec::new(),
             creator: (op == GroupSyncOp::Accept).then(|| MEMBER.to_string()),
-            text: (op == GroupSyncOp::Post).then(|| "hi".to_string()),
+            text: match op {
+                GroupSyncOp::Post => Some("hi".to_string()),
+                GroupSyncOp::React => Some("👍".to_string()),
+                _ => None,
+            },
+            post_id: (op == GroupSyncOp::React).then(|| POST_ID.to_string()),
             left: Vec::new(),
         }
     }
 
-    const OPS: [GroupSyncOp; 4] = [GroupSyncOp::Create, GroupSyncOp::Accept, GroupSyncOp::Leave, GroupSyncOp::Post];
+    const OPS: [GroupSyncOp; 5] =
+        [GroupSyncOp::Create, GroupSyncOp::Accept, GroupSyncOp::Leave, GroupSyncOp::Post, GroupSyncOp::React];
+    const POST_ID: &str = "00112233445566778899aabbccddeeff";
+
+    /// The 0xFC array a sync is written as.
+    fn written(s: &GroupSync, d: &Identity, d_hex: &str) -> Vec<Value> {
+        let mut msg = message(d, d_hex);
+        set_group_sync_fields(&mut msg, s, d_hex, DEVICE).unwrap();
+        let Value::Map(entries) = &msg.fields else { panic!("fields are a map") };
+        match &entries[2].1 {
+            Value::Array(items) => items.clone(),
+            other => panic!("0xFC is {other:?}"),
+        }
+    }
+
+    /// REACTIONS-DESIGN.md §5.3: a post's id and a react go after `left`, so
+    /// a reader that knows neither still reads the post (§17.14: elements
+    /// after `left` are ignored).
+    #[test]
+    fn a_post_id_and_a_react_go_after_left() {
+        let (d, d_hex) = distro();
+        let mut post = sync(GroupSyncOp::Post, &d_hex);
+        assert_eq!(written(&post, &d, &d_hex).len(), 5, "a post without an id is written as before");
+        post.post_id = Some(POST_ID.to_ascii_uppercase());
+        let items = written(&post, &d, &d_hex);
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[4], Value::Array(Vec::new()), "left stays fifth");
+        assert_eq!(items[5], Value::from(POST_ID), "the id last, lowercased");
+        post.post_id = Some(POST_ID.into());
+        assert_eq!(parse_group_sync(&items, &d_hex), Ok(post.clone()));
+        let before: Vec<Value> = items[..5].to_vec();
+        assert_eq!(parse_group_sync(&before, &d_hex).unwrap().post_id, None, "an older device's post has none");
+        let mut odd = before.clone();
+        odd.push(Value::from(7));
+        assert_eq!(parse_group_sync(&odd, &d_hex).unwrap().post_id, None, "anything else after left is ignored");
+
+        let react = sync(GroupSyncOp::React, &d_hex);
+        let items = written(&react, &d, &d_hex);
+        assert_eq!(items, vec![
+            Value::from("react"), Value::from(GROUP), Value::from(1_790_000_000_123u64),
+            Value::from("👍"), Value::Array(Vec::new()), Value::from(POST_ID),
+        ]);
+        assert_eq!(parse_group_sync(&items, &d_hex), Ok(react.clone()));
+        assert!(parse_group_sync(&items[..5], &d_hex).unwrap_err().contains("a react has 5 elements, not 6"));
+        let mut bad = items.clone();
+        bad[5] = Value::from("not hex");
+        assert!(parse_group_sync(&bad, &d_hex).is_err(), "a react's post id is required");
+
+        let mut removal = react.clone();
+        removal.text = Some(String::new());
+        assert_eq!(parse_group_sync(&written(&removal, &d, &d_hex), &d_hex), Ok(removal), "\"\" removes");
+        let mut no_id = react;
+        no_id.post_id = None;
+        let mut msg = message(&d, &d_hex);
+        assert!(set_group_sync_fields(&mut msg, &no_id, &d_hex, DEVICE).is_err());
+    }
+
+    /// The JSON form carries `post_id` only when the sync has one: the JSON of
+    /// every sync made before it (tests/distro_group_sync_vectors.json) is unchanged.
+    #[test]
+    fn the_json_form_carries_a_post_id_only_when_there_is_one() {
+        let (_, d_hex) = distro();
+        let post = sync(GroupSyncOp::Post, &d_hex);
+        assert!(!post.to_json().contains("post_id"));
+        let react = sync(GroupSyncOp::React, &d_hex);
+        let json = react.to_json();
+        assert!(json.ends_with(&format!(r#""left":[],"post_id":"{POST_ID}"}}"#)), "{json}");
+        assert_eq!(GroupSync::from_json(&json), Ok(react));
+        let mut with_id = post;
+        with_id.post_id = Some(POST_ID.into());
+        assert_eq!(GroupSync::from_json(&with_id.to_json()), Ok(with_id));
+        let leave = sync(GroupSyncOp::Leave, &d_hex).to_json();
+        let leave_with_id = leave.replace(r#""left":[]"#, &format!(r#""left":[],"post_id":"{POST_ID}""#));
+        assert!(GroupSync::from_json(&leave_with_id).unwrap_err().contains("post_id is not part of a leave"));
+        let react_without = sync(GroupSyncOp::React, &d_hex).to_json().replace(&format!(r#","post_id":"{POST_ID}""#), "");
+        assert!(GroupSync::from_json(&react_without).unwrap_err().contains("a react carries post_id"));
+    }
 
     #[test]
     fn every_op_is_written_as_the_four_fields_and_read_back_as_written() {

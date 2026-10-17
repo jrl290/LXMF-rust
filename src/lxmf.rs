@@ -23,6 +23,19 @@ pub const FIELD_RENDERER: u8 = 0x0F;
 // reads it (DISPLAY_NAMES.md §2.1). MeshChatX uses field 16 for its app
 // extensions and Columba reads it as legacy reactions.
 
+/// Upstream LXMF 1.2.0: a reaction, `{REACTION_TO: bytes, REACTION_CONTENT:
+/// bytes}`, sent in an otherwise-empty message; the reactor is the message's
+/// source. Retichat (REACTIONS-DESIGN.md): an empty REACTION_CONTENT removes
+/// the reactor's reaction, and in a Group REACTION_TO holds the target's
+/// 16-byte post id instead of an LXMF hash.
+pub const FIELD_REACTION: u8 = 0x40;
+/// Key of [`FIELD_REACTION`]: the target, the full `LXMessage.hash`.
+pub const REACTION_TO: u8 = 0x00;
+/// Key of [`FIELD_REACTION`]: the reaction, UTF-8.
+pub const REACTION_CONTENT: u8 = 0x01;
+/// Retichat's bound on REACTION_CONTENT, in bytes: longer ones are refused.
+pub const REACTION_CONTENT_MAX: usize = 64;
+
 /// DISPLAY_NAMES.md §2.1 / §10: the Retichat field. Its value is a msgpack
 /// map of small integer keys (`crate::retichat_field::RF_*`): key 0 is the
 /// LXMF source's display name (router-owned, decoded by

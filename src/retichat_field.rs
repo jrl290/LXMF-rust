@@ -49,6 +49,13 @@ pub const RF_GROUP_RELAY_FOR: u8 = 7;
 pub const RF_GROUP_RELAY_DONE: u8 = 8;
 /// str: one `hash:base64-public-key` pair per invite chunk (was `0xA8`).
 pub const RF_GROUP_MEMBER_KEYS: u8 = 9;
+/// str: 32-hex id of a Group post, the same on every copy of it, so a Group
+/// reaction can name it (REACTIONS-DESIGN.md §4). Retichat field only. Key 10
+/// is GROUP_STATUSES (Group.md), written by the apps.
+pub const RF_GROUP_POST_ID: u8 = 11;
+/// str: on a Distro Sync of a send (RFed SPEC §17.11), the 64-hex LXMF hash
+/// of the message it copies (REACTIONS-DESIGN.md §5.2).
+pub const RF_SENT_HASH: u8 = 12;
 
 /// The largest key: keys are positive fixints, one byte on the wire (§2.1).
 pub const RF_MAX_KEY: u8 = 127;
@@ -286,10 +293,15 @@ pub fn app_key(key: i64) -> Result<u8, String> {
 }
 
 /// An app entry for the FFI/JNI setters: the key checked by [`app_key`], and
-/// a defined group key (1..=9) must get its own type.
+/// a defined key (group entries 1..=9, the post id 11, the sent hash 12)
+/// must get its own type.
 pub fn check_app_entry(key: i64, entry_type: EntryType) -> Result<u8, String> {
 	let key = app_key(key)?;
-	if let Some((_, want)) = group_entry(key) {
+	let want = match key {
+		RF_GROUP_POST_ID | RF_SENT_HASH => Some(EntryType::Str),
+		_ => group_entry(key).map(|(_, want)| want),
+	};
+	if let Some(want) = want {
 		if want != entry_type {
 			return Err(format!("Retichat field key {key} holds {want:?}, not {entry_type:?}"));
 		}
@@ -488,5 +500,9 @@ mod tests {
 		assert!(check_app_entry(1, EntryType::Bool).is_err());
 		assert_eq!(check_app_entry(10, EntryType::Bool), Ok(10), "undefined keys take either type");
 		assert_eq!(check_app_entry(10, EntryType::Str), Ok(10));
+		assert_eq!(check_app_entry(11, EntryType::Str), Ok(11));
+		assert!(check_app_entry(11, EntryType::Bool).is_err(), "the post id is a str");
+		assert_eq!(check_app_entry(12, EntryType::Str), Ok(12));
+		assert!(check_app_entry(12, EntryType::Bool).is_err(), "the sent hash is a str");
 	}
 }

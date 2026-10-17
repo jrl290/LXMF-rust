@@ -540,6 +540,27 @@ pub fn message_set_retichat_bool(handle: u64, key: i64, value: bool) -> Result<(
     with_message(handle, |m| m.set_retichat_entry(key, rmpv::Value::Boolean(value)))
 }
 
+/// Make an outbound message a reaction (upstream LXMF 1.2.0
+/// `FIELD_REACTION`, REACTIONS-DESIGN.md): `{0x40: {0x00: to, 0x01:
+/// content}}`, both bin. `to` is the target's 32-byte LXMF hash, or in a
+/// Group its 16-byte post id; `content` is the reaction, empty to remove
+/// one, at most `REACTION_CONTENT_MAX` bytes. Returns an error, and changes
+/// nothing, otherwise.
+pub fn message_set_reaction(handle: u64, to: &[u8], content: &str) -> Result<(), String> {
+    use crate::lxmf::{FIELD_REACTION, REACTION_CONTENT, REACTION_CONTENT_MAX, REACTION_TO};
+    if to.len() != 32 && to.len() != 16 {
+        return Err(format!("a reaction's target is 32 bytes (an LXMF hash) or 16 (a post id), not {}", to.len()));
+    }
+    if content.len() > REACTION_CONTENT_MAX {
+        return Err(format!("a reaction is at most {REACTION_CONTENT_MAX} bytes, not {}", content.len()));
+    }
+    let value = rmpv::Value::Map(vec![
+        (rmpv::Value::from(REACTION_TO), rmpv::Value::Binary(to.to_vec())),
+        (rmpv::Value::from(REACTION_CONTENT), rmpv::Value::Binary(content.as_bytes().to_vec())),
+    ]);
+    with_message(handle, |m| m.set_field(FIELD_REACTION, value))
+}
+
 /// Clone an outbound message as a fresh PROPAGATED message, preserving all
 /// application fields and attachments while resetting transport state.
 pub fn message_clone_propagated(handle: u64) -> Result<u64, String> {
@@ -1285,5 +1306,31 @@ mod retichat_field_setter_tests {
         let fields = arc.lock().unwrap().fields.clone();
         assert_eq!(crate::retichat_field::top_level(&fields, 0xA0), Some(&rmpv::Value::String("g".into())));
         assert_eq!(crate::retichat_field::top_level(&fields, 0xA7), Some(&rmpv::Value::Boolean(true)));
+    }
+
+    /// Upstream LXMF 1.2.0's reaction: `{0x40: {0x00: bin to, 0x01: bin
+    /// content}}`, as Columba writes it; a wrong-sized target or an
+    /// over-long reaction is refused and changes nothing.
+    #[test]
+    fn the_reaction_setter_writes_the_upstream_form() {
+        let (handle, arc) = message_handle();
+        let hash = [0xABu8; 32];
+        message_set_reaction(handle, &hash, "👍").unwrap();
+        let mut want = vec![0x81, 0x40, 0x82, 0x00, 0xc4, 32];
+        want.extend_from_slice(&hash);
+        want.extend_from_slice(&[0x01, 0xc4, 4, 0xf0, 0x9f, 0x91, 0x8d]);
+        assert_eq!(fields_bytes(&arc), want);
+
+        for to in [&[0u8; 0][..], &[0u8; 15], &[0u8; 33]] {
+            assert!(message_set_reaction(handle, to, "x").is_err(), "{} bytes", to.len());
+        }
+        assert!(message_set_reaction(handle, &hash, &"a".repeat(65)).is_err(), "over 64 bytes");
+        assert_eq!(fields_bytes(&arc), want, "refusals change nothing");
+
+        message_set_reaction(handle, &[7u8; 16], "").unwrap();
+        assert_eq!(fields_bytes(&arc), [&[0x81, 0x40, 0x82, 0x00, 0xc4, 16][..], &[7u8; 16], &[0x01, 0xc4, 0]].concat(),
+            "a post id, and an empty reaction (a removal)");
+        message_set_reaction(handle, &hash, &"a".repeat(64)).unwrap();
+        assert!(message_set_reaction(0, &hash, "x").is_err(), "invalid handle");
     }
 }

@@ -1973,6 +1973,39 @@ pub extern "C" fn lxmf_message_set_retichat_bool(msg: u64, key: i32, value: i32)
     }
 }
 
+/// Make a message a reaction (upstream FIELD_REACTION 0x40,
+/// REACTIONS-DESIGN.md): `to` is `to_len` bytes, the target's 32-byte LXMF
+/// hash or, in a Group, its 16-byte post id; `content` is non-NULL UTF-8,
+/// empty to remove a reaction, at most 64 bytes.
+/// Returns 0 on success, -1 on error (`lxmf_last_error`), changing nothing.
+#[no_mangle]
+pub extern "C" fn lxmf_message_set_reaction(
+    msg: u64,
+    to: *const u8,
+    to_len: u32,
+    content: *const c_char,
+) -> i32 {
+    if to.is_null() || content.is_null() {
+        set_error("to or content is NULL");
+        return -1;
+    }
+    let to = unsafe { std::slice::from_raw_parts(to, to_len as usize) };
+    let content = match unsafe { CStr::from_ptr(content) }.to_str() {
+        Ok(c) => c,
+        Err(_) => {
+            set_error("content is not UTF-8");
+            return -1;
+        }
+    };
+    match lxmf::message_set_reaction(msg, to, content) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
 /// Add a file attachment to a message.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
