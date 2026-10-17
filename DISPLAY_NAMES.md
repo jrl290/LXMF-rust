@@ -985,6 +985,8 @@ entry: it is no larger from three entries up.
 | 8 | `RF_GROUP_RELAY_DONE` | bool: relay-complete signal | `0xA7` |
 | 9 | `RF_GROUP_MEMBER_KEYS` | str: one `hash:base64-public-key` pair per invite chunk; an `accept`/`leave` carries its sender's own | `0xA8` |
 | 10 | `RF_GROUP_STATUSES` | array of bin: in `status`, the members' own packed `accept`/`leave` messages (2026-10-06) | (new: no old field) |
+| 11 | `RF_GROUP_POST_ID` | str: 32-hex id of a Group post, the same on every copy of it and on its relays, which Group reactions name (REACTIONS-DESIGN.md §4, 2026-10-17) | (new: no old field) |
+| 12 | `RF_SENT_HASH` | str: on a Distro Sync of a send (RFed SPEC §17.11), the 64-hex LXMF hash of the message it copies (REACTIONS-DESIGN.md §5.2, 2026-10-17) | (new: no old field) |
 
 Each value keeps exactly the type it had as a top-level field, so the group
 logic itself is unchanged. Key 10 exists only here: before the switch it is
