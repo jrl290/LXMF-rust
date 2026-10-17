@@ -1,0 +1,629 @@
+{
+  "spec": "REACTIONS-DESIGN.md revision 2: §1 FIELD_REACTION (0x40), §4 GROUP_POST_ID (0xD1 key 11), §5.2 SENT_HASH (0xD1 key 12), §5.3 post_id after left and the react op; RFed SPEC §17.14",
+  "notes": [
+    "Generated for Retichat-js (reactions.test.mjs checks it); the bytes are written as Python's umsgpack writes them (each int in its smallest form, fixstr/str 8, bin 8), by an encoder independent of msgpackr.",
+    "group_sync: fields_hex is a G's fields map (0x0C, 0xFB, 0xFC, 0xFD); expected is the §7 group_sync reading with `content` and `post_id` added (null where an op has none; `problem` set and the rest null when refused: its text is the web's wording, and only whether it is null counts across readers). Entries with writer true are what a writer makes from `sync`; the web writes at_ms as an int 64 (0xd3), its one difference.",
+    "reaction: payload_hex is an LXMF payload [timestamp, title, content, fields] whose fields are fields_hex; expected is the reading of 0x40: {reaction: null} when absent, {refused: true, not_a_map} when refused, else REACTION_TO's bytes as to_hex and REACTION_CONTENT as UTF-8.",
+    "retichat_field: fields_hex is a fields map; expected is key 11 (a str of 32 hex, read lowercased) and key 12 (a str of 64 hex, read lowercased) of its 0xD1, null when absent or malformed."
+  ],
+  "distro_lxmf_delivery_hash_hex": "fae321c442e3c9bdcd7a3e79d850e03c",
+  "device_hex": "0123456789abcdef0123456789abcdef",
+  "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+  "group_sync": [
+    {
+      "name": "post_with_post_id",
+      "why": "a post G as every new writer makes it: its post id after left",
+      "writer": true,
+      "sync": {
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "text": "See you at 9",
+        "left": [],
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adbac53656520796f75206174203990d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "See you at 9",
+        "left": [],
+        "content": null,
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "post_with_post_id_full_left",
+      "why": "a post G with ids in left and its post id after them",
+      "writer": true,
+      "sync": {
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "text": "bring water ☀",
+        "left": [
+          "424467f537cd2b9892f7ea584d075a0e",
+          "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        ],
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adbaf6272696e6720776174657220e2988092d9203432343436376635333763643262393839326637656135383464303735613065d9203561356135613561356135613561356135613561356135613561356135613561d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "bring water ☀",
+        "left": [
+          "424467f537cd2b9892f7ea584d075a0e",
+          "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        ],
+        "content": null,
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "react",
+      "why": "a react G: the user's reaction to the post with that id",
+      "writer": true,
+      "sync": {
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "content": "👍",
+        "left": [],
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba4f09f918d90d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": [],
+        "content": "👍",
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "react_removal",
+      "why": "a react G whose content is empty: the user's reaction taken back",
+      "writer": true,
+      "sync": {
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "content": "",
+        "left": [],
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba090d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": [],
+        "content": "",
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "react_full_left",
+      "why": "a react G with ids in left",
+      "writer": true,
+      "sync": {
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "content": "❤️",
+        "left": [
+          "424467f537cd2b9892f7ea584d075a0e",
+          "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        ],
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba6e29da4efb88f92d9203432343436376635333763643262393839326637656135383464303735613065d9203561356135613561356135613561356135613561356135613561356135613561d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": [
+          "424467f537cd2b9892f7ea584d075a0e",
+          "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        ],
+        "content": "❤️",
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "post_without_post_id",
+      "why": "a post G from a device older than reactions: no post id, the post stands",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc95a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba36f6c6490ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "old",
+        "left": [],
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "post_post_id_uppercase",
+      "why": "a post id in upper case is read lowercased",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba17890d9203743304535463141324233433444354536463730383139324133423443354436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "x",
+        "left": [],
+        "content": null,
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "post_post_id_not_hex",
+      "why": "a post G whose element after left is no 32 hex: no post id, the post stands",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba17890ad6e6f742d612d706f73742d6964ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "x",
+        "left": [],
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "post_post_id_int",
+      "why": "a post G whose element after left is an int: no post id, the post stands",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba1789007ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "x",
+        "left": [],
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "post_after_post_id_ignored",
+      "why": "elements after the post id are ignored",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc97a4706f7374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba17890d9203763306535663161326233633464356536663730383139326133623463356436a56c61746572ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "post",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": "x",
+        "left": [],
+        "content": null,
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "react_bin_content",
+      "why": "a react G whose content is bin: read as UTF-8",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adbc404f09f988290d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "react",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000700123,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": [],
+        "content": "😂",
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6"
+      }
+    },
+    {
+      "name": "react_without_post_id",
+      "why": "a react G that ends at left: refused, a react needs its post id",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc95a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba4f09f918d90ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": "a react has 6 elements, ending with post_id; this one has 5",
+        "op": null,
+        "group_id": null,
+        "at_ms": null,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": null,
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "react_post_id_not_hex",
+      "why": "a react G whose post id is no 32 hex: refused",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba4f09f918d90a3616263ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": "its post_id is not a str of 32 hex",
+        "op": null,
+        "group_id": null,
+        "at_ms": null,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": null,
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "react_post_id_bin",
+      "why": "a react G whose post id is bin: refused (a str of 32 hex only)",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba4f09f918d90c4203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": "its post_id is not a str of 32 hex",
+        "op": null,
+        "group_id": null,
+        "at_ms": null,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": null,
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "react_content_int",
+      "why": "a react G whose content is an int: refused",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adb0190d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": "its content is not a str or bin",
+        "op": null,
+        "group_id": null,
+        "at_ms": null,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": null,
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "react_content_nil",
+      "why": "a react G whose content is nil: refused",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a57265616374d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adbc090d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": "its content is not a str or bin",
+        "op": null,
+        "group_id": null,
+        "at_ms": null,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": null,
+        "content": null,
+        "post_id": null
+      }
+    },
+    {
+      "name": "unknown_op",
+      "why": "an op no reader knows: refused",
+      "writer": false,
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc96a770726f6d6f7465d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c45b1adba17890d9203763306535663161326233633464356536663730383139326133623463356436ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": "its op is \"promote\", not create, accept, leave, post or react",
+        "op": null,
+        "group_id": null,
+        "at_ms": null,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": null,
+        "content": null,
+        "post_id": null
+      }
+    }
+  ],
+  "reaction": [
+    {
+      "name": "direct",
+      "why": "a direct reaction: REACTION_TO the 32 bytes of the target's LXMF hash, REACTION_CONTENT the emoji as bin",
+      "fields_hex": "81408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c404f09f918d",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c404f09f918d",
+      "expected": {
+        "refused": false,
+        "to_hex": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+        "content": "👍"
+      }
+    },
+    {
+      "name": "group",
+      "why": "a Group reaction: REACTION_TO the 16 bytes of the post id",
+      "fields_hex": "81408200c4107c0e5f1a2b3c4d5e6f708192a3b4c5d601c406e29da4efb88f",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200c4107c0e5f1a2b3c4d5e6f708192a3b4c5d601c406e29da4efb88f",
+      "expected": {
+        "refused": false,
+        "to_hex": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6",
+        "content": "❤️"
+      }
+    },
+    {
+      "name": "removal",
+      "why": "REACTION_CONTENT empty: the reactor's reaction taken back (Retichat's convention)",
+      "fields_hex": "81408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c400",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c400",
+      "expected": {
+        "refused": false,
+        "to_hex": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+        "content": ""
+      }
+    },
+    {
+      "name": "with_ticket",
+      "why": "a reaction beside a ticket (0x0C) is still a reaction",
+      "fields_hex": "820cc4080123456789abcdef408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c404f09f998f",
+      "payload_hex": "94cb41daac4f8f200000c400c400820cc4080123456789abcdef408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c404f09f998f",
+      "expected": {
+        "refused": false,
+        "to_hex": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+        "content": "🙏"
+      }
+    },
+    {
+      "name": "str_forms",
+      "why": "REACTION_TO as a str holding the raw bytes, REACTION_CONTENT as a str",
+      "fields_hex": "81408200b07c0e5f1a2b3c4d5e6f708192a3b4c5d601a4f09f98ae",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200b07c0e5f1a2b3c4d5e6f708192a3b4c5d601a4f09f98ae",
+      "expected": {
+        "refused": false,
+        "to_hex": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6",
+        "content": "😮"
+      }
+    },
+    {
+      "name": "key_as_uint8",
+      "why": "0x40 written as uint 8 (msgpackr's form) and inner keys as uint 8",
+      "fields_hex": "81cc4082cc00c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4fcc01c404f09f98a2",
+      "payload_hex": "94cb41daac4f8f200000c400c40081cc4082cc00c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4fcc01c404f09f98a2",
+      "expected": {
+        "refused": false,
+        "to_hex": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+        "content": "😢"
+      }
+    },
+    {
+      "name": "keys_wide",
+      "why": "inner keys as uint 16 and uint 64: read by value",
+      "fields_hex": "81cd004082cf0000000000000000c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4fcd0001c404f09f918d",
+      "payload_hex": "94cb41daac4f8f200000c400c40081cd004082cf0000000000000000c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4fcd0001c404f09f918d",
+      "expected": {
+        "refused": false,
+        "to_hex": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+        "content": "👍"
+      }
+    },
+    {
+      "name": "content_64_bytes",
+      "why": "64 bytes of content: taken",
+      "fields_hex": "81408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c44061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c44061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "expected": {
+        "refused": false,
+        "to_hex": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+        "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "content_65_bytes",
+      "why": "65 bytes of content: refused",
+      "fields_hex": "81408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c4416161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c4416161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+      "expected": {
+        "refused": true,
+        "not_a_map": false
+      }
+    },
+    {
+      "name": "missing_to",
+      "why": "no REACTION_TO: refused",
+      "fields_hex": "81408101c404f09f918d",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408101c404f09f918d",
+      "expected": {
+        "refused": true,
+        "not_a_map": false
+      }
+    },
+    {
+      "name": "missing_content",
+      "why": "no REACTION_CONTENT: refused",
+      "fields_hex": "81408100c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408100c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f",
+      "expected": {
+        "refused": true,
+        "not_a_map": false
+      }
+    },
+    {
+      "name": "to_int",
+      "why": "REACTION_TO an int: refused",
+      "fields_hex": "814082000501c404f09f918d",
+      "payload_hex": "94cb41daac4f8f200000c400c400814082000501c404f09f918d",
+      "expected": {
+        "refused": true,
+        "not_a_map": false
+      }
+    },
+    {
+      "name": "content_nil",
+      "why": "REACTION_CONTENT nil: refused",
+      "fields_hex": "81408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c0",
+      "payload_hex": "94cb41daac4f8f200000c400c40081408200c420cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f01c0",
+      "expected": {
+        "refused": true,
+        "not_a_map": false
+      }
+    },
+    {
+      "name": "not_a_map",
+      "why": "0x40 that is no map: no reaction (the message is read as it always was)",
+      "fields_hex": "8140a4f09f918d",
+      "payload_hex": "94cb41daac4f8f200000c400c4008140a4f09f918d",
+      "expected": {
+        "refused": true,
+        "not_a_map": true
+      }
+    },
+    {
+      "name": "absent",
+      "why": "no 0x40: no reaction",
+      "fields_hex": "810cc4080123456789abcdef",
+      "payload_hex": "94cb41daac4f8f200000c400c400810cc4080123456789abcdef",
+      "expected": {
+        "reaction": null
+      }
+    }
+  ],
+  "retichat_field": [
+    {
+      "name": "post_id",
+      "why": "GROUP_POST_ID (key 11) on a Group post, beside the display name (key 0) and GROUP_ID (key 1)",
+      "fields_hex": "81ccd18300c405416c69636501d92039663865376436633562346133393238313730366635653464336332623161300bd9203763306535663161326233633464356536663730383139326133623463356436",
+      "expected": {
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6",
+        "sent_hash": null
+      }
+    },
+    {
+      "name": "post_id_uppercase",
+      "why": "a post id in upper case is read lowercased",
+      "fields_hex": "81ccd1810bd9203743304535463141324233433444354536463730383139324133423443354436",
+      "expected": {
+        "post_id": "7c0e5f1a2b3c4d5e6f708192a3b4c5d6",
+        "sent_hash": null
+      }
+    },
+    {
+      "name": "post_id_not_hex",
+      "why": "a key 11 that is no 32 hex: no post id",
+      "fields_hex": "81ccd1810ba378797a",
+      "expected": {
+        "post_id": null,
+        "sent_hash": null
+      }
+    },
+    {
+      "name": "sent_hash",
+      "why": "SENT_HASH (key 12) on a Distro Sync of a send: M's LXMF hash",
+      "fields_hex": "84ccfbb0726665642e64697374726f2e73656e74ccfcd9203031323334353637383961626364656630313233343536373839616263646566ccfdd9203031323334353637383961626364656630313233343536373839616263646566ccd1810cd94063666663353265313564366136333233383730343430646438323136646431363537343361333530393766393038363233326664626663633863383165623466",
+      "expected": {
+        "post_id": null,
+        "sent_hash": "cffc52e15d6a6323870440dd8216dd165743a35097f9086232fdbfcc8c81eb4f"
+      }
+    },
+    {
+      "name": "sent_hash_not_hex",
+      "why": "a key 12 that is no 64 hex: no hash",
+      "fields_hex": "81ccd1810ca3616263",
+      "expected": {
+        "post_id": null,
+        "sent_hash": null
+      }
+    }
+  ]
+}
