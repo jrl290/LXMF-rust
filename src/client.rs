@@ -391,7 +391,9 @@ impl LxmfClient {
     /// The callback is `(dest_hash, status)` where status is one of
     /// `APP_LINK_NONE` (0), `APP_LINK_PATH_REQUESTED` (1),
     /// `APP_LINK_ESTABLISHING` (2), `APP_LINK_ACTIVE` (3),
-    /// `APP_LINK_DISCONNECTED` (4).  Multiple callbacks may be registered.
+    /// `APP_LINK_DISCONNECTED` (4), or the event `APP_LINK_RECOVERED` (5): the
+    /// held link was STALE and heard its peer again; it is ACTIVE, and 5 is
+    /// never a state `status` returns.  Multiple callbacks may be registered.
     pub fn register_app_link_status_callback(
         &self,
         cb: Arc<dyn Fn(&[u8], u8) + Send + Sync>,

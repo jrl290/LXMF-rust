@@ -1663,7 +1663,8 @@ impl LXMRouter {
 											// own event, or no tier could fire. Fires once; a
 											// proof after it still reaches on_delivered.
 											// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-											link_packet_timed_out_shared(&msg_fail);
+											// No receipt, so no link to tear down: AppLinks owns its links.
+											link_packet_timed_out_shared(&msg_fail, None);
 										}),
 										// A message over the link MDU travels as a Resource:
 										// its fraction moves progress to 0.10 + 0.90 × fraction

@@ -1030,7 +1030,9 @@ pub fn router_set_message_state_callback(
 ///
 /// The callback receives the destination hash and the new status byte:
 ///   0 = NONE, 1 = PATH_REQUESTED, 2 = ESTABLISHING,
-///   3 = ACTIVE, 4 = DISCONNECTED.
+///   3 = ACTIVE, 4 = DISCONNECTED, or the event 5 = RECOVERED (the held
+///   link was STALE and heard its peer again: it is ACTIVE; 5 is never a
+///   state).
 ///
 /// Multiple callbacks may be registered.  Callbacks fire on whichever
 /// thread the underlying link callback runs on (link actor thread) and

@@ -758,7 +758,11 @@ impl LXMessage {
 		self.packed_size = packed.len();
 		self.packed = Some(packed.clone());
 
-		let mut content_size = packed_payload.len() - Self::TIMESTAMP_SIZE - Self::STRUCT_OVERHEAD;
+		// LXMF/LXMessage.py's size goes negative for an empty message (a 15-byte
+		// payload); 0 decides the same, where usize underflowed (C3).
+		let mut content_size = packed_payload
+			.len()
+			.saturating_sub(Self::TIMESTAMP_SIZE + Self::STRUCT_OVERHEAD);
 
 		if self.desired_method.is_none() {
 			self.desired_method = Some(Self::DIRECT);
@@ -986,11 +990,14 @@ impl LXMessage {
 							if let Some(handle) = handle.clone() {
 								let delivery_handle = Arc::clone(&handle);
 								let timeout_handle = Arc::clone(&handle);
+								// The link this packet goes out on: its receipt's timeout tears
+								// that one down (`packet_receipt.destination` in the reference).
+								let sent_on = self.delivery_link.clone();
 								let delivery_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 									mark_delivered_shared(&delivery_handle);
 								});
 								let timeout_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
-									link_packet_timed_out_shared(&timeout_handle);
+									link_packet_timed_out_shared(&timeout_handle, sent_on.clone());
 								});
 								receipt.set_delivery_callback(delivery_cb.clone());
 								receipt.set_timeout_callback(timeout_cb.clone());
@@ -1038,8 +1045,9 @@ impl LXMessage {
 								let delivery_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
 									mark_propagated_shared(&delivery_handle);
 								});
+								let sent_on = self.delivery_link.clone();
 								let timeout_cb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> = Arc::new(move |_| {
-									link_packet_timed_out_shared(&timeout_handle);
+									link_packet_timed_out_shared(&timeout_handle, sent_on.clone());
 								});
 								receipt.set_delivery_callback(delivery_cb.clone());
 								receipt.set_timeout_callback(timeout_cb.clone());
@@ -1592,11 +1600,16 @@ impl LXMessage {
 		}
 	}
 
-	fn link_packet_timed_out(&mut self) {
+	/// LXMF/LXMessage.py `__link_packet_timed_out`: `sent_on` is the link the
+	/// timed-out packet went out on (`packet_receipt.destination`), None when
+	/// there is no receipt (AppLinks' on_failed, whose links AppLinks owns).
+	/// Never `delivery_link`: the message may have moved to a newer, good link
+	/// since, which until 2026-10-17 this cut (C3).
+	fn link_packet_timed_out(&mut self, sent_on: Option<&LinkHandle>) {
 		let msg_hash = self.hash.as_ref().map(|h| hexrep(h, false)).unwrap_or_default();
 		log(&format!("link_packet_timed_out msg={} state={}", msg_hash, self.state), LOG_NOTICE, false, false);
 		if self.state != Self::CANCELLED {
-			if let Some(link) = self.delivery_link.as_ref() {
+			if let Some(link) = sent_on {
 				log(&format!("link_packet_timed_out tearing down link={}", hexrep(&link.link_id(), false)), LOG_NOTICE, false, false);
 				link.teardown();
 			}
@@ -1923,9 +1936,11 @@ pub(crate) fn propagation_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>
 	}
 }
 
-pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>) {
+/// A receipt timed out on `sent_on`, the link its packet went out on, or
+/// (None) AppLinks gave up on every tier: `LXMessage::link_packet_timed_out`.
+pub(crate) fn link_packet_timed_out_shared(handle: &Arc<Mutex<LXMessage>>, sent_on: Option<LinkHandle>) {
 	if let Ok(mut message) = handle.lock() {
-		message.link_packet_timed_out();
+		message.link_packet_timed_out(sent_on.as_ref());
 	}
 }
 
@@ -2088,6 +2103,97 @@ mod tests {
 			false,
 		)
 		.expect("LXMessage::new")
+	}
+
+	/// A message to a fresh destination with `title` and `content`, no fields.
+	fn make_message(method: u8, content: &[u8], title: &[u8]) -> LXMessage {
+		let source = Destination::new_inbound(
+			Some(Identity::new(true)),
+			DestinationType::Single,
+			"lxmf".to_string(),
+			vec!["delivery".to_string()],
+		)
+		.expect("source dest");
+		let dest = Destination::new_outbound(
+			Some(Identity::new(true)),
+			DestinationType::Single,
+			"lxmf".to_string(),
+			vec!["delivery".to_string()],
+		)
+		.expect("dest dest");
+		let (dest_hash, src_hash) = (dest.hash.clone(), source.hash.clone());
+		LXMessage::new(
+			Some(dest),
+			Some(source),
+			Some(content.to_vec()),
+			Some(title.to_vec()),
+			None,
+			Some(method),
+			Some(dest_hash),
+			Some(src_hash),
+			None,
+			false,
+		)
+		.expect("LXMessage::new")
+	}
+
+	/// An empty message (no title, no content, no fields) packs as one packet.
+	/// Its payload is 15 bytes, under the 16 that TIMESTAMP_SIZE and
+	/// STRUCT_OVERHEAD take off, so the content size underflowed: a panic in
+	/// debug, and in release a wrap to a huge size that sent 15 bytes as a
+	/// Resource. LXMF/LXMessage.py's size goes negative and reads as small (C3).
+	#[test]
+	fn an_empty_message_packs_as_one_packet() {
+		for method in [LXMessage::DIRECT, LXMessage::OPPORTUNISTIC] {
+			let mut msg = make_message(method, b"", b"");
+			msg.pack(false).expect("pack");
+			assert_eq!(msg.representation, LXMessage::PACKET, "method {}", method);
+			assert_eq!(msg.method, method, "method {} is kept", method);
+		}
+		let mut msg = make_message(LXMessage::PROPAGATED, b"", b"");
+		msg.pack(false).expect("an empty PROPAGATED message packs too");
+	}
+
+	/// A spawned link, as a delivery link is.
+	fn test_link() -> LinkHandle {
+		LinkHandle::spawn(reticulum_rust::link::Link::new_inbound(Destination::default()).expect("test link"))
+	}
+
+	/// True once `link` reads CLOSED (gives up after 5 s).
+	fn closes(link: &LinkHandle) -> bool {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while std::time::Instant::now() < deadline {
+			if link.status() == reticulum_rust::link::STATE_CLOSED {
+				return true;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		false
+	}
+
+	/// A receipt's timeout tears down the link its packet went out on, as
+	/// LXMF/LXMessage.py `__link_packet_timed_out` tears down
+	/// `packet_receipt.destination`; never a newer link the message moved to
+	/// since, which until 2026-10-17 it cut (C3). AppLinks' on_failed carries
+	/// no receipt and, as the reference without one, tears nothing down.
+	#[test]
+	fn a_receipt_timeout_tears_down_the_link_its_packet_used() {
+		let sent_on = test_link();
+		let newer = test_link();
+		let mut msg = make_message(LXMessage::DIRECT, b"hi", b"");
+		msg.state = LXMessage::SENDING;
+		msg.set_delivery_link(newer.clone());
+		msg.link_packet_timed_out(Some(&sent_on));
+		assert!(closes(&sent_on), "the receipt's link is torn down");
+		assert_eq!(msg.state, LXMessage::OUTBOUND, "and the message goes back to OUTBOUND");
+
+		let mut failed = make_message(LXMessage::DIRECT, b"hi", b"");
+		failed.state = LXMessage::SENDING;
+		failed.set_delivery_link(newer.clone());
+		failed.link_packet_timed_out(None);
+		std::thread::sleep(std::time::Duration::from_millis(300));
+		assert_ne!(newer.status(), reticulum_rust::link::STATE_CLOSED, "the newer link stays up");
+		newer.teardown();
 	}
 
 	/// REGRESSION GUARD: After pack(), propagation_packed must be Some(_).

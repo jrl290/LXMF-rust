@@ -133,7 +133,8 @@ pub type LxmfMessageStateCallback = extern "C" fn(
 /// APP_LINK status callback: fires whenever an APP_LINK transitions state.
 /// `dest_hash` is a pointer to the 16-byte destination hash; `hash_len` is 16.
 /// `status` is one of: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING,
-///   3=ACTIVE, 4=DISCONNECTED.
+///   3=ACTIVE, 4=DISCONNECTED, or the event 5=RECOVERED (the held link was
+///   STALE and heard its peer again: it is ACTIVE; 5 is never a state).
 pub type LxmfAppLinkStatusCallback = extern "C" fn(
     context: *mut std::ffi::c_void,
     dest_hash: *const u8,
