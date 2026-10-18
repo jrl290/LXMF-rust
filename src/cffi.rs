@@ -628,6 +628,90 @@ pub extern "C" fn lxmf_app_link_register_packet_callback(
     }
 }
 
+/// Callback for a request the node sends on a held outbound link (rfed.link's
+/// `/delivery` and `/lxmf/delivery` pushes, RFed-spec Link.md). Returns true
+/// only when the app now holds the blob; the answer goes back as msgpack bool
+/// and is the delivery proof. Runs on a link worker thread.
+pub type LxmfAppLinkInboundRequestCallback = extern "C" fn(
+    context: *mut std::ffi::c_void,
+    path: *const c_char,
+    data: *const u8,
+    data_len: u32,
+) -> bool;
+
+/// Set up every held outbound link to `dest_hash` from now on: identify as this
+/// client once established (`identify` != 0), and answer the node's requests on
+/// each path in `paths_csv` (comma-separated, e.g. "/delivery,/lxmf/delivery")
+/// with `callback`. Call before `lxmf_app_link_open_persistent`; a link already
+/// open keeps its setup until it re-opens. Returns 0, or -1 on error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_set_outbound_setup(
+    client: u64,
+    dest_hash: *const u8,
+    dest_len: u32,
+    identify: i32,
+    paths_csv: *const c_char,
+    callback: Option<LxmfAppLinkInboundRequestCallback>,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    if dest_hash.is_null() || dest_len == 0 {
+        set_error("dest_hash is null or empty");
+        return -1;
+    }
+    let paths: Vec<String> = if paths_csv.is_null() {
+        Vec::new()
+    } else {
+        match unsafe { CStr::from_ptr(paths_csv) }.to_str() {
+            Ok(s) => s.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).map(String::from).collect(),
+            Err(_) => {
+                set_error("paths_csv is not UTF-8");
+                return -1;
+            }
+        }
+    };
+    if !paths.is_empty() && callback.is_none() {
+        set_error("paths given without a callback");
+        return -1;
+    }
+    with_client!(client, c, {
+        let identify_as = if identify != 0 {
+            match get_handle::<reticulum_rust::identity::Identity>(c.identity_handle()) {
+                Some(identity) => Some(identity),
+                None => {
+                    set_error("client identity not available");
+                    return -1;
+                }
+            }
+        } else {
+            None
+        };
+        let mut request_handlers: Vec<(String, app_links::OutboundRequestHandler)> = Vec::new();
+        if let Some(callback) = callback {
+            let ctx = Arc::new(SendPtr(context));
+            for path in paths {
+                let ctx = ctx.clone();
+                let c_path = match CString::new(path.clone()) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        set_error("path contains NUL");
+                        return -1;
+                    }
+                };
+                let handler: app_links::OutboundRequestHandler = Arc::new(move |_path: &str, data: &[u8]| {
+                    callback(ctx.ptr(), c_path.as_ptr(), data.as_ptr(), data.len() as u32)
+                });
+                request_handlers.push((path, handler));
+            }
+        }
+        let dest = unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) };
+        app_links::AppLinks::set_outbound_link_setup(
+            dest,
+            app_links::OutboundLinkSetup { identify_as, request_handlers },
+        );
+        0
+    })
+}
+
 // =========================================================================
 // Client queries
 // =========================================================================
