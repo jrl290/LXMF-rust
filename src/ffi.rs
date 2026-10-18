@@ -561,6 +561,27 @@ pub fn message_set_reaction(handle: u64, to: &[u8], content: &str) -> Result<(),
     with_message(handle, |m| m.set_field(FIELD_REACTION, value))
 }
 
+/// Set FIELD_IMAGE (0x06): `[image_type, data]`, the type a str ("jpg",
+/// "png", "webp", no "image/" prefix, which Sideband does not show) and the
+/// image a bin, as MeshChat and Sideband write a picture and show it inline
+/// (a FIELD_FILE_ATTACHMENTS entry is a download there). One image per
+/// message: a second call replaces the first. The type is 1 to 16 ASCII
+/// letters or digits and the data is not empty; anything else is an error
+/// and changes nothing.
+pub fn message_set_image(handle: u64, image_type: &str, data: &[u8]) -> Result<(), String> {
+    if image_type.is_empty() || image_type.len() > 16 || !image_type.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("an image type is 1 to 16 ASCII letters or digits, not {image_type:?}"));
+    }
+    if data.is_empty() {
+        return Err("an image is not empty".to_string());
+    }
+    let value = rmpv::Value::Array(vec![
+        rmpv::Value::String(image_type.into()),
+        rmpv::Value::Binary(data.to_vec()),
+    ]);
+    with_message(handle, |m| m.set_field(crate::lxmf::FIELD_IMAGE, value))
+}
+
 /// Clone an outbound message as a fresh PROPAGATED message, preserving all
 /// application fields and attachments while resetting transport state.
 pub fn message_clone_propagated(handle: u64) -> Result<u64, String> {
@@ -1332,5 +1353,30 @@ mod retichat_field_setter_tests {
             "a post id, and an empty reaction (a removal)");
         message_set_reaction(handle, &hash, &"a".repeat(64)).unwrap();
         assert!(message_set_reaction(0, &hash, "x").is_err(), "invalid handle");
+    }
+
+    /// FIELD_IMAGE as MeshChat and Sideband write it, `{0x06: [str type, bin
+    /// data]}`, beside a file attachment; one image, a second call replacing
+    /// it; a type with "image/" or not ASCII, or no data, refused.
+    #[test]
+    fn the_image_setter_writes_what_meshchat_writes() {
+        let (handle, arc) = message_handle();
+        message_set_image(handle, "jpg", &[1, 2, 3]).unwrap();
+        assert_eq!(fields_bytes(&arc), [0x81, 0x06, 0x92, 0xa3, b'j', b'p', b'g', 0xc4, 3, 1, 2, 3]);
+
+        message_add_attachment(handle, "a.txt", &[9]).unwrap();
+        message_set_image(handle, "webp", &[4]).unwrap();
+        assert_eq!(fields_bytes(&arc), [
+            &[0x82, 0x06, 0x92, 0xa4][..], b"webp", &[0xc4, 1, 4],
+            &[0x05, 0x91, 0x92, 0xa5], b"a.txt", &[0xc4, 1, 9],
+        ].concat(), "replaced in place, the attachment kept");
+
+        let before = fields_bytes(&arc);
+        for bad in ["", "image/png", "pñg", "abcdefghijklmnopq", "j g"] {
+            assert!(message_set_image(handle, bad, &[1]).is_err(), "{bad:?}");
+        }
+        assert!(message_set_image(handle, "png", &[]).is_err(), "no data");
+        assert!(message_set_image(0, "png", &[1]).is_err(), "invalid handle");
+        assert_eq!(fields_bytes(&arc), before, "refusals change nothing");
     }
 }

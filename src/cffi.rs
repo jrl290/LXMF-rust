@@ -2006,6 +2006,38 @@ pub extern "C" fn lxmf_message_set_reaction(
     }
 }
 
+/// Set a message's FIELD_IMAGE (0x06) to `[image_type, data]`, how MeshChat
+/// and Sideband send a picture (lxmf::message_set_image: the type 1 to 16
+/// ASCII letters or digits, such as "jpg", the data not empty; one image).
+/// Returns 0 on success, -1 on error (lxmf_last_error says why).
+#[no_mangle]
+pub extern "C" fn lxmf_message_set_image(
+    msg: u64,
+    image_type: *const c_char,
+    data: *const u8,
+    data_len: u32,
+) -> i32 {
+    if image_type.is_null() || data.is_null() {
+        set_error("image_type or data is NULL");
+        return -1;
+    }
+    let image_type = match unsafe { CStr::from_ptr(image_type) }.to_str() {
+        Ok(t) => t,
+        Err(_) => {
+            set_error("image_type is not UTF-8");
+            return -1;
+        }
+    };
+    let data = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
+    match lxmf::message_set_image(msg, image_type, data) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
 /// Add a file attachment to a message.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
