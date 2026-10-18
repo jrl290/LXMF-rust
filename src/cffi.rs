@@ -1578,8 +1578,12 @@ pub extern "C" fn lxmf_app_link_request_async(
 
     let fired_fail = fired.clone();
     let ctx_fail = ctx.clone();
+    let link_for_fail = link_handle.clone();
     let failed_cb: Arc<dyn Fn(reticulum_rust::link::RequestReceipt) + Send + Sync> =
         Arc::new(move |_receipt| {
+            // The link's own failure, not the caller's deadline below: the
+            // next request opens a fresh link (LXMRouter.message_get_failed).
+            app_links::AppLinks::request_failed(&link_for_fail);
             if fired_fail.swap(true, Ordering::SeqCst) {
                 return;
             }
