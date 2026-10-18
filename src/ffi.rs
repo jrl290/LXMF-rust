@@ -385,6 +385,9 @@ pub fn router_destroy(router_handle: u64) -> Result<(), String> {
             r.delivery_callback = None;
             r.sync_complete_callback = None;
             r.message_state_callback = None;
+
+            // As LXMRouter.exit_handler persists its state on the way out.
+            r.save_locally_delivered_transient_ids();
         }
     }
     if destroy_handle(router_handle) {

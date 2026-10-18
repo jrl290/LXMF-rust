@@ -2763,13 +2763,21 @@ impl LXMRouter {
 		}
 	}
 
-	fn save_locally_delivered_transient_ids(&self) {
+	/// Written whole to a temporary file and moved into place, as
+	/// LXMRouter.save_locally_delivered_transient_ids does: a process killed
+	/// mid-write leaves the last copy, never a torn one, which
+	/// `load_cached_state` would replace with an empty cache.
+	pub(crate) fn save_locally_delivered_transient_ids(&self) {
 		if self.locally_delivered_transient_ids.is_empty() {
 			return;
 		}
 		if let Ok(data) = rmp_serde::to_vec(&self.locally_delivered_transient_ids) {
 			let _ = fs::create_dir_all(&self.storagepath);
-			let _ = fs::write(format!("{}/local_deliveries", self.storagepath), data);
+			let path = format!("{}/local_deliveries", self.storagepath);
+			let temp = format!("{}.tmp.{}", path, now());
+			if fs::write(&temp, data).and_then(|_| fs::rename(&temp, &path)).is_err() {
+				let _ = fs::remove_file(&temp);
+			}
 		}
 	}
 
@@ -5042,8 +5050,17 @@ impl LXMRouter {
 	/// This reuses the normal propagation-delivery path so delivery callbacks,
 	/// duplicate suppression, and ratchet handling stay identical to `/get`
 	/// responses from `lxmf.propagation`.
+	///
+	/// The node keeps a pushed message until this device's next sync lists
+	/// it as had, and that sync downloads whatever this device does not know
+	/// it has (`has_message`): so a transient id a push adds is saved at once,
+	/// as a sync saves its own. Until 2026-10-18 only a sync saved them, and
+	/// an app killed between a push and its next sync downloaded every pushed
+	/// message again (L80).
 	pub fn ingest_propagated_lxmf(&mut self, lxmf_data: &[u8]) -> bool {
-		self.lxmf_propagation(
+		let transient_id = reticulum_rust::identity::full_hash(lxmf_data);
+		let had = self.locally_delivered_transient_ids.contains_key(&transient_id);
+		let delivered = self.lxmf_propagation(
 			lxmf_data,
 			None,
 			None,
@@ -5052,7 +5069,11 @@ impl LXMRouter {
 			None,
 			None,
 			None,
-		)
+		);
+		if !had && self.locally_delivered_transient_ids.contains_key(&transient_id) {
+			self.save_locally_delivered_transient_ids();
+		}
+		delivered
 	}
 
 	fn enqueue_peer_distribution(&mut self, transient_id: Vec<u8>, from_peer: Option<Vec<u8>>) {
@@ -6797,5 +6818,96 @@ mod send_assertion_router_tests {
 		assert_eq!(text.lock().unwrap().state, LXMessage::SENDING);
 		assert!(!text.lock().unwrap().violation_reported);
 		assert!(text.lock().unwrap().send_violations.is_empty(), "no violation recorded");
+	}
+}
+
+#[cfg(test)]
+mod delivered_ids_tests {
+	use super::*;
+
+	struct TempDir(std::path::PathBuf);
+	impl TempDir {
+		fn new(label: &str) -> Self {
+			let mut bytes = [0u8; 8];
+			rand::thread_rng().fill(&mut bytes);
+			let dir = std::env::temp_dir().join(format!("lxmf-router-delivered-{label}-{}", hexrep(&bytes, false)));
+			std::fs::create_dir_all(&dir).expect("temp dir");
+			TempDir(dir)
+		}
+		fn path(&self, name: &str) -> String {
+			self.0.join(name).to_string_lossy().into_owned()
+		}
+	}
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn router(storage: &str) -> Arc<Mutex<LXMRouter>> {
+		LXMRouter::new(
+			Some(Identity::new(true)), storage.to_string(), None, None, None, None, None,
+			false, false, Vec::new(), None, false, 0, 0, 0, 0, 0, None,
+		)
+		.expect("router")
+	}
+
+	/// The lxmf_data a node holds for a message to `receiver`: what rfed
+	/// pushes, stamp-free, and what its transient id is the hash of.
+	fn propagated_to(receiver: &Identity) -> Vec<u8> {
+		let public = Identity::from_public_key(&receiver.get_public_key().unwrap()).unwrap();
+		let dest = Destination::new_outbound(Some(public), DestinationType::Single, "lxmf".to_string(), vec!["delivery".to_string()])
+			.expect("destination");
+		let source = Destination::new_inbound(Some(Identity::new(true)), DestinationType::Single, "lxmf".to_string(), vec!["delivery".to_string()])
+			.expect("source");
+		let (dest_hash, source_hash) = (dest.hash.clone(), source.hash.clone());
+		let mut message = LXMessage::new(
+			Some(dest), Some(source), Some(b"pushed".to_vec()), Some(Vec::new()), None,
+			Some(LXMessage::PROPAGATED), Some(dest_hash), Some(source_hash), None, false,
+		)
+		.expect("message");
+		message.pack(false).expect("pack");
+		let packed = message.propagation_packed.clone().expect("propagation packed");
+		match read_value(&mut packed.as_slice()).expect("msgpack") {
+			Value::Array(parts) => match &parts[1] {
+				Value::Array(datas) => match &datas[0] {
+					Value::Binary(lxmf_data) => {
+						assert_eq!(message.transient_id.as_deref(), Some(reticulum_rust::identity::full_hash(lxmf_data).as_slice()));
+						lxmf_data.clone()
+					}
+					other => panic!("lxmf_data {other:?}"),
+				},
+				other => panic!("messages {other:?}"),
+			},
+			other => panic!("propagation packed {other:?}"),
+		}
+	}
+
+	/// L80: a message the node pushed is still had after the app is killed
+	/// (no shutdown, no sync since), so the next sync does not download it
+	/// again: the node keeps it until that sync lists it as had.
+	#[test]
+	fn a_pushed_message_is_still_had_after_a_kill() {
+		let tmp = TempDir::new("pushed");
+		let storage = tmp.path("storage");
+		let receiver = Identity::new(true);
+		let lxmf_data = propagated_to(&receiver);
+		let transient_id = reticulum_rust::identity::full_hash(&lxmf_data);
+
+		let before = router(&storage);
+		{
+			let mut r = before.lock().unwrap();
+			r.register_delivery_identity(receiver, None, None).expect("register");
+			r.ingest_propagated_lxmf(&lxmf_data);
+			assert!(r.has_message(&transient_id), "delivered by the push");
+		}
+
+		let after = router(&storage);
+		assert!(after.lock().unwrap().has_message(&transient_id), "a sync after the kill would download it again");
+		let leftovers: Vec<_> = std::fs::read_dir(&storage).unwrap()
+			.filter_map(|e| e.ok()?.file_name().into_string().ok())
+			.filter(|name| name.contains(".tmp."))
+			.collect();
+		assert!(leftovers.is_empty(), "the save leaves no temporary file: {leftovers:?}");
 	}
 }
