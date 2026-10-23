@@ -3825,6 +3825,7 @@ impl LXMRouter {
 		method: Option<u8>,
 		no_stamp_enforcement: bool,
 		allow_duplicate: bool,
+		propagated_transient_id: Option<Vec<u8>>,
 	) -> bool {
 		log(&format!("[LXMF-DELIVERY] enter data_len={} method={:?} dest_type={:?}", lxmf_data.len(), method, destination_type), LOG_NOTICE, false, false);
 		let mut message = match LXMessage::unpack_from_bytes(lxmf_data, method) {
@@ -3849,6 +3850,15 @@ impl LXMRouter {
 
 		if ratchet_id.is_some() && message.ratchet_id.is_none() {
 			message.ratchet_id = ratchet_id;
+		}
+
+		// A propagated message's transient id is the hash of the encrypted
+		// lxmf_data the node held, which unpacking the decrypted message
+		// cannot recompute. An rfed wake names the message by it (RFed-spec
+		// Notify.md), so the app can match the two. Python LXMF leaves it
+		// unset on a received message.
+		if propagated_transient_id.is_some() {
+			message.transient_id = propagated_transient_id;
 		}
 
 		// Extract and remember ticket if present and signature is valid
@@ -4054,6 +4064,7 @@ impl LXMRouter {
 			method,
 			false,
 			false,
+			None,
 		);
 	}
 
@@ -4184,6 +4195,7 @@ impl LXMRouter {
 					Some(LXMessage::DIRECT),
 					false,
 					false,
+					None,
 				);
 			}
 		}
@@ -4996,6 +5008,7 @@ impl LXMRouter {
 				Some(LXMessage::PROPAGATED),
 				is_paper_message,
 				allow_duplicate,
+				Some(transient_id.clone()),
 			);
 			self.locally_delivered_transient_ids.insert(transient_id.clone(), now());
 			let _ = signal_local_delivery;
@@ -6272,7 +6285,7 @@ mod display_name_router_tests {
 		};
 		let deliver = |bytes: &[u8]| {
 			assert!(router.lock().unwrap().lxmf_delivery(
-				bytes, Some(DestinationType::Single), None, None, Some(LXMessage::OPPORTUNISTIC), true, true,
+				bytes, Some(DestinationType::Single), None, None, Some(LXMessage::OPPORTUNISTIC), true, true, None,
 			));
 			seen.lock().unwrap().pop().expect("delivered to the callback")
 		};
@@ -6882,6 +6895,29 @@ mod delivered_ids_tests {
 			},
 			other => panic!("propagation packed {other:?}"),
 		}
+	}
+
+	/// A message that came by propagation (a sync, or a node's push) is
+	/// delivered with its transient id, the hash of the lxmf_data the node
+	/// held: an rfed wake names the message by it (RFed-spec Notify.md), so
+	/// the app can show one notification per message.
+	#[test]
+	fn a_propagated_message_is_delivered_with_its_transient_id() {
+		let tmp = TempDir::new("transient");
+		let receiver = Identity::new(true);
+		let lxmf_data = propagated_to(&receiver);
+		let delivered: Arc<Mutex<Vec<Option<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
+
+		let router = router(&tmp.path("storage"));
+		let mut r = router.lock().unwrap();
+		r.register_delivery_identity(receiver, None, None).expect("register");
+		let seen = Arc::clone(&delivered);
+		r.register_delivery_callback(Arc::new(move |message: &LXMessage| {
+			seen.lock().unwrap().push(message.transient_id.clone());
+		}));
+		r.ingest_propagated_lxmf(&lxmf_data);
+
+		assert_eq!(*delivered.lock().unwrap(), vec![Some(reticulum_rust::identity::full_hash(&lxmf_data))]);
 	}
 
 	/// L80: a message the node pushed is still had after the app is killed

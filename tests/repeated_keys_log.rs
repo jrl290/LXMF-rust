@@ -91,7 +91,7 @@ fn refusals_are_logged_once() {
 		assert_eq!(refusals(why, name), 1, "{name}: the unwrap logs its refusal once");
 
 		let accepted = router.lock().unwrap().lxmf_delivery(
-			&packed, Some(DestinationType::Single), None, None, Some(LXMessage::DIRECT), true, true,
+			&packed, Some(DestinationType::Single), None, None, Some(LXMessage::DIRECT), true, true, None,
 		);
 		assert!(!accepted, "{name}: the router refuses it");
 		let lines_now = lines.lock().unwrap().clone();
@@ -104,7 +104,7 @@ fn refusals_are_logged_once() {
 	let mut garbage = hex(v["refused"][0]["packed_hex"].as_str().unwrap())[..96].to_vec();
 	garbage.push(0xc1); // a reserved msgpack marker
 	assert!(!router.lock().unwrap().lxmf_delivery(
-		&garbage, Some(DestinationType::Single), None, None, Some(LXMessage::DIRECT), true, true,
+		&garbage, Some(DestinationType::Single), None, None, Some(LXMessage::DIRECT), true, true, None,
 	));
 	assert_eq!(said("unpack FAILED"), 1);
 
