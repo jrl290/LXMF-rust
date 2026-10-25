@@ -8,7 +8,9 @@ A Rust implementation of the [LXMF](https://github.com/markqvist/LXMF) (Lightwei
 
 ## About
 
-LXMF-rust is a from-scratch Rust port of the [Python LXMF reference implementation](https://github.com/markqvist/LXMF) (achieving module parity), built on top of [Rusticulum](https://github.com/jrl290/Rusticulum) (the Rust Reticulum transport layer). It provides the same messaging capabilities as the Python version with the performance and safety benefits of Rust — a ~5 MB statically-linked binary with near-zero startup time.
+LXMF-rust is a Rust port of the [Python LXMF reference implementation](https://github.com/markqvist/LXMF) (achieving module parity), built on top of [Rusticulum](https://github.com/jrl290/Rusticulum) (the Rust Reticulum transport layer). It provides the same messaging capabilities as the Python version with the performance and safety benefits of Rust — a ~5 MB statically-linked binary with near-zero startup time.
+
+It is written for our own projects (RFed and Retichat) and is not offered as an alternative LXMF implementation. For LXMF itself, use the [reference implementation](https://github.com/markqvist/LXMF).
 
 ### AI-Assisted Development
 
@@ -233,7 +235,7 @@ docker/
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+This is a port of Mark Qvist's LXMF and is distributed under the same license as the reference implementation, the Reticulum License, including its conditions: the software may not be used in systems that can purposefully harm people, or to build AI, machine-learning or language-model training datasets. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
