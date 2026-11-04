@@ -1463,6 +1463,10 @@ pub extern "C" fn lxmf_app_link_request(
 /// Issues a request on the existing app-link to `dest_hash` and fires
 /// `callback(context, bytes, bytes_len, status)` exactly once when the
 /// response arrives, the request fails, or `timeout_secs` elapses.
+/// A `timeout_secs` of 0 or less sets no deadline of the caller's: the
+/// request is decided by its own events alone, the answer, its own
+/// RTT-scaled failure or the link closing (a slow route's request,
+/// `ConnectionStateManager.appLinkSend`).
 ///
 /// Returns 0 on success (callback will fire), -1 on immediate error
 /// (invalid args, no link, link not active — callback will NOT fire;
@@ -1628,20 +1632,36 @@ pub extern "C" fn lxmf_app_link_request_async(
         }
     });
 
-    // Detached timeout watcher — fires the callback with status=1 if the
-    // request hasn't completed by the deadline. The single-fire latch
-    // makes this safe to race with response/failed callbacks.
-    let fired_to = fired.clone();
-    let ctx_to = ctx.clone();
-    let to_secs = timeout_secs.max(0.0);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs_f64(to_secs));
-        if !fired_to.swap(true, Ordering::SeqCst) {
-            cb(ctx_to.0, std::ptr::null(), 0, 1);
-        }
-    });
+    // Detached timeout watcher, only for a caller with a deadline — fires
+    // the callback with status=1 if the request hasn't completed by then.
+    // The single-fire latch makes this safe to race with response/failed
+    // callbacks.
+    if timeout_secs > 0.0 {
+        let fired_to = fired.clone();
+        let ctx_to = ctx.clone();
+        let to_secs = timeout_secs;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs_f64(to_secs));
+            if !fired_to.swap(true, Ordering::SeqCst) {
+                cb(ctx_to.0, std::ptr::null(), 0, 1);
+            }
+        });
+    }
 
     0
+}
+
+/// How fast the route to `dest_hash` is, from the round trip its link
+/// measured as it came up (`AppLinks::route_speed`): 0 = not measured yet,
+/// 1 = fast, 2 = slow (over a second).  Returns -1 on parameter error.
+#[no_mangle]
+pub extern "C" fn lxmf_app_link_route_speed(dest_hash: *const u8, dest_len: u32) -> i32 {
+    if dest_hash.is_null() || dest_len == 0 {
+        set_error("null dest hash");
+        return -1;
+    }
+    let hash = unsafe { std::slice::from_raw_parts(dest_hash, dest_len as usize) };
+    app_links::AppLinks::route_speed(hash) as i32
 }
 
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.
